@@ -126,16 +126,17 @@ export async function resolveGitHubOperationCredentials(
     companyId: string;
     agentId: string;
     runId: string;
+    repository?: string;
   },
 ) {
   const { run, context } = await captureRunIdentity(db, input, { readScope: "github_credentials" });
   if (!context) throw forbidden("This run predates managed GitHub credentials");
-  return resolveCapturedGitHubCredentials(db, run, context);
+  return resolveCapturedGitHubCredentials(db, run, context, input.repository);
 }
 
 export async function resolveGitHubCompletionCredentials(
   db: Db,
-  input: { companyId: string; issueId: string; runId: string },
+  input: { companyId: string; issueId: string; runId: string; repository?: string },
 ) {
   const [source] = await db.select({ agentId: heartbeatRuns.agentId })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
@@ -146,10 +147,10 @@ export async function resolveGitHubCompletionCredentials(
   if (!context || context.companyId !== run.companyId || context.status !== "accepted") {
     throw forbidden("GitHub completion requires the run's accepted identity");
   }
-  return resolveCapturedGitHubCredentials(db, run, context);
+  return resolveCapturedGitHubCredentials(db, run, context, input.repository);
 }
 
-async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun, context: RunIdentityContext) {
+async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun, context: RunIdentityContext, repository?: string) {
   let summary: GitHubCredentialSummary;
   let env: Record<string, string> = {};
   // A sponsored guest's responsible person is an internal accountability field,
@@ -178,6 +179,7 @@ async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun
       {
         agentId: run.agentId,
         heartbeatRunId: run.id,
+        repository,
         allowStandingDelegation: false,
         responsibleUserId:
           context?.cause === "company_default"
@@ -198,7 +200,7 @@ async function resolveCapturedGitHubCredentials(db: Db, run: GitHubCredentialRun
         grantId: resolved.credential.grantId,
         authenticationMode: "managed",
       };
-      env = buildGitAuthInvocation(resolved.credential).env;
+      env = buildGitAuthInvocation(resolved.credential, repository).env;
     } else {
       summary = {
         status: resolved.configured ? "unavailable" : "absent",

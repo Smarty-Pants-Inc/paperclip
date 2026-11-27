@@ -1,6 +1,11 @@
+import { isNativeInputSizeRefusal, nativeInputRefusalEvidence } from "../native-input-refusal.js";
+import { NativeTurnPromptExceedsCommandBoundError, nativePromptCauseFromError } from "../native-runtime/native-turn-budget.js";
+import { PI_MODEL_PROVIDER_REQUIRED } from "../../adapters/pi-model-selection.js";
+import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
+import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
-import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
+import { NativeProviderStateIncompatibleError, providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
 import { GENERIC_RUN_FAILURE_CODES, NATIVE_PRE_DISPATCH_FAILURE_CODE, NATIVE_PRE_DISPATCH_FAILURE_KEY, NATIVE_PRE_DISPATCH_FAILURE_RECORD, failureCauseFromAdapterResult, failureCauseFromError,
   isNativePreDispatchTransientFailure } from "./run-failure-cause.js";
 import { INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
@@ -43,7 +48,7 @@ import { isConversation, settleConversationTurn } from "../agent-conversations.j
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { normalizeResponsibleUserDenialCode } from "../responsible-user-denial-run-outcomes.js";
@@ -156,6 +161,7 @@ export interface CompleteHeartbeatRunInput extends RunCompletionInput {
 }
 
 export interface FailHeartbeatRunInput extends RunCompletionInput {
+  configFreshnessResultMetadata?: Record<string, unknown>;
   runId: string;
   err: unknown;
   identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "redact">;
@@ -188,6 +194,7 @@ export interface FailHeartbeatRunSetupInput {
 }
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
+  if (error instanceof NativeProviderStateIncompatibleError) return error.code;
   if (error instanceof ProjectAccessDeniedError) return PROJECT_ACCESS_DENIED;
   if (error instanceof ChatControlRecoveryUnresolvedError)
     return CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE;
@@ -439,12 +446,31 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     failedProcessRunCancellations,
   } = dependencies;
 
+  // Both terminal paths persist server-prepared authority, never adapter-supplied
+  // receipts. Completion also publishes legacy session state; a throw cannot do
+  // that, so it needs the durable, matching native start before keeping a receipt.
+  async function sessionConfigReceipt(run: Run, metadata: Record<string, unknown> | undefined, completed: boolean) {
+    if (!metadata) return {};
+    if (!completed) {
+      const [started] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+        sql`exists (select 1 from ${heartbeatRunEvents}
+          where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+            and ${heartbeatRunEvents.eventType} = 'session.started'
+            and ${heartbeatRunEvents.payload}#>>'{prpEvent,normalizedSessionId}' = ${heartbeatRuns.nativeSessionId}::text)`,
+      )).limit(1);
+      if (!started) return {};
+    }
+    return { configFreshness: metadata };
+  }
+
   async function completeRun(input: CompleteHeartbeatRunInput) {
     const { run, agent, issueId, issueRef, signal, output, session, readFailureReportSecrets, adapterResult, sessionCodec, taskSessionForRun, sessionCompaction,
       configFreshnessResultMetadata, runLedgerScope, currentUserRedactionOptions,
       providerTraceCapture, onProviderTraceFinalized, issueContext, onLog } = input;
     const { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata } = session;
     const { handle, outputProgressState, flushOutputProgress } = output;
+    const configFreshnessReceipt = await sessionConfigReceipt(run, configFreshnessResultMetadata, true);
     const processCancellation =
       processRunCancellationSettlements.get(run.id) ??
       failedProcessRunCancellations.get(run.id);
@@ -682,7 +708,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               : {}),
             ...(outcome === "cancelled" ? controllerLeaseLossResultJson(signal) : {}),
             ...(failureCause ? { failureCause } : {}),
-            configFreshness: configFreshnessResultMetadata,
+            ...configFreshnessReceipt,
           },
           errorFamily: adapterResult.errorFamily ?? null,
           retryNotBefore: adapterResult.retryNotBefore ?? null,
@@ -850,19 +876,20 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       let resolvedPresentationDecision: RunPresentationDecision | null =
         null;
       try {
+        const finalAgentMessage =
+          await measureRunPhase("response.resolve", () => findLatestCompletedFinalAgentMessage(
+            livenessRun.id,
+            livenessRun.companyId,
+          ));
         const existingRunComment = issueId
           ? await measureRunPhase("response.resolve", () => findRunIssueComment(
               livenessRun.id,
               livenessRun.companyId,
               issueId,
               persistedResultJson,
+              finalAgentMessage?.replyKey,
             ))
           : null;
-        const finalAgentMessage =
-          await measureRunPhase("response.resolve", () => findLatestCompletedFinalAgentMessage(
-            livenessRun.id,
-            livenessRun.companyId,
-          ));
         const externalChatPresentationCandidate = isChatOriginPublicationCandidate(livenessRun.contextSnapshot);
         const externalChatPresentationAuthorization =
           issueId && externalChatPresentationCandidate
@@ -903,6 +930,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         });
         let presentationDecision: RunPresentationDecision =
           resolved.decision;
+        // A same-run progress note that already says exactly the final answer is that answer: don't post it twice.
+        const sameRunAnswer = issueId && presentationDecision.commentAction === "create" && resolved.text
+          ? (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.companyId, livenessRun.companyId),
+              eq(issueComments.issueId, issueId), eq(issueComments.createdByRunId, livenessRun.id),
+              sql`btrim(${issueComments.body}) = ${resolved.text.trim()}`)).limit(1))[0] ?? null
+          : null;
+        if (sameRunAnswer) presentationDecision = { ...presentationDecision, commentAction: "reuse", commentId: sameRunAnswer.id,
+          reasonCodes: [...presentationDecision.reasonCodes, "same_run_comment_is_final_answer"] };
 
         if (
           issueId &&
@@ -1259,7 +1294,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
   async function failRun(input: FailHeartbeatRunInput): Promise<{ preserveFailedWorkspace: true } | undefined> {
     const { run, agent, issueId, issueRef, signal, output, session, readFailureReportSecrets, runId, err, identityRedactor, requiredWorkspaceRestoreEvidence,
       legacyAdapterEntered, nativeDispatchMayHaveStarted, goalCheckpointSession, previousSessionDisplayId, taskSession,
-      predecessorRetirementFallback } = input;
+      predecessorRetirementFallback, configFreshnessResultMetadata } = input;
     const { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata } = session;
     const { handle, outputProgressState, flushOutputProgress } = output;
     // A process adapter may throw while its owned Stop is joining the
@@ -1329,6 +1364,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       && run.nativeSessionId === null && run.runnerInstanceId === null && err instanceof RemoteWorkspacePreparationTimeoutError
       ? err : null;
     const failureErrorCode =
+      (err instanceof NativeTurnPromptExceedsCommandBoundError ? err.code : null) ??
       workspaceValidationFailure?.code ??
       configurationIncompleteFailure?.code ??
       nonRetryablePreflightFailureCode(err) ??
@@ -1376,10 +1412,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     });
 
     const stoppedDuringFailure = signal.aborted;
-    const stopSnapshot = stoppedDuringFailure ? await getRun(run.id) : null;
+    const config = parseObject(agent.adapterConfig);
+    const continuousPi = run.runtimeMode === "native" && config.provider === "pi_rpc" &&
+      resolveSessionContinuity("pi_rpc", config.sessionContinuity) === "continuous";
+    const stopSnapshot = stoppedDuringFailure || continuousPi ? await getRun(run.id) : null;
     const failureOutcome = stoppedDuringFailure ? "cancelled" : "failed";
     const nativePreDispatchFailure = !stoppedDuringFailure && nativeTerminalFailureCode === null
       ? await nativePreDispatchFailureResult(run.id, nativeDispatchMayHaveStarted) : null;
+    const configFreshnessReceipt = await sessionConfigReceipt(run, configFreshnessResultMetadata, false);
+    const promptRefusalEvidence = await nativeInputRefusalEvidence(db, run, err, failureErrorCode);
     const failedRunWrite = await measureRunPhase("completion.terminal_write", () => setRunStatusIfRunning(run.id, failureOutcome, {
       error: message,
       errorCode: stopSnapshot?.errorCode ?? failureErrorCode,
@@ -1390,6 +1431,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         resultJson: {
           ...parseObject(stopSnapshot?.resultJson),
           ...(failureCause && !stoppedDuringFailure ? { failureCause } : {}),
+          ...(nativePromptCauseFromError(err) ? { nativeTurnPromptRefusalCause: nativePromptCauseFromError(err) } : {}),
+          ...promptRefusalEvidence,
           ...(providerFailure ? { providerFailure: { ...providerFailure,
             message: redactCurrentUserText(identityRedactor.redact(providerFailure.message), currentUserRedactionOptions) } } : {}),
           ...(interruptedExactResume ? { nativeExactResumeRefusal: {
@@ -1404,6 +1447,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             {}),
           ...(stoppedDuringFailure ? controllerLeaseLossResultJson(signal) : {}),
           ...nativePreDispatchFailure,
+          ...configFreshnessReceipt,
           ...(!legacyAdapterEntered && run.runtimeMode !== "native"
             ? {
                 executionRecovery: {
@@ -1513,7 +1557,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         // exhaustion. Once its durable coordinator has classified a
         // terminal failure, generic issue recovery must not create a
         // replacement retryOfRunId chain for the same provider work.
-        suppressImmediateRecovery: nativeTerminalFailureCode !== null || storageWait?.outcome === "scheduled"
+        suppressImmediateRecovery: isNativeInputSizeRefusal(livenessRun.errorCode) || nativeTerminalFailureCode !== null || storageWait?.outcome === "scheduled"
           || storageWait?.outcome === "retry_exhausted" || nativePreDispatchRetry?.outcome === "scheduled",
       });
       await handleIssueReviewPathDisposition(livenessRun);
@@ -1683,6 +1727,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const ownedAiSelectionRejection = isOwnedAiConnectionSelectionRejection(
       configurationIncompleteSetupFailure?.resultJson.configurationIncomplete);
     const setupFailureErrorCode =
+      (outerErr instanceof NativeTurnPromptExceedsCommandBoundError ? outerErr.code : null) ??
       (controllerLeaseLost && !ownedAiSelectionRejection ? CONTROLLER_LEASE_LOST_FAILURE_CODE : null) ??
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
       remoteWorkspacePreparationTimeout?.code ??
@@ -1752,6 +1797,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const connectionFailure = readGitConnectionFailure(outerErr);
     const setupFailureResultJson = {
       ...setupFailureDetails,
+      ...(nativePromptCauseFromError(outerErr) ? { nativeTurnPromptRefusalCause: nativePromptCauseFromError(outerErr) } : {}),
+      ...await nativeInputRefusalEvidence(db, run, outerErr, setupFailureErrorCode),
+      ...(nonRetryablePreflightCode === PI_MODEL_PROVIDER_REQUIRED && outerErr instanceof HttpError
+        ? { modelSelection: { model: parseObject(outerErr.details).model, retryability: "requires_action" } } : {}),
       ...(failureCause ? { failureCause } : {}),
       ...(repositoryCatalogUnavailable ? { errorFamily: "transient_upstream",
         ...(repositoryCatalogUnavailable.retryAt ? { retryNotBefore: new Date(repositoryCatalogUnavailable.retryAt).toISOString() } : {}),
@@ -1838,6 +1887,13 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         parseObject(livenessRun.contextSnapshot).issueId,
       );
       if (setupFailureIssueId) {
+        if (livenessRun.errorCode === PI_MODEL_PROVIDER_REQUIRED) {
+          // The terminal failure is durable authority to park the turn. Notice
+          // publication is repairable and must never prevent settle/release.
+          await ensurePiModelSelectionFailureNotice(db, livenessRun, issuesSvc.addComment)
+            .catch((noticeError) => logger.warn({ err: noticeError, runId }, "Pi selection notice deferred to recovery"));
+          await settleConversationTurn(db, livenessRun);
+        }
         await completeSkillTestRunForHeartbeatOutcome({
           run: livenessRun,
           issueId: setupFailureIssueId,
@@ -1915,7 +1971,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       await settleStorageWaitMessage(livenessRun, storageWait, outerErr);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: storageWaitScheduled || nativePreDispatchRetryScheduled ||
+        suppressImmediateRecovery: isNativeInputSizeRefusal(livenessRun.errorCode) || storageWaitScheduled || nativePreDispatchRetryScheduled ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||

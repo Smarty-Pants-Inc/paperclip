@@ -96,6 +96,8 @@ curl -sS -X PATCH "$PAPERCLIP_API_URL/api/companies/{companyId}" \
 
 The CEO is the first agent. Use the agent-hire endpoint:
 
+Always name both the model and the reasoning level in `adapterConfig`. A hire that leaves either to a default is a failure. For a native Pi agent use `"adapterType": "paperclip_runner"` with `"adapterConfig": {"provider": "pi_rpc", "model": "<provider>/<model>", "piRpcThinkingLevel": "medium"}`. The level is one of off, minimal, low, medium, high, xhigh, max. For other adapters, set that adapter's documented effort field.
+
 ```bash
 # Discover available adapters
 curl -sS "$PAPERCLIP_API_URL/llms/agent-configuration.txt"
@@ -118,7 +120,8 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
     "adapterType": "claude_local",
     "adapterConfig": {
       "cwd": "/path/to/working/directory",
-      "model": "sonnet"
+      "model": "sonnet",
+      "effort": "medium"
     },
     "runtimeConfig": {
       "heartbeat": {"enabled": true, "intervalSec": 300, "wakeOnDemand": true}
@@ -277,6 +280,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
     "adapterConfig": {
       "cwd": "/path/to/working/directory",
       "model": "sonnet",
+      "effort": "medium",
       "systemPrompt": "... the full system prompt from the template ..."
     },
     "runtimeConfig": {

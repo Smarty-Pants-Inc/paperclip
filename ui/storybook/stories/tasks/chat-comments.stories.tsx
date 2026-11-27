@@ -305,6 +305,7 @@ const feedbackVotes: FeedbackVote[] = [
 const liveRun: LiveRunForIssue = {
   id: "run-live-chat-01",
   status: "running",
+  runModel: null,
   invocationSource: "manual",
   triggerDetail: "comment",
   createdAt: "2026-04-20T13:40:00.000Z",

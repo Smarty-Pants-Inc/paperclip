@@ -120,6 +120,8 @@ Before submitting, walk the draft-review checklist end-to-end and fix any item t
 
 ### 8. Submit hire request
 
+Always name both the model and the reasoning level in `adapterConfig`. A hire that leaves either to a default is a failure. For a native Pi agent use `"adapterType": "paperclip_runner"` with `"adapterConfig": {"provider": "pi_rpc", "model": "<provider>/<model>", "piRpcThinkingLevel": "medium"}`. The level is one of off, minimal, low, medium, high, xhigh, max. For other adapters, set that adapter's documented effort field.
+
 ```sh
 curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-hires" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
@@ -133,7 +135,7 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
     "capabilities": "Owns technical roadmap, architecture, staffing, execution",
     "desiredSkills": ["vercel-labs/agent-browser/agent-browser"],
     "adapterType": "codex_local",
-    "adapterConfig": {"cwd": "/abs/path/to/repo", "model": "o4-mini"},
+    "adapterConfig": {"cwd": "/abs/path/to/repo", "model": "o4-mini", "modelReasoningEffort": "medium"},
     "instructionsBundle": {"files": {"AGENTS.md": "You are the CTO..."}},
     "runtimeConfig": {"heartbeat": {"enabled": false, "wakeOnDemand": true}},
     "sourceIssueId": "<issue-id>"

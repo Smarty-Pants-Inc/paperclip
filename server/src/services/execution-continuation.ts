@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   agentWakeupRequests,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -19,6 +20,10 @@ import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
 import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { githubRecoveryReceipts } from "./chat-channels/github/recovery-receipts.js";
 import { readTaskRetryIntent } from "./task-retry.js";
+import { readByEarlierTurnCommentIds } from "./queued-comment-delivery.js";
+import type { NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
+import { continuationResultIdentityKeys } from "./execution-continuation-identity.js";
+export { continuationResultIdentityKeys } from "./execution-continuation-identity.js";
 
 const retryWakeReasons = new Set(["task_retry", "retry_failed_run"]);
 const maxRequeueChain = 32;
@@ -39,8 +44,7 @@ function continuationApiResult(operationId: string, result: unknown, companyId: 
   const serialized = JSON.stringify(data);
   if (Buffer.byteLength(serialized) <= 4 * 1024) return result;
   const reference: Record<string, unknown> = {};
-  for (const key of ["id", "companyId", "issueId", "key", "latestRevisionId", "latestRevisionNumber",
-    "identifier", "status", "statusVersion", "createdAt", "updatedAt"]) {
+  for (const key of continuationResultIdentityKeys) {
     const value = data[key];
     if (value === null || typeof value === "string" && value.length <= 256
       || typeof value === "number" && Number.isSafeInteger(value)) reference[key] = value;
@@ -231,11 +235,16 @@ export async function buildExecutionContinuation(input: {
   agentId: string;
   context: Record<string, unknown>;
   previousContextRunId?: string | null;
+  /** Selected native session: omitted revisions never cross a session reset. */
+  nativeSessionId?: string | null;
+  nativeProviderSessionId?: string | null;
   /** Server-owned current run identity when validating dispatch authority. */
   runId?: string;
   summary: string | null;
   exposeLowTrustRaw: boolean;
   prospectiveTaskStatus?: "todo";
+  /** Native-only preparation metadata, never serialized into the model prompt. */
+  onNativeReadState?: (state: NativeContinuationReadState) => void;
 }): Promise<ExecutionContinuationEnvelope> {
   const { db, companyId, issueId } = input;
   const [issue] = await db
@@ -365,12 +374,16 @@ export async function buildExecutionContinuation(input: {
       updatedAt: row.updatedAt.toISOString(),
       deleted: row.deletedAt !== null,
       sourceTrust: row.sourceTrust,
+      // The page-only marker written when a native session starts fresh (paperclip-control-plane-port.ts).
+      ...(!row.authorUserId && !row.authorAgentId && row.conversationSessionGeneration !== null &&
+        row.presentation?.kind === "system_notice" && typeof (row.metadata as { sourceRunId?: unknown } | null)?.sourceRunId === "string"
+        ? { freshSessionMarker: true as const } : {}),
     };
   });
   const previousRun = input.previousContextRunId
     ? (
         await db
-          .select({ context: heartbeatRuns.contextSnapshot })
+          .select({ context: heartbeatRuns.contextSnapshot, nativeSessionId: heartbeatRuns.nativeSessionId, profile: heartbeatRuns.runnerProfileJson })
           .from(heartbeatRuns)
           .where(
             and(
@@ -386,6 +399,48 @@ export async function buildExecutionContinuation(input: {
   const deliveredMessages = Array.isArray(priorEnvelope.messages)
     ? priorEnvelope.messages.map(object)
     : null;
+  const [accepted] = input.previousContextRunId ? await db.select({ id: heartbeatRunEvents.id, seq: heartbeatRunEvents.seq }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, input.previousContextRunId),
+    inArray(heartbeatRunEvents.eventType, ["turn.accepted", "turn.started"]))).orderBy(asc(heartbeatRunEvents.seq)).limit(1) : [];
+  const [previousGeneration] = input.previousContextRunId && input.nativeProviderSessionId
+    ? await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, input.previousContextRunId),
+      inArray(heartbeatRunEvents.eventType, ["session.started", "session.resumed", "session.reconciled"]),
+      accepted ? sql`${heartbeatRunEvents.seq} <= ${accepted.seq}` : undefined,
+    )).orderBy(desc(heartbeatRunEvents.seq)).limit(1) : [];
+  const priorCoverage = object(priorEnvelope.coverage);
+  const savedReadState = object(previousRun?.context?.nativeContinuationReadState);
+  const checkpoint = object(object(previousRun?.profile).sessionCheckpoint);
+  const savingSessionId = previousRun?.nativeSessionId ?? string(checkpoint.sessionId);
+  // Pre-upgrade read states had no generation fields. Infer their authority
+  // only from the saving run loaded above, never from caller context or the
+  // requested session alone. Explicit null/partial generation is not legacy.
+  // A normalized session can survive provider replacement: absence of all
+  // provider evidence must never manufacture omission authority.
+  const savingEventProviderId = string(object(object(object(previousGeneration?.payload).prpEvent).payload).providerSessionId);
+  const savingProviderId = string(checkpoint.providerSessionId) ?? savingEventProviderId;
+  const legacySameSession = !!savingProviderId && savingProviderId === input.nativeProviderSessionId
+    && !!input.nativeSessionId && !!input.nativeProviderSessionId
+    && savingSessionId === input.nativeSessionId
+    && (!string(checkpoint.sessionId) || checkpoint.sessionId === input.nativeSessionId)
+    && (!string(checkpoint.providerSessionId) || checkpoint.providerSessionId === input.nativeProviderSessionId)
+    && (!savingEventProviderId || savingEventProviderId === input.nativeProviderSessionId)
+    && !Object.hasOwn(savedReadState, "nativeSessionId") && !Object.hasOwn(savedReadState, "providerSessionId");
+  const legacyReadIds = new Set<string>(legacySameSession && Array.isArray(savedReadState.readCommentIds)
+    ? (savedReadState.readCommentIds as unknown[]).filter((id): id is string => typeof id === "string") : []);
+  const legacyReadAt = Date.parse(typeof savedReadState.lastRunAt === "string" ? savedReadState.lastRunAt : "");
+  const legacyReadRevision = (message: ExecutionContinuationEnvelope["messages"][number]) => legacyReadIds.has(message.id)
+    && Number.isFinite(legacyReadAt) && Date.parse(message.createdAt) < legacyReadAt && Date.parse(message.updatedAt) < legacyReadAt;
+  const sameGeneration = legacySameSession || (!!input.nativeSessionId && input.nativeSessionId === previousRun?.nativeSessionId
+    && !!input.nativeProviderSessionId
+    && (savingEventProviderId ?? string(priorCoverage.providerSessionId)) === input.nativeProviderSessionId);
+  const omitted = accepted && input.nativeSessionId && savingSessionId === input.nativeSessionId
+    && priorCoverage.nativeSessionId === input.nativeSessionId
+    && input.nativeProviderSessionId && (priorCoverage.providerSessionId === input.nativeProviderSessionId
+      || (!Object.hasOwn(priorCoverage, "providerSessionId") && legacySameSession))
+    && Array.isArray(priorCoverage.omitted)
+    ? priorCoverage.omitted.map(object) : [];
+  const omittedRevision = (message: ExecutionContinuationEnvelope["messages"][number]) => omitted.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt);
   const resumeDelta =
     deliveredMessages && input.previousContextRunId
       ? {
@@ -393,7 +448,9 @@ export async function buildExecutionContinuation(input: {
           messages: messages.filter(
             (message) =>
               originCommentIds.includes(message.id) ||
-              !deliveredMessages.some(
+              // A saved snapshot without provider evidence is not authority
+              // to hide a body from a selected native generation, either.
+              !(omittedRevision(message) || legacyReadRevision(message) || ((!input.nativeSessionId || (sameGeneration && accepted)) && deliveredMessages.some(
                 (prior) =>
                   prior.id === message.id &&
                   prior.updatedAt === message.updatedAt &&
@@ -403,7 +460,7 @@ export async function buildExecutionContinuation(input: {
                   (prior.createdByRunId ?? null) === message.createdByRunId &&
                   JSON.stringify(prior.sourceTrust) ===
                     JSON.stringify(message.sourceTrust),
-              ),
+              ))),
           ),
         }
       : undefined;
@@ -418,7 +475,8 @@ export async function buildExecutionContinuation(input: {
       ? { kind: "description" as const, id: issue.id, revision: hashObjectiveSource(issue.description) }
       : { kind: "title" as const, id: issue.id, revision: hashObjectiveSource(issue.title) };
   const priorRuns = await db
-    .select({ id: heartbeatRuns.id, result: historyResult, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId })
+    .select({ id: heartbeatRuns.id, result: historyResult, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId,
+      createdAt: heartbeatRuns.createdAt, startedAt: heartbeatRuns.startedAt })
     .from(heartbeatRuns)
     .where(
       and(
@@ -429,6 +487,23 @@ export async function buildExecutionContinuation(input: {
       ),
     )
     .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+  if (input.onNativeReadState) {
+    const generation = { nativeSessionId: input.nativeSessionId ?? null, providerSessionId: input.nativeProviderSessionId ?? null };
+    const read = await readByEarlierTurnCommentIds(db, { companyId, issueId, agentId: input.agentId,
+      commentIds: messages.map(message => message.id), currentRunId: input.runId, retainedGeneration: generation });
+    // Carry old saved reads forward only while the same native session is
+    // retained. The budgeter's explicit fresh target still drops all reads.
+    for (const message of messages) if (legacyReadRevision(message)) read.add(message.id);
+    // A stored snapshot alone is not delivery proof: size refusal can precede
+    // acceptance. Only a prior accepted turn can make its exact revisions read.
+    if (sameGeneration && accepted && deliveredMessages) for (const message of messages) {
+      if (omittedRevision(message) || deliveredMessages.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt && prior.body === message.body
+        && prior.deleted === message.deleted && prior.authorId === message.authorId
+        && (prior.createdByRunId ?? null) === message.createdByRunId && JSON.stringify(prior.sourceTrust) === JSON.stringify(message.sourceTrust))) read.add(message.id);
+    }
+    const lastRun = priorRuns.findLast(run => run.id !== input.runId);
+    input.onNativeReadState({ ...generation, lastRunAt: (lastRun?.startedAt ?? lastRun?.createdAt)?.toISOString() ?? null, readCommentIds: [...read] });
+  }
   const completedActions = priorRuns.flatMap((run) =>
     Object.entries(object(object(run.result).apiToolReceipts)).flatMap(
       ([receiptId, receipt]) => {

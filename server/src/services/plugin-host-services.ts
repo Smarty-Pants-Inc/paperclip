@@ -764,6 +764,11 @@ export function recordWorkerProviderSpan(
   try { visit(params, parent, 0); } catch {}
 }
 
+function isConversationInputPlugin(pluginId: string): boolean {
+  return (process.env.PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS ?? "")
+    .split(",").map(id => id.trim()).filter(Boolean).includes(pluginId);
+}
+
 export function buildHostServices(
   db: Db,
   pluginId: string,
@@ -2669,13 +2674,19 @@ export function buildHostServices(
           params.issueId,
           params.body,
           { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
+          {
+            // Installation identity comes from the authenticated host context,
+            // never from plugin-supplied comment attribution. Default deny.
+            allowConversationAgentInput: !params.actorUserId && Boolean(params.authorAgentId)
+              && isConversationInputPlugin(pluginId),
+          },
         )) as IssueComment;
         await logPluginActivity({
           companyId,
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
-          actor: { actorAgentId: params.actorUserId ? null : params.authorAgentId ?? null, actorUserId: params.actorUserId ?? null },
+          actor: { actorAgentId: comment.authorAgentId, actorUserId: comment.authorUserId, actorRunId: comment.createdByRunId },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
@@ -2683,14 +2694,12 @@ export function buildHostServices(
           },
         });
 
-        // Human-attributed comments participate in the same "wake the
-        // assignee" behavior a board user's comment gets in the web app
-        // (routes/issues.ts's addComment route) — a plugin's own
-        // agent-attributed comments never do this. Deliberately narrower
-        // than the HTTP route: no reopen/resume/interrupt/scheduled-retry
-        // handling here, just the core wake. An assignee-less or
-        // closed-status issue is a silent no-op, matching the route's own
-        // guard.
+        // Authored plugin comments use the HTTP comment's ordinary wake door,
+        // including post-commit agent steering when admission defers to a live
+        // run. Agent input requires an allow-listed installation, on ordinary
+        // tasks as well as conversations. Self-authored output never wakes its
+        // own assignee. No separate
+        // delivery/ACK path, reopen, resume or interrupt semantics live here.
         //
         // The guard re-fetches the issue instead of trusting the pre-insert
         // `issue` snapshot: a concurrent close/unassign/reassign landing
@@ -2702,16 +2711,19 @@ export function buildHostServices(
         // falls back to the in-hand snapshot rather than rejecting
         // createComment — a rejection would surface to the caller as a failed
         // write and invite a retry that inserts a duplicate comment.
-        if (params.actorUserId) {
+        // addComment may replace supplied attribution with the authenticated
+        // tool-call origin. Only persisted identity can authorize/attribute wake.
+        if (comment.authorUserId || (comment.authorAgentId && isConversationInputPlugin(pluginId))) {
           const postCommentIssue = (await issues.getById(issue.id).catch((err) => {
             logger.warn(
               { err, issueId: issue.id, commentId: comment.id },
-              "failed to re-fetch issue for plugin-relayed human comment wake; falling back to pre-insert snapshot",
+              "failed to re-fetch issue for plugin-relayed comment wake; falling back to pre-insert snapshot",
             );
             return null;
           })) ?? issue;
           if (
             postCommentIssue.assigneeAgentId
+            && (comment.authorUserId || comment.authorAgentId !== postCommentIssue.assigneeAgentId)
             && postCommentIssue.status !== "done"
             && postCommentIssue.status !== "cancelled"
           ) {
@@ -2724,21 +2736,23 @@ export function buildHostServices(
                 commentId: comment.id,
                 mutation: "comment",
               },
-              requestedByActorType: "user",
-              requestedByActorId: params.actorUserId,
+              requestedByActorType: comment.authorUserId ? "user" : "agent",
+              requestedByActorId: comment.authorUserId ?? comment.authorAgentId ?? undefined,
               contextSnapshot: {
                 issueId: issue.id,
                 taskId: issue.id,
                 sourceCommentId: comment.id,
+                wakeCommentId: comment.id,
                 wakeReason: "issue_commented",
                 source: `plugin:${pluginKey}`,
+                ...(comment.createdByRunId ? { sourceRunId: comment.createdByRunId } : {}),
               },
             }).catch((err) => logger.warn({
               err,
               issueId: issue.id,
               commentId: comment.id,
               agentId: postCommentIssue.assigneeAgentId,
-            }, "failed to wake assignee on plugin-relayed human comment"));
+            }, "failed to wake assignee on plugin-relayed comment"));
           }
         }
 

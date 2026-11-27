@@ -17,7 +17,11 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notificatio
 import { logActivity } from "./activity-log.js";
 
 export const PROVIDER_TRACE_MAX_BYTES = 64 * 1024 * 1024;
-export const PROVIDER_TRACE_RETENTION_MS = 24 * 60 * 60 * 1_000;
+// Seam 0271: raw provider traces are kept (0) unless PAPERCLIP_PROVIDER_TRACE_RETENTION_MS sets an expiry in ms.
+const retentionOverride = process.env.PAPERCLIP_PROVIDER_TRACE_RETENTION_MS?.trim();
+export const PROVIDER_TRACE_RETENTION_MS = retentionOverride ? Number(retentionOverride) : 0;
+if (!Number.isSafeInteger(PROVIDER_TRACE_RETENTION_MS) || PROVIDER_TRACE_RETENTION_MS < 0)
+  throw new Error("PAPERCLIP_PROVIDER_TRACE_RETENTION_MS must be a whole number of milliseconds (0 keeps traces)");
 const EXPIRED_PROVIDER_TRACE_REF = "00000000-0000-0000-0000-000000000000.ndjson";
 
 export function providerTraceRequiredChannels(provider: string): string[] {
@@ -426,7 +430,7 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
     const handle = await fs.open(filePath, "wx", 0o600);
     await handle.close();
     await fs.chmod(filePath, 0o600);
-    const expiresAt = new Date(Date.now() + PROVIDER_TRACE_RETENTION_MS);
+    const expiresAt = new Date(PROVIDER_TRACE_RETENTION_MS === 0 ? Date.parse("9999-12-31T23:59:59Z") : Date.now() + PROVIDER_TRACE_RETENTION_MS);
     const values = {
       runId: input.runId, companyId: input.companyId, status: "capturing", provider: input.provider,
       traceRef, requestedBy: input.requestedBy, expiresAt,

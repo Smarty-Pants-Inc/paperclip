@@ -121,6 +121,10 @@ vi.mock("../services/native-runtime/native-session-executor.js", () => ({
   closeWarmNativeSessionsForEnvironment:
     mockCloseWarmNativeSessionsForEnvironment,
 }));
+// Durable consumer invalidation is covered against PostgreSQL by the native/session suites.
+vi.mock("../services/native-runtime/held-native-turn.js", () => ({
+  requestHeldNativeConfigurationEndForTargets: vi.fn(async () => {}),
+}));
 
 vi.mock("../services/execution-workspaces.js", () => ({
   executionWorkspaceService: () => mockExecutionWorkspaceService,

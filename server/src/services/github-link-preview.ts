@@ -6,10 +6,10 @@ import { secretService } from "./secrets.js";
 import type { LinkPreviewProvider, LinkPreviewScope } from "./link-previews.js";
 
 /** Only the viewer's own connection is eligible. Never borrow the task assignee's identity. */
-export async function resolveLinkPreviewGitHubCredential(db: Db, scope: LinkPreviewScope) {
+export async function resolveLinkPreviewGitHubCredential(db: Db, scope: LinkPreviewScope, repository?: string) {
   if (scope.userId) {
     const managed = await resolveManagedGitHubCredential(db, secretService(db), scope.companyId, {
-      responsibleUserId: scope.userId, allowStandingDelegation: false,
+      responsibleUserId: scope.userId, allowStandingDelegation: false, ...(repository ? { repository } : {}),
     });
     if (managed.configured) {
       if (!managed.credential) throw new Error("GitHub connection unavailable");
@@ -26,7 +26,7 @@ export function createGitHubLinkPreviewProvider(db: Db, options?: GitHubExternal
       const [, owner, repo, , number] = new URL(target.canonicalUrl).pathname.split("/");
       const resolver = createGitHubExternalObjectProvider(db, {
         ...options,
-        credentialProvider: options?.credentialProvider ?? (() => resolveLinkPreviewGitHubCredential(db, scope)),
+        credentialProvider: options?.credentialProvider ?? (() => resolveLinkPreviewGitHubCredential(db, scope, `${owner}/${repo}`)),
       }).resolvers.find(candidate => candidate.objectType === "pull_request")!;
       const result = await resolver.resolve({ companyId: scope.companyId, signal, object: {
         externalId: `${owner}/${repo}#pull/${number}`,

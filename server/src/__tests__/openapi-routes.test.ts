@@ -554,7 +554,14 @@ describe("openapi routes", () => {
         expect(query.sort).toMatchObject({ enum: ["newest", "oldest"] });
         expect(query.since).toMatchObject({ format: "date-time" });
       } else {
-        expect(Object.keys(query).sort()).toEqual(["cursor", "limit"]);
+        expect(Object.keys(query).sort()).toEqual(path.endsWith("/chat-handoffs") ? ["cursor", "limit", "view"] : ["cursor", "limit"]);
+        if (path.endsWith("/chat-handoffs")) {
+          expect(query.view).toMatchObject({ type: "string", enum: ["tray"] });
+          for (const field of ["displayStatus", "externalConversationState", "blockerAttention", "unblockDescriptor",
+            "interruption", "blockedInboxAttention", "assigneeAgentId", "assigneeUserId", "updatedAt"]) {
+            expect(operation.description).toContain(field);
+          }
+        }
         expect(operation.responses["404"]).toBeDefined();
       }
       for (const code of ["200", "400", "401", "403"]) {

@@ -47,6 +47,9 @@ export interface IssueChatComment extends IssueComment {
 }
 
 export interface IssueChatLinkedRun {
+  /** Existing first-turn receipt: these comments were folded into the opening input. */
+  firstTurnCommentIds?: string[] | null;
+  retryOfRunId?: string | null;
   execution?: ExecutionProjection | null;
   runId: string;
   runtimeMode?: "legacy" | "native";
@@ -1069,6 +1072,7 @@ function normalizeLiveRuns(
     deduped.set(activeRun.id, {
       id: activeRun.id,
       status: activeRun.status,
+      runModel: activeRun.runModel,
       invocationSource: activeRun.invocationSource,
       triggerDetail: activeRun.triggerDetail,
       contextCommentId: activeRun.contextCommentId,

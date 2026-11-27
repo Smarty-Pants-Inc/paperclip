@@ -1837,7 +1837,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         ? { ...pending, expectedBindingRevision: nextRevision }
         : pending;
       await notifyStatusCardIssueChange(tx, companyId);
-      const [bound] = await tx.update(issues).set({ ...patch, executionWorkspaceId: workspaceId,
+      // Runtime binding owns mode only. Never write back a preparation-time
+      // copy of user policy: saves, explicit clears and absent keys all survive.
+      const { executionWorkspaceSettings: settingsPatch, ...bindingPatch } = patch;
+      const [bound] = await tx.update(issues).set({ ...bindingPatch,
+        ...(settingsPatch ? { executionWorkspaceSettings: {
+          ...parseObject(task.executionWorkspaceSettings),
+          ...(Object.hasOwn(settingsPatch, "mode") ? { mode: settingsPatch.mode } : {}),
+        } } : {}), executionWorkspaceId: workspaceId,
         workspaceBindingRevision: nextRevision, workspacePendingSelection: pendingAfterFirstBinding, updatedAt: new Date() })
         .where(eq(issues.id, issueId)).returning();
       return bound;

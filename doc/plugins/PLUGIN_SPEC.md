@@ -850,6 +850,25 @@ Governance helpers:
 - `ctx.issues.requestWakeups(issueIds, companyId, options)` applies the same host-owned wakeup semantics to a batch and may use an idempotency key prefix for stable coordinator retries.
 - `ctx.issues.createComment(issueId, body, companyId, options)` posts a comment attributed to the plugin's own agent by default (`options.authorAgentId`). Passing `options.actorUserId` instead attributes the comment to that human company member — this requires `issue.comments.create_human_attributed` in addition to `issue.comments.create`, and the host independently verifies `actorUserId` is an active human member of the company before applying it, so a plugin can never forge attribution to an arbitrary or inactive user. A human-attributed comment on a non-terminal-status issue with an assignee also triggers the same assignee wakeup a board user's comment gets.
 
+Conversation agent-input ingress is **off by default**. A deployment may set
+`PAPERCLIP_CONVERSATION_INPUT_PLUGIN_IDS` to a comma-separated list of trusted
+plugin **installation UUIDs** (the registered host-context `pluginId`, not a
+plugin key or caller-supplied field). Empty or unset permits no plugin. For a
+fleet-bridge installation, configure only its installation UUID. Whitespace
+around entries is ignored; matches are exact. An approved plugin may relay a
+run-less comment from a different agent in the same company into a conversation;
+it cannot post run-less output as the conversation's own agent. Existing company
+and interaction-permission checks still apply. Authenticated tool-call origins
+remain authoritative: persisted comment author/run identity supplies activity and
+wake attribution, and the assignee's own output never wakes itself.
+
+This is per-comment idempotent delivery, not a finite reciprocal-chain budget.
+The per-pair hourly watch is not implemented here: operators can group
+`issue.comment.created` activity by company, `details.sourcePluginId`,
+`details.initiatingAgentId`, target conversation/assignee and hour to observe
+A→B/B→A traffic. An automatic alert/cap requires a separately agreed threshold
+and operational owner; no new polling loop or silent admission limit is added.
+
 Plugin-originated issue, relation, document, comment, and wakeup mutations must write activity entries with `actorType: "plugin"` and details fields for `sourcePluginId`, `sourcePluginKey`, `initiatingActorType`, `initiatingActorId`, and `initiatingRunId` when a user or agent run initiated the plugin work.
 
 Scoped API routes:

@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createWriteStream } from "node:fs";
-import { lstat, mkdtemp, open, rm } from "node:fs/promises";
+import { lstat, mkdtemp, open, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import { sandboxSyncMinimumTimeoutMs } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { providerPackExtractionProbe } from "./provider-pack-extraction.js";
 
@@ -143,8 +144,10 @@ export async function stageProviderPackLayers(input: {
     bypassSession: true, timeoutMs: 10_000,
   }));
   if (capability.exitCode !== 0 || capability.timedOut) return false;
+  const reuseBytes = archive.files.reduce((sum, file) => sum + file.bytes, 0);
   const reused = await measure("provider_pack.archive.reuse", () => runner.execute({
-    command: "node", args: ["-e", reuseScript, spec], bypassSession: true, timeoutMs: 60_000,
+    command: "node", args: ["-e", reuseScript, spec], bypassSession: true,
+    timeoutMs: sandboxSyncMinimumTimeoutMs(Number.isSafeInteger(reuseBytes) ? reuseBytes : undefined),
   }));
   if (reused.exitCode !== 0 || reused.timedOut) throw Error("runner_remote_provider_archive_reuse_failed");
   let missing: number[];
@@ -180,10 +183,11 @@ export async function stageProviderPackLayers(input: {
       }
     })(), createWriteStream(bundlePath, { flags: "wx", mode: 0o600 })));
     const sha256 = hash.digest("hex");
+    const byteSize = (await stat(bundlePath)).size;
     await measure("provider_pack.archive.transfer", () => runner.syncIn!([{
       operationId: `runner-provider-layers-${randomUUID()}`,
       files: [{ kind: "file", sourcePath: bundlePath, targetPath: remoteArchive, mode: 0o600 }],
-    }]));
+    }], { minimumTimeoutMs: sandboxSyncMinimumTimeoutMs(byteSize) }));
     const result = await measure("provider_pack.archive.extract", () => runner.execute({
       command: "sh", args: ["-c", ["set -eu; umask 077;",
         `test ! -L ${quote(input.targetPath)}; test -d ${quote(input.targetPath)};`,

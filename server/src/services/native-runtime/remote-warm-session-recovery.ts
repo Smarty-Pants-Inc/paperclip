@@ -1,3 +1,4 @@
+import { sandboxRestartKey } from "../sandbox-snapshot-restore.js";
 import { and, eq } from "drizzle-orm";
 import { agents, companies, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
@@ -109,19 +110,23 @@ export function unsettledControllerCommands(commands: readonly Record<string, un
   });
 }
 
-export function isSettledRemoteWarmControlState(control: Record<string, unknown>, identity: Record<string, unknown>): boolean {
+export function isSettledRemoteWarmControlState(control: Record<string, unknown>, identity: Record<string, unknown>,
+  allowCompletedPiConversation = false): boolean {
   const commands = control.commands;
   const events = control.committedEvents;
   if (!Array.isArray(commands) || unsettledControllerCommands(commands.map(record)).length > 0 ||
       !Array.isArray(events) || Object.entries(identity).some(([key, value]) => record(control.identity)[key] !== value)) return false;
-  const terminalIndex = events.findLastIndex(event => record(event).eventType === "run.terminal");
+  let terminalIndex = events.findLastIndex(event => record(event).eventType === "run.terminal");
+  if (allowCompletedPiConversation) {
+    terminalIndex = Math.max(terminalIndex, events.findLastIndex(event => record(event).eventType === "turn.completed"));
+  }
   if (terminalIndex < 0) return false;
   const matchesSession = (event: unknown) => {
     const envelope = record(record(event).envelope);
     return envelope.runId === identity.runId && envelope.normalizedSessionId === identity.normalizedSessionId;
   };
   if (!matchesSession(events[terminalIndex])) return false;
-  return events.slice(terminalIndex + 1).every(event => {
+  return events.slice(terminalIndex + (record(events[terminalIndex]).eventType === "turn.completed" ? 0 : 1)).every(event => {
     const envelope = record(record(event).envelope);
     const notification = record(envelope.payload);
     const payload = record(notification.payload);
@@ -206,7 +211,10 @@ export async function inspectRemoteWarmSessionRecovery(input: {
   // sandbox (for example after a restart or deploy replaced the controller)
   // holds no Runner to adopt, so live adoption steps aside. Ordinary admission
   // then retires the finished owner or keeps it held with a named reason.
-  if (!input.portableSourceTaskId && target.transport === "sandbox" && ["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
+  if (!input.portableSourceTaskId && target.transport === "sandbox" && (
+    ["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")
+    || sandboxRestartKey(target.sandboxLeaseAcquisition)
+  )) {
     return null;
   }
   if (target.transport !== "sandbox" || !target.leaseId || !target.environmentId ||
@@ -240,7 +248,9 @@ export async function inspectRemoteWarmSessionRecovery(input: {
       checkpoint.driverKind !== previous.session.driverKind || !checkpoint.providerSessionId ||
       checkpoint.activeTurnId !== null || checkpoint.pendingRuntimeRequests?.length !== 0) return deny("checkpoint_unsettled");
   const control = input.readControlState();
-  if (!isSettledRemoteWarmControlState(control, identity)) return deny("journal_unsettled");
+  // A finalized Pi conversation has a server terminal but may lack a Runner terminal.
+  const completedPiConversation = previous.provider.kind === "pi_rpc" && previous.provider.conversationMode === true;
+  if (!isSettledRemoteWarmControlState(control, identity, completedPiConversation)) return deny("journal_unsettled");
   const assertPriorStopped = async () => {
     const persistedRecovery = readNativeControllerRecovery(prior.run.runnerProfileJson?.nativeControllerRecovery,
       prior.run.runnerProfileJson?.sessionCheckpoint);

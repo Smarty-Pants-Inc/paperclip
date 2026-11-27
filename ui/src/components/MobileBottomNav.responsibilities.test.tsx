@@ -48,8 +48,11 @@ async function renderNav() {
   return host;
 }
 
-const tabs = (host: HTMLElement) =>
-  [...host.querySelectorAll("a, button")].map((node) => `${node.textContent}:${node.getAttribute("href") ?? "action"}`);
+const tabs = (host: HTMLElement) => {
+  const bar = host.querySelector('[data-testid="mobile-tab-bar"]');
+  expect(bar).not.toBeNull();
+  return [...bar!.querySelectorAll("a, button")].map((node) => `${node.textContent}:${node.getAttribute("href") ?? "action"}`);
+};
 
 it.each([
   [false, "/dashboard"],

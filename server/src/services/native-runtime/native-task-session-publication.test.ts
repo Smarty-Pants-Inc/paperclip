@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
-import { agents, agentTaskSessions, companies, completionContracts, createDb, heartbeatRuns, issues,
+import { agents, agentTaskSessions, companies, completionContracts, createDb, heartbeatRuns, issueComments, issues,
   nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { CONTROL_PLANE_CONFORMANCE_OPEN, CONTROL_PLANE_CONFORMANCE_RESULT,
   CONTROL_PLANE_CONFORMANCE_TERMINAL } from "../../vendor/paperclip-runner/testing.js";
@@ -16,6 +16,8 @@ import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
 import { PaperclipControlPlanePort, type PaperclipControlPlaneBinding } from "./paperclip-control-plane-port.js";
 import { nativeTaskSessionPublicationHandled, publishNativeTaskSessionInTransaction, NATIVE_TASK_SESSION_PUBLICATION_KEY,
   type NativeTaskSessionPublicationContext } from "./native-task-session-publication.js";
+
+import { publishContinuousNativeReply } from "./native-continuous-reply.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_NATIVE_PUBLICATION_TEST_DATABASE_URL");
 describe("accepted native task session publication", () => {
@@ -289,18 +291,65 @@ describe("accepted native task session publication", () => {
     expect((await f.read()).session?.lastRunId).toBe(f.binding.runId);
   });
 
-  it("does not block completeRun's issue KEY SHARE while publishing", async () => {
-    const f = await fixture(); let release!: () => void; let locked!: () => void;
-    const ready = new Promise<void>(resolve => { locked = resolve; });
-    const hold = new Promise<void>(resolve => { release = resolve; });
-    const blocker = db.transaction(async tx => {
-      await tx.select().from(issues).where(eq(issues.id, f.binding.issueId)).for("key share"); locked(); await hold;
-    });
-    await ready;
-    try { await f.port.checkpointSession(f.snapshot); }
-    finally { release(); await blocker; }
-    expect((await f.read()).session?.lastRunId).toBe(f.binding.runId);
-  });
+  it.each(["task-session publication", "continuous-reply publication"] as const)(
+    "does not block completeRun's issue KEY SHARE during %s", async publication => {
+      const f = await fixture(); let release!: () => void; let locked!: () => void;
+      if (publication === "continuous-reply publication") {
+        await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } })
+          .where(eq(agents.id, f.binding.agentId));
+      }
+      const ready = new Promise<void>(resolve => { locked = resolve; });
+      const hold = new Promise<void>(resolve => { release = resolve; });
+      const continuous = publication === "continuous-reply publication";
+      const blocker = db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '1s'`);
+        if (continuous) {
+          // The event writer owns RUN before its ISSUE foreign-key check.
+          await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.binding.runId)).for("no key update");
+          locked(); await hold;
+          await tx.select().from(issues).where(eq(issues.id, f.binding.issueId)).for("key share");
+        } else {
+          await tx.select().from(issues).where(eq(issues.id, f.binding.issueId)).for("key share"); locked(); await hold;
+        }
+      });
+      void blocker.catch(() => undefined);
+      let reply: ReturnType<typeof publishContinuousNativeReply> | undefined;
+      try {
+        await Promise.race([ready, blocker]);
+        await measured.execute(sql`set lock_timeout = '5s'`);
+        if (publication === "task-session publication") {
+          await f.port.checkpointSession(f.snapshot);
+          expect((await f.read()).session?.lastRunId).toBe(f.binding.runId);
+        } else {
+          reply = publishContinuousNativeReply({ db: measured, cursor: 1, recoverTerminal: true,
+            execution: { binding: f.binding, provider: { kind: "pi_rpc" } },
+            event: { eventType: "item.completed", runId: f.binding.runId, normalizedSessionId: f.binding.sessionId,
+              sourceEventId: "lock-order-final", itemId: "lock-order-final", turnId: "lock-order-turn",
+              payload: { kind: "agentMessage", channel: "final", providerPhase: "final", text: "Reply published without blocking the run writer." } },
+          });
+          void reply.catch(() => undefined);
+          // Publication must own ISSUE and be waiting for RUN before the
+          // writer checks ISSUE; reversing either order misses the deadlock.
+          await expect.poll(async () => (await db.execute(sql`select 1 from pg_stat_activity
+            where application_name = 'native-publication-observer' and wait_event_type = 'Lock'`)).length,
+            { timeout: 3_000 }).toBe(1);
+          // pg_stat_activity truncates the full run projection, so inspect the
+          // wire observer rather than matching its truncated query text.
+          expect(statements.at(-1)).toMatch(/from "heartbeat_runs".*for update/);
+          release();
+          await blocker;
+          expect(await reply).toBe(true);
+          expect(await db.select({ body: issueComments.body }).from(issueComments)
+            .where(eq(issueComments.issueId, f.binding.issueId)))
+            .toEqual([{ body: "Reply published without blocking the run writer." }]);
+        }
+      } finally {
+        release();
+        await Promise.allSettled([blocker, ...(reply ? [reply] : [])]);
+        await measured.execute(sql`set lock_timeout = '0'`);
+      }
+    },
+  );
 
   it("rechecks the owner clock and issue authority after an issue lock wait", async () => {
     const f = await fixture(); let release!: () => void; let locked!: () => void;

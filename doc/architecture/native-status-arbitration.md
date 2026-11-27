@@ -439,6 +439,19 @@ including the ability to run tests and create temporary files. An operator who
 needs filesystem isolation must configure it in the execution environment.
 The review role does not raise the provider permission mode or bypass a sandbox.
 
+A person's Stop ends the reviewer run as succeeded ("Stopped.") without resolving
+its review card. An authorized person can use **Resume review** on that pending
+card. The server exposes `canResumeReview` only when the latest scoped native
+reviewer run has `personStop`, has finished successfully, and no reviewer attempt
+or wake is live or queued for the review. It rechecks these facts and the person's
+card permissions under the task and card locks. The action
+`POST /api/issues/:id/interactions/:interactionId/resume_review` saves another
+durable wake with key `native-review:<interactionId>:resume:<n>`, keeping the same
+`nativeReviewInteractionId` and `nativeReviewDecisionId`. Concurrent presses reuse
+the wake for that Stop; a later Stop permits a new numbered wake. This neither
+resolves the card nor changes task status, assignee, decision, or execution stage.
+It is not an automatic retry, and comments and mentions keep their usual meaning.
+
 Admission claims the reviewer run, its wake, and the child execution lock in
 one transaction. If another run holds the lock, the reviewer stays queued.
 The provider does not start without this claim.

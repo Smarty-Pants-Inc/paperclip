@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { runningProcesses } from "../adapters/index.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
@@ -42,11 +43,19 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 
+import { closeConversationResetHold } from "../modules/wake-queue/index.js";
+const closeHeldNativeTurnMock = vi.hoisted(() => vi.fn());
 const steerNativeSessionMock = vi.hoisted(() => vi.fn());
+const automaticSteeringAvailable = vi.hoisted(() => ({ value: false }));
 vi.mock("../services/native-runtime/native-session-executor.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
   steerNativeSessionMock.mockImplementation(actual.steerNativeSession);
-  return { ...actual, steerNativeSession: steerNativeSessionMock };
+  closeHeldNativeTurnMock.mockImplementation(actual.closeHeldNativeTurn);
+  return { ...actual, steerNativeSession: steerNativeSessionMock, closeHeldNativeTurn: closeHeldNativeTurnMock,
+    getNativeSessionSteeringState: (runId: string) => automaticSteeringAvailable.value
+      ? Promise.resolve({ disposition: "available", activeTurnId: "automatic-comment-turn" })
+      : actual.getNativeSessionSteeringState(runId),
+  };
 });
 const { NativeSessionSteeringError } = await import("../services/native-runtime/native-session-executor.js");
 
@@ -161,6 +170,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         _paperclipWakeContext: {
           commentId: commentIds[1],
           wakeCommentId: commentIds[1],
+          wakeReason: "issue_commented",
           wakeCommentIds: commentIds,
         },
       },
@@ -216,11 +226,17 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   }
 
   it.each([false, true])("polls queued comments without transferring run snapshots (agent fallback: %s)", async fallback => {
-    const f = await seedQueue(), payload = "saved-execution-input🙂".repeat(25_000);
+    const f = await seedQueue(), payload = "saved-execution-input🙂".repeat(25_000), sessionId = randomUUID();
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, prompt: payload },
       runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner", adapterConfig: { instructions: payload } } },
       stdoutExcerpt: payload, stderrExcerpt: payload,
+      nativeSessionId: sessionId,
+      resultJson: { bulk: "x".repeat(1_048_576), continuedSessionInput: {
+        runId: f.runId, sessionId, commentIds: [f.commentIds[0]],
+      } },
     }).where(eq(heartbeatRuns.id, f.runId));
+    const { continuousSessionAcknowledgedCommentIds } = await import("../services/native-runtime/continuous-session-input.js");
+    expect(await continuousSessionAcknowledgedCommentIds(db, f)).toEqual(new Set([f.commentIds[0]]));
     if (fallback) await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
     const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
     const observed = createDb(tempDb!.connectionString), events: Array<Record<string, unknown>> = [], now = Date.now();
@@ -231,7 +247,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         .get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
       expect(response.body.queueId).toBe(f.wakeId);
       expect(response.body.targetRunId).toBe(f.runId);
-      expect(response.body.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds);
+      expect(response.body.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual(f.commentIds.slice(1));
       capture.flush();
       const reads = events.filter(event => event.table === "heartbeat_runs" && event.operation === "select");
       expect(reads.length).toBeGreaterThan(0);
@@ -1870,6 +1886,86 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(await db.select().from(activityLog).where(eq(activityLog.entityId, seeded.issueId))).toHaveLength(0);
   });
 
+  it.each([true, false])("asks only an idle hold to close for a reset head (held=%s)", async held => {
+    const f = await seedQueue();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    await db.update(issueComments).set({ body: " /new " }).where(eq(issueComments.id, f.commentIds[0]));
+    closeHeldNativeTurnMock.mockClear().mockResolvedValueOnce(held);
+    expect(await closeConversationResetHold(db, { companyId: f.companyId, issueId: f.issueId })).toBe(held);
+    expect(closeHeldNativeTurnMock).toHaveBeenCalledExactlyOnceWith(f.runId);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(wake.status).toBe("deferred_issue_execution");
+    expect(run).toMatchObject({ status: "running", resultJson: null });
+    expect(run.resultJson?.personStop).toBeUndefined();
+    await db.update(issueComments).set({ body: "ordinary follow-up" }).where(eq(issueComments.id, f.commentIds[0]));
+    closeHeldNativeTurnMock.mockClear();
+    expect(await closeConversationResetHold(db, { companyId: f.companyId, issueId: f.issueId })).toBe(false);
+    expect(closeHeldNativeTurnMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["flag-off", "unsupported-provider", "paperclip", "available", "review"])("retains stock close for an other-agent head unless the drain can take it (%s)", async scenario => {
+    const f = await seedQueue();
+    const [sender] = await db.insert(agents).values({ companyId: f.companyId, name: "Other agent", adapterType: "process" }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, conversationSessionGeneration: 0 },
+      resultJson: { continuousReplies: { opening: { commentId: "opening-reply" } } } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    await db.update(agents).set({ adapterConfig: { provider: scenario === "unsupported-provider" ? "codex" : "pi_rpc",
+      sessionContinuity: scenario === "paperclip" ? "paperclip" : "continuous" } }).where(eq(agents.id, f.agentId));
+    await db.update(issueComments).set({ authorType: "agent", authorAgentId: sender.id, authorUserId: null }).where(eq(issueComments.id, f.commentIds[0]));
+    const [before] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    if (scenario === "review") await db.update(agentWakeupRequests).set({ payload: { ...before.payload,
+      _paperclipWakeContext: { ...(before.payload?._paperclipWakeContext as object), wakeReason: "execution_review_requested" } } }).where(eq(agentWakeupRequests.id, f.wakeId));
+    const flag = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = scenario === "flag-off" ? "false" : "true";
+    automaticSteeringAvailable.value = true;
+    closeHeldNativeTurnMock.mockClear().mockResolvedValueOnce(true);
+    try {
+      expect(await closeConversationResetHold(db, { companyId: f.companyId, issueId: f.issueId })).toBe(scenario !== "available");
+      expect(closeHeldNativeTurnMock.mock.calls.length).toBe(scenario === "available" ? 0 : 1);
+      const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(after.status).toBe("deferred_issue_execution");
+      expect(after.runId).toBeNull();
+      expect(after.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: f.commentIds });
+    } finally {
+      automaticSteeringAvailable.value = false;
+      if (flag === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+      else process.env.PAPERCLIP_AGENT_CHAT_STEERING = flag;
+    }
+  });
+
+  it("asks an idle hold to close once for a deferred non-person wake", async () => {
+    const f = await seedQueue();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ payload: { issueId: f.issueId }, reason: "subtask_completed", requestedByActorType: "system" }).where(eq(agentWakeupRequests.id, f.wakeId));
+    closeHeldNativeTurnMock.mockClear().mockResolvedValueOnce(true);
+    expect(await closeConversationResetHold(db, { companyId: f.companyId, issueId: f.issueId })).toBe(true);
+    expect(closeHeldNativeTurnMock).toHaveBeenCalledExactlyOnceWith(f.runId);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(wake.status).toBe("deferred_issue_execution");
+    expect(run.resultJson?.personStop).toBeUndefined();
+  });
+
+  it("refuses steering a /new head or a later row across that reset", async () => {
+    const f = await seedQueue();
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "queue-owner", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    await db.update(issueComments).set({ body: "/new" }).where(eq(issueComments.id, f.commentIds[0]));
+    const previous = process.env.PAPERCLIP_AGENT_CHAT_STEERING;
+    process.env.PAPERCLIP_AGENT_CHAT_STEERING = "true";
+    try {
+      const initial = await request(app(f.companyId)).get(`/api/issues/${f.issueId}/queued-comments`);
+      steerNativeSessionMock.mockClear();
+      for (const commentId of f.commentIds) {
+        const reply = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/${commentId}/steer`)
+          .send({ queueId: f.wakeId, revision: initial.body.revision, targetRunId: f.runId });
+        expect(reply.status, JSON.stringify(reply.body)).toBe(409);
+        expect(reply.body.error).toContain("/new needs a new session");
+      }
+      expect(steerNativeSessionMock).not.toHaveBeenCalled();
+    } finally { if (previous === undefined) delete process.env.PAPERCLIP_AGENT_CHAT_STEERING; else process.env.PAPERCLIP_AGENT_CHAT_STEERING = previous; }
+  });
+
   it("leaves the selected row queued when no native steering session is attached", async () => {
     const seeded = await seedQueue();
     const initial = await request(app(seeded.companyId))
@@ -2172,6 +2268,107 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     return identity!;
   }
 
+  it.each(["same-wake", "earlier-wake"])("automatic delivery rechecks person FIFO under its issue lock (%s)", async scenario => {
+    const f = await seedQueue();
+    await seedDispatchIdentity(f);
+    const [sender] = await db.insert(agents).values({ companyId: f.companyId, name: "Agent input", adapterType: "process" }).returning();
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "agent", authorAgentId: sender.id, body: "Must not pass a person" }).returning();
+    const payload = { issueId: f.issueId, _paperclipWakeContext: { wakeReason: "issue_commented",
+      wakeCommentIds: scenario === "same-wake" ? [...f.commentIds, comment.id] : [comment.id] } };
+    const [wake] = scenario === "same-wake"
+      ? await db.update(agentWakeupRequests).set({ payload }).where(eq(agentWakeupRequests.id, f.wakeId)).returning()
+      : await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+          reason: "issue_commented", status: "deferred_issue_execution", requestedAt: new Date(Date.now() + 1000), payload }).returning();
+    const { createQueuedCommentSteeringAdapter, readBoardQueuedComments } = await import("../modules/wake-queue/adapters/queued-comment-board-postgres.js");
+    const { createSteerQueuedComment } = await import("../modules/wake-queue/application/queued-comment-use-cases.js");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const actor = { actorType: "agent" as const, actorId: sender.id, agentId: sender.id, runId: null, agentApiKeyId: null };
+    const queue = await readBoardQueuedComments({ executor: db, issue, activeRun: run, actor,
+      queueState: { wake, state: "deferred", queueRun: null } });
+    const before = steerNativeSessionMock.mock.calls.length;
+    await expect(createSteerQueuedComment(createQueuedCommentSteeringAdapter(db, { requireQueueHead: true }))({
+      issue, actor, queueId: wake.id, revision: queue.revision, targetRunId: run.id, commentId: comment.id,
+    })).rejects.toMatchObject({ code: "queued_comment_order_mismatch" });
+    expect(steerNativeSessionMock.mock.calls.length).toBe(before);
+    const [unchanged] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+    expect(unchanged).toMatchObject({ status: "deferred_issue_execution", payload });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].resultJson?.queuedSteeringAcknowledgements).toBeUndefined();
+  });
+
+  it.each(["agent"] as const)("keeps older person input ahead of a %s API comment, then acknowledges it once", async author => {
+    const seeded = await seedQueue();
+    await seedDispatchIdentity(seeded);
+    let caller = app(seeded.companyId);
+    if (author === "agent") {
+      const [sender] = await db.insert(agents).values({ companyId: seeded.companyId, name: "Agent A", status: "idle", adapterType: "process" }).returning();
+      const [senderIssue] = await db.insert(issues).values({ companyId: seeded.companyId, title: "Agent A's work", status: "in_progress", assigneeAgentId: sender.id }).returning();
+      const [senderRun] = await db.insert(heartbeatRuns).values({ companyId: seeded.companyId, agentId: sender.id, status: "running",
+        runtimeMode: "legacy", contextSnapshot: { issueId: senderIssue.id } }).returning();
+      caller = app(seeded.companyId, "queue-owner", { agentId: sender.id, runId: senderRun.id });
+    }
+    automaticSteeringAvailable.value = true;
+    const callsBefore = steerNativeSessionMock.mock.calls.length;
+    try {
+      const posted = await request(caller).post(`/api/issues/${seeded.issueId}/comments`)
+        .send({ body: `${author} API message delivered without a page countdown` });
+      expect(posted.status, JSON.stringify(posted.body)).toBe(201);
+      expect(steerNativeSessionMock.mock.calls.length - callsBefore).toBe(0);
+      const pending = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+      expect(pending.body.entries.slice(0, 2).map((entry: { comment: { id: string } }) => entry.comment.id))
+        .toEqual(seeded.commentIds);
+      await vi.waitFor(async () => {
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, seeded.agentId));
+        expect(wakes.some(wake => JSON.stringify(wake.payload).includes(posted.body.id))).toBe(true);
+      });
+      // Deliver older person input through the same transactional ACK door.
+      for (const commentId of seeded.commentIds) {
+        const queue = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+        steerNativeSessionMock.mockResolvedValueOnce({ turnId: `person-${commentId}` });
+        const sent = await request(app(seeded.companyId)).post(`/api/issues/${seeded.issueId}/queued-comments/${commentId}/steer`)
+          .send({ queueId: queue.body.queueId, targetRunId: seeded.runId, revision: queue.body.revision });
+        expect(sent.status, JSON.stringify(sent.body)).toBe(200);
+      }
+      const agentQueue = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`);
+      expect(agentQueue.body.entries.map((entry: { comment: { id: string } }) => entry.comment.id)).toEqual([posted.body.id]);
+      steerNativeSessionMock.mockResolvedValueOnce({ turnId: "automatic-comment-turn" });
+      const { steerCommittedQueuedComment } = await import("../modules/wake-queue/index.js");
+      await steerCommittedQueuedComment(db, { companyId: seeded.companyId, issueId: seeded.issueId,
+        agentId: seeded.agentId, commentId: posted.body.id });
+      await vi.waitFor(async () => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+        expect(run.resultJson?.queuedSteeringAcknowledgements).toMatchObject({ [posted.body.id]: {
+          status: "acknowledged", turnId: "automatic-comment-turn",
+        } });
+      }, { timeout: 5_000 });
+      for (const queueId of [agentQueue.body.queueId]) {
+        const replay = await request(app(seeded.companyId))
+          .post(`/api/issues/${seeded.issueId}/queued-comments/${posted.body.id}/steer`)
+          .send({ queueId, targetRunId: seeded.runId, revision: agentQueue.body.revision });
+        expect(replay.status, JSON.stringify(replay.body)).toBe(200);
+      }
+      expect(steerNativeSessionMock.mock.calls.length - callsBefore).toBe(3);
+      expect(steerNativeSessionMock.mock.calls.slice(callsBefore).map(([input]) => input.correlationId))
+        .toEqual([...seeded.commentIds, posted.body.id]);
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+      expect(Object.keys(saved.resultJson!.queuedSteeringAcknowledgements as object).sort()).toEqual([...seeded.commentIds, posted.body.id].sort());
+      const replayActivities = await db.select().from(activityLog).where(eq(activityLog.action, "issue.queued_comment_steered"));
+      expect(replayActivities.filter(row => row.details?.duplicate === true)).toHaveLength(1);
+      const identities = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.messageId, posted.body.id));
+      expect(identities).toHaveLength(1);
+      expect(identities[0].status).toBe("accepted");
+      process.stdout.write(`AUTO_STEER_PAGE_REPLAY ${JSON.stringify({ author, runId: seeded.runId, commentId: posted.body.id,
+        acknowledgement: saved.resultJson!.queuedSteeringAcknowledgements, httpStatuses: [200], duplicateActivities: 1,
+        providerTurns: 3, fifo: [...seeded.commentIds, posted.body.id], acceptedIdentities: identities.length })}\n`);
+    } finally {
+      await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+      automaticSteeringAvailable.value = false;
+      const actual = await vi.importActual<typeof import("../services/native-runtime/native-session-executor.js")>("../services/native-runtime/native-session-executor.js");
+      steerNativeSessionMock.mockReset().mockImplementation(actual.steerNativeSession);
+    }
+  });
+
   it("writes the identity acceptance, the wake payload, the run acknowledgement, and the activity row on a successful steering transaction", async () => {
     const seeded = await seedQueue();
     await seedDispatchIdentity(seeded);
@@ -2236,12 +2433,26 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     await db.update(heartbeatRuns).set({ runnerProfileJson: originalProfile }).where(eq(heartbeatRuns.id, seeded.runId));
     await db.update(issues).set({ assigneeAdapterOverrides: { model: "gpt-6-sol", reasoningEffort: "xhigh" } })
       .where(eq(issues.id, seeded.issueId));
+    let ackSeq!: number;
     steerNativeSessionMock.mockImplementationOnce(async () => {
       await db.transaction(async tx => {
         await tx.execute(sql`set local lock_timeout = '1000ms'`);
-        await appendHeartbeatRunEvent(tx as unknown as typeof db, {
+        const acknowledgement = await appendHeartbeatRunEvent(tx as unknown as typeof db, {
           companyId: seeded.companyId, agentId: seeded.agentId, runId: seeded.runId,
           eventType: "item.completed", payload: { kind: "steering_acknowledgement" },
+        });
+        ackSeq = acknowledgement.row.seq;
+        // Validated native ACK and a later provider item can both commit before
+        // the steering transaction resumes. Neither the pre-dispatch cursor nor
+        // the latest run cursor identifies the ACK's actual place in the stream.
+        await tx.update(heartbeatRunEvents).set({ sourceEventId: "steer-ack-cursor", payload: { prpEvent: {
+          sourceEventId: "steer-ack-cursor", turnId: "turn-before-model-change",
+          itemId: `turn-before-model-change:steer:${seeded.commentIds[0]}`,
+          payload: { kind: "steering_acknowledgement" },
+        } } }).where(eq(heartbeatRunEvents.id, acknowledgement.row.id));
+        await appendHeartbeatRunEvent(tx as unknown as typeof db, {
+          companyId: seeded.companyId, agentId: seeded.agentId, runId: seeded.runId,
+          eventType: "item.delta", payload: { text: "A later provider item" },
         });
         await tx.update(heartbeatRuns).set({ resultJson: { concurrentProviderReceipt: "preserve" } })
           .where(eq(heartbeatRuns.id, seeded.runId));
@@ -2259,7 +2470,7 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     expect(steerNativeSessionMock).toHaveBeenCalledWith(expect.objectContaining({ runId: seeded.runId,
       message: "First queued message", correlationId: seeded.commentIds[0] }));
     expect(run.resultJson).toMatchObject({ concurrentProviderReceipt: "preserve", queuedSteeringAcknowledgements: {
-      [seeded.commentIds[0]]: { status: "acknowledged", turnId: "turn-before-model-change" },
+      [seeded.commentIds[0]]: { status: "acknowledged", turnId: "turn-before-model-change", afterEventSeq: ackSeq },
     } });
     expect(steered.body.entries.map((entry: any) => entry.comment.id)).toEqual([seeded.commentIds[1]]);
   });

@@ -345,6 +345,11 @@ describe("Codex app-server Codex driver", () => {
       "turn/steer",
       "turn/interrupt",
     ]);
+    const commandResult = { result: { code: "execution_indeterminate", message: "interrupt Authorization: Bearer private-interrupt-token", diagnostic: "private-interrupt-token" }, status: "failed" };
+    transport.rejectMethods.set("turn/interrupt", Object.defineProperty(new Error("Provider request failed"), "runnerCommandResult", { value: commandResult }));
+    const failure = await session.interrupt?.({ turnId }).catch(error => error);
+    expect(Object.getOwnPropertyDescriptor(failure, "runnerCommandResult")?.value).toEqual({ code: "execution_indeterminate", message: "interrupt Authorization: Bearer [REDACTED]" });
+    expect(Object.getOwnPropertyDescriptor(failure, "runnerCommandResult")?.enumerable).toBe(false);
     expect(session.ids()).toEqual({
       driverSessionId: "thread-1",
       providerSessionId: "provider-session-1",
@@ -435,7 +440,7 @@ describe("Codex app-server Codex driver", () => {
     }
   });
 
-  it("acknowledges same-turn steering and rejects stale or child steering", async () => {
+  it.each([false, true])("acknowledges same-turn steering and rejects stale or child steering (unsupported: %s)", async unsupported => {
     const fixture = await loadLiveConsoleConformanceFixture(
       liveConsoleFixturePath,
     );
@@ -470,10 +475,11 @@ describe("Codex app-server Codex driver", () => {
     expect(
       transport.calls.filter((call) => call.method === "turn/steer"),
     ).toHaveLength(1);
-    transport.rejectMethods.set(
-      "turn/steer",
-      new Error("provider rejected steering"),
-    );
+    const commandResult = { result: { code: "execution_indeterminate", message: "provider Authorization: Bearer private-steer-token", diagnostic: "private-steer-token" }, status: "failed" };
+    transport.rejectMethods.set("turn/steer", Object.defineProperty(
+      new Error(`${unsupported ? "unsupported: " : ""}provider rejected steering Authorization: Bearer private-steer-token`),
+      "runnerCommandResult", { value: commandResult, enumerable: false },
+    ));
     const rejectedSteering = await session
       .steer?.({
         turnId,
@@ -485,10 +491,12 @@ describe("Codex app-server Codex driver", () => {
         (error: unknown) => error,
       );
     expect(rejectedSteering).toBeInstanceOf(Error);
-    expect(rejectedSteering).not.toBeInstanceOf(
-      HarnessCapabilityUnavailableError,
-    );
+    expect(rejectedSteering instanceof HarnessCapabilityUnavailableError).toBe(unsupported);
     expect(String(rejectedSteering)).toContain("provider rejected steering");
+    expect(String(rejectedSteering)).not.toContain("private-steer-token");
+    const descriptor = Object.getOwnPropertyDescriptor(rejectedSteering, "runnerCommandResult");
+    expect(descriptor?.value).toEqual({ code: "execution_indeterminate", message: "provider Authorization: Bearer [REDACTED]" });
+    expect(descriptor?.enumerable).toBe(false);
     transport.rejectMethods.delete("turn/steer");
     await expect(
       session.steer?.({
@@ -524,7 +532,7 @@ describe("Codex app-server Codex driver", () => {
     const observed: PrpEvent[] = [];
     // PRP v2 adds a capability and authoritative goal snapshot immediately
     // after session start, so include those two events in this bounded read.
-    for (let index = 0; index < 11; index += 1) {
+    for (let index = 0; index < 11 + Number(unsupported); index += 1) {
       const next = await events.next();
       if (next.done) break;
       observed.push(next.value);

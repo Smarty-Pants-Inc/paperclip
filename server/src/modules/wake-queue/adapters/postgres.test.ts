@@ -488,6 +488,41 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect((rows[0][0] as typeof heartbeatRuns.$inferSelect).resultJson).toEqual(result);
   });
 
+  it("never promotes input-only handbacks into unbudgeted starts", async () => {
+    const companyId = await seedCompany(), agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, status: "blocked", assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "failed", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(), scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, runId));
+    const [old] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user",
+      authorUserId: "responsible-user", body: "The failed opening still needs an answer" }).returning();
+    const oldWakeId = await seedDeferredWake({ companyId, agentId, issueId, requestedByActorId: "responsible-user",
+      payload: { preDispatchInputOnly: true, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [old.id] } } });
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+    const input = { companyId, runId, now: new Date(), suppressImmediateRecovery: true, resumeStrandedQueue: true };
+    for (let pass = 0; pass < 3; pass++) {
+      expect((await release(input)).outcome.kind).toBe("released");
+      expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, oldWakeId)))[0])
+        .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    }
+    // Even after the failure's execution gate has settled, the saved input
+    // alone cannot create an uncounted attempt. Ordinary new work still can.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    expect((await release(input)).outcome.kind).toBe("released");
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    const [next] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user",
+      authorUserId: "responsible-user", body: "A new authorized request" }).returning();
+    const nextWakeId = await seedDeferredWake({ companyId, agentId, issueId, requestedByActorId: "responsible-user",
+      payload: { _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [next.id] } } });
+    expect((await release(input)).outcome.kind).toBe("promoted");
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, nextWakeId)))[0])
+      .toMatchObject({ status: "queued", runId: expect.any(String) });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, oldWakeId)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].scheduledRetryAttempt).toBe(2);
+  });
+
   it.each(["assignee", "mentioned"])("preserves a paused recipient's accepted message until resume (%s)", async kind => {
     const companyId = await seedCompany();
     const ownerId = await seedAgent({ companyId });

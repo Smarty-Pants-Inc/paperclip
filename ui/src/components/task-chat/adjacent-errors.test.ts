@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compactAdjacentErrors } from "./adjacent-errors";
+import { compactAdjacentErrors, isRetryableFailureMarker } from "./adjacent-errors";
 import type { TaskChatItem, TaskChatMarkerItem, TaskChatMessageItem } from "./task-chat-model";
 
 const failed: TaskChatMarkerItem = {
@@ -11,6 +11,24 @@ const recovery: TaskChatMessageItem = {
 };
 
 describe("compactAdjacentErrors", () => {
+  it("uses the run's retry decision independently of display copy, including on the surviving notice", () => {
+    const renamed = { ...failed, label: "Couldn't finish", retryable: true };
+    const retitled = { ...renamed, label: "Another failure description" };
+    for (const marker of [renamed, retitled]) {
+      expect(isRetryableFailureMarker(marker)).toBe(true);
+      expect(isRetryableFailureMarker(compactAdjacentErrors([marker, recovery]).retryMarkers.get(recovery.id)!)).toBe(true);
+    }
+    const denied = { ...renamed, id: "latest-denied", retryable: false };
+    const target = compactAdjacentErrors([renamed, denied, recovery]).retryMarkers.get(recovery.id)!;
+    expect(target).toBe(denied);
+    expect(isRetryableFailureMarker(target)).toBe(false);
+    expect(isRetryableFailureMarker({ ...failed, retryable: false })).toBe(false);
+    // Standalone historical markers lack status/capability fields; do not
+    // silently grant new retries or remove their existing ones.
+    expect(isRetryableFailureMarker(failed)).toBe(true);
+    expect(isRetryableFailureMarker({ ...failed, label: "Couldn't finish" })).toBe(false);
+  });
+
   it.each([
     [failed, recovery],
     [recovery, failed],

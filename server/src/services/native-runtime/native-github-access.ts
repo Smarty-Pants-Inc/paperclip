@@ -10,6 +10,7 @@ import {
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
+import { gitHubRepositoryHint } from "../git-credentials.js";
 
 type Binding = { companyId: string; agentId: string; issueId: string; runId: string };
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
@@ -26,7 +27,7 @@ export async function createNativeGitHubAccess(input: {
   target: LauncherInput["target"];
   cwd: string;
   env: NodeJS.ProcessEnv;
-  resolveCredentials: (binding: Binding) => Promise<unknown>;
+  resolveCredentials: (binding: Binding & { repository?: string }) => Promise<unknown>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   launcherKey?: string;
 }, startBridge = startAdapterExecutionTargetPaperclipBridge) {
@@ -76,7 +77,13 @@ export async function createNativeGitHubAccess(input: {
     }
     try {
       // Bind at receipt; body/headers cannot select a run or responsible user.
-      const result = await input.resolveCredentials({ ...binding });
+      const requested = req.headers["x-paperclip-github-repository"];
+      const repository = typeof requested === "string" ? gitHubRepositoryHint(requested, true) : undefined;
+      if (requested !== undefined && !repository) {
+        reply(403, { error: "Invalid GitHub repository hint" });
+        return;
+      }
+      const result = await input.resolveCredentials({ ...binding, ...(repository ? { repository } : {}) });
       if (active !== binding || stopped) {
         reply(403, { error: "GitHub run ended during credential acquisition" });
         return;

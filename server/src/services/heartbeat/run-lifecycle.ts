@@ -13,6 +13,7 @@ import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notificat
 import { notifyNativeRunProjection } from "../native-run-projection-notifications.js";
 import { notifyRetainedNativeSessionCleanup } from "../retained-native-session-cleanup-notifications.js";
 import { notifyUnsafeWorkspaceExportRunChange } from "../unsafe-workspace-export-notifications.js";
+import { preservePersonStopResultSql } from "../person-stop-result.js";
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
@@ -272,6 +273,7 @@ const LIVENESS_BOOKKEEPING_EVENT_TYPES = [
 ];
 
 export const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
+  "pi_model_provider_required",
   "project_access_denied",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
@@ -697,7 +699,7 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 function preserveNativeExecutionObligationsSql(incoming: Record<string, unknown> | null, setupFailure = false) {
-  const projected = incoming === null ? sql`null::jsonb` : sql`${JSON.stringify(incoming)}::jsonb`;
+  const projected = preservePersonStopResultSql(incoming === null ? sql`null::jsonb` : sql`${JSON.stringify(incoming)}::jsonb`);
   const result = setupFailure ? sql`case when ${heartbeatRuns.runtimeMode} = 'native'
     and exists (select 1 from ${nativeRunFinalizations}
       where ${nativeRunFinalizations.runId} = ${heartbeatRuns.id}
@@ -1150,7 +1152,10 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .then((rows) => rows[0] ?? null);
 
     if (previousStatus && patch?.resultJson !== undefined) patch = { ...patch,
-      resultJson: preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      resultJson: {
+        ...(previousStatus.resultJson?.configurationSupersession ? { configurationSupersession: previousStatus.resultJson.configurationSupersession } : {}),
+        ...preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      },
     };
 
     // Preserve the receipt-source fence when finalization enriches usage. A
@@ -1263,7 +1268,10 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     }
 
     if (previousStatus && patch?.resultJson !== undefined) patch = { ...patch,
-      resultJson: preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      resultJson: {
+        ...(previousStatus.resultJson?.configurationSupersession ? { configurationSupersession: previousStatus.resultJson.configurationSupersession } : {}),
+        ...preserveWorkspaceRestoreRecoveryMetadata(previousStatus.resultJson, patch.resultJson),
+      },
     };
 
     // Preserve the receipt-source fence when finalization enriches usage. A
@@ -2394,12 +2402,14 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     companyId: string,
     issueId: string,
     resultJson?: Record<string, unknown> | null,
+    replyKey?: string,
   ) {
     const comments = await db
       .select({
         id: issueComments.id,
         body: issueComments.body,
         presentation: issueComments.presentation,
+        clientRequestId: issueComments.clientRequestId,
       })
       .from(issueComments)
       .where(
@@ -2410,7 +2420,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         ),
       )
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id));
-    return findHeartbeatRunCompletionComment(comments, resultJson);
+    return findHeartbeatRunCompletionComment(comments, resultJson, replyKey);
   }
 
   async function findLatestCompletedFinalAgentMessage(

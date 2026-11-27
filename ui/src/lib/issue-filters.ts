@@ -50,7 +50,7 @@ export const defaultIssueFilterState: IssueFilterState = {
   workspaces: [],
   liveOnly: false,
   externalObjectStatuses: [],
-  showAgentCreatedTasks: false,
+  showAgentCreatedTasks: true,
   routineTasksOnly: false,
 };
 
@@ -119,7 +119,7 @@ export function normalizeIssueFilterState(value: unknown): IssueFilterState {
     workspaces: normalizeIssueFilterValueArray(candidate.workspaces),
     liveOnly: candidate.liveOnly === true,
     externalObjectStatuses: normalizeIssueFilterValueArray(candidate.externalObjectStatuses),
-    showAgentCreatedTasks: candidate.showAgentCreatedTasks === true,
+    showAgentCreatedTasks: candidate.showAgentCreatedTasks !== false,
     routineTasksOnly: candidate.routineTasksOnly === true,
   };
 }
@@ -305,6 +305,6 @@ export function countActiveIssueFilters(
   if (state.liveOnly) count += 1;
   if (state.routineTasksOnly) count += 1;
   if (state.externalObjectStatuses.length > 0) count += 1;
-  if (enableAgentCreatedVisibilityFilter && state.showAgentCreatedTasks) count += 1;
+  if (enableAgentCreatedVisibilityFilter && !state.showAgentCreatedTasks) count += 1;
   return count;
 }

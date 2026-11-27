@@ -730,8 +730,8 @@ export interface RunnerProcessHandle {
   processGroupId?: number | null;
   startedAt?: string;
   isExitConfirmed?(): boolean;
-  /** Relaunches the same immutable process specification with a fresh ticket. */
-  restart?: ((ticket: string) => RunnerProcessHandle) | null;
+  /** Relaunches the same process specification with a fresh ticket and current authority. */
+  restart?: ((ticket: string, identity?: DurableRecoveryIdentity, connection?: RunnerProcessConnection) => RunnerProcessHandle) | null;
 }
 
 export type RunnerProcessConnection =
@@ -4922,6 +4922,13 @@ const runnerExplicitProviderEnvironmentKeys = [
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+  "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+  "PAPERCLIP_AI_PROVIDER_AUTH",
+  "PAPERCLIP_AI_PROVIDER_HEADERS",
+  "PAPERCLIP_PI_RUNTIME_DIR",
+  "PAPERCLIP_PI_RESOURCES_DIR",
+  "PAPERCLIP_PI_THINKING_LEVEL",
+  "PAPERCLIP_PI_CONTINUOUS",
   "PAPERCLIP_OPENCODE_PERMISSION_MODE",
   "PAPERCLIP_OPENCODE_RUNTIME_DIR",
   "PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS",
@@ -5177,12 +5184,12 @@ export function spawnRunner(options: {
     ...handle,
     // Remote owners publish this identity after dispatch; keep it live through the wrapper.
     get startedAt() { return handle.startedAt; },
-    restart: (ticket) => {
+    restart: (ticket, identity, connection) => {
       if (handle.isExitConfirmed?.() === false) {
         throw new Error("runner_process_termination_unconfirmed");
       }
       if (lifetimeDeadline !== undefined && lifetimeDeadline <= Date.now()) throw new Error("runner_process_lifetime_expired");
-      return spawnRunner({ ...options, ticket, refreshBootstrapTicket: undefined,
+      return spawnRunner({ ...options, ...(identity ? { identity, environment: { ...options.environment, PAPERCLIP_RUN_ID: identity.runId } } : {}), ...(connection ? { connection } : {}), ticket, refreshBootstrapTicket: undefined,
         ...(lifetimeDeadline === undefined ? {} : { maxLifetimeMs: lifetimeDeadline - Date.now() }) });
     },
   });

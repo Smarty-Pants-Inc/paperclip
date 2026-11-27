@@ -1,8 +1,23 @@
 import type { ComponentType } from "react";
-import type { CreateConfigValues } from "@paperclipai/adapter-utils";
+import type { CreateConfigValues, TranscriptEntry as SharedTranscriptEntry } from "@paperclipai/adapter-utils";
 
-// Re-export shared types so local consumers don't need to change imports
-export type { TranscriptEntry, StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";
+// Content freshness is separate from placement and completion's clock.
+export interface TranscriptContentVersion {
+  at: string;
+  sequence?: number;
+  scope?: string;
+  completed: boolean;
+}
+// Placement keeps event order across session reads; completion owns the clock.
+export type TranscriptEntry = SharedTranscriptEntry & {
+  completedAt?: string;
+  firstSeenAt?: string;
+  providerEventId?: string;
+  contentVersion?: TranscriptContentVersion;
+  eventSeq?: number;
+  steeringEvent?: { kind: "ack" | "input" | "end"; turnId: string | null; commentId?: string };
+};
+export type { StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";
 
 export interface StatefulStdoutParser {
   parseLine: (line: string, ts: string) => import("@paperclipai/adapter-utils").TranscriptEntry[];
@@ -88,6 +103,6 @@ export interface UIAdapterModule extends TranscriptParserSource {
      * auto-follows the newest line — for backends whose delta volume
      * overwhelms the ticker.
      */
-    liveReasoningView?: "ticker" | "scrollLog";
+    liveReasoningView?: "ticker" | "scrollLog" | "inline";
   };
 }

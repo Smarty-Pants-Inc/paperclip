@@ -1,6 +1,40 @@
+import { constants } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { redactSensitiveText } from "../../redaction.js";
 import { nativeRunFailureCheck, type NativeRunTrace } from "./native-run-trace.js";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
+
+/** Absence keeps stock Pi. An advertised but damaged native installation must fail closed. */
+export async function installedNativePiDriverAvailable(): Promise<boolean> {
+  const packRoot = process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH?.trim();
+  if (!packRoot) return false;
+  // Reuse execution's manifest reader: this checks selection identity, not the
+  // multi-gigabyte pack contents. Execution still owns full artifact admission.
+  const { resolveRemoteProviderPackSource } = await import("./native-session-executor.js");
+  const { manifest } = resolveRemoteProviderPackSource(packRoot, "pi_rpc");
+  const pi = manifest.payload.pi_rpc;
+  if (pi === undefined) return false;
+  if (!pi || typeof pi.version !== "string" || !pi.version.trim()) {
+    throw new Error("The native Pi driver manifest is invalid.");
+  }
+  const root = resolve(packRoot);
+  for (const artifact of [pi.runtime, pi.resources]) {
+    if (!artifact || typeof artifact.path !== "string" || !artifact.path
+      || isAbsolute(artifact.path) || !/^sha256:[a-f0-9]{64}$/.test(artifact.sha256)) {
+      throw new Error("The native Pi driver artifact identity is invalid.");
+    }
+    const path = resolve(root, artifact.path);
+    const within = relative(root, path);
+    if (!within || within.startsWith("..") || isAbsolute(within)) {
+      throw new Error("The native Pi driver artifact is outside its provider pack.");
+    }
+    const info = await stat(path);
+    if (!info.isFile() && !info.isDirectory()) throw new Error("The native Pi driver artifact is unavailable.");
+  }
+  await access(join(root, "dist/cli/pi-rpc-command.sh"), constants.R_OK | constants.X_OK);
+  return true;
+}
 
 /** Qualified ACPX releases carry their Linux image manifest and daemon. */
 export function shouldUseBundledAcpxImageAssets(input: {

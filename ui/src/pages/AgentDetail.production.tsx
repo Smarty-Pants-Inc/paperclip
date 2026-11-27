@@ -40,11 +40,12 @@ import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { useAdapterCapabilities } from "@/adapters/use-adapter-capabilities";
 import { MarkdownEditor } from "../components/MarkdownEditor";
 import { assetsApi } from "../api/assets";
-import { StatusBadge } from "../components/StatusBadge";
+import { IssueStatusBadge, StatusBadge } from "../components/StatusBadge";
 import { MarkdownBody } from "../components/MarkdownBody";
 import { CopyText } from "../components/CopyText";
 import { EntityRow } from "../components/EntityRow";
-import { StatusGlyph } from "../components/StatusGlyph";
+import { StatusIcon as TaskStatusIcon } from "../components/StatusIcon";
+import { taskStatusIconProps, type TaskStatusPresentationInput } from "../lib/task-status-presentation";
 import { MembershipAction } from "../components/MembershipAction";
 import { StarToggle } from "../components/StarToggle";
 import { Identity } from "../components/Identity";
@@ -1121,7 +1122,7 @@ function SummaryRow({ label, children }: { label: string; children: React.ReactN
   );
 }
 
-export type LatestRunIssue = { id: string; title: string; status: string; identifier?: string | null };
+export type LatestRunIssue = TaskStatusPresentationInput & { id: string; title: string; identifier?: string | null };
 
 /**
  * The id of the issue a run works on, read from its context snapshot. Newer
@@ -1222,12 +1223,7 @@ function LatestRunCard({
   // snapshot id used to resolve the row so it hits regardless of id-vs-slug.
   const effectiveIssuesById =
     fallbackIssue && snapshotIssueId
-      ? new Map(issuesById).set(snapshotIssueId, {
-          id: fallbackIssue.id,
-          title: fallbackIssue.title,
-          status: fallbackIssue.status,
-          identifier: fallbackIssue.identifier,
-        })
+      ? new Map(issuesById).set(snapshotIssueId, fallbackIssue)
       : issuesById;
   const { task, runHref, rowHref } = resolveLatestRunNavigation(run, agentId, effectiveIssuesById);
   const statusInfo = runStatusIcons[run.status] ?? { icon: Clock, color: "text-neutral-400" };
@@ -1267,7 +1263,7 @@ function LatestRunCard({
           <StatusBadge status={run.status} />
           {task ? (
             <>
-              <StatusGlyph status={task.status} size="sm" />
+              <TaskStatusIcon {...taskStatusIconProps(task)} size="sm" />
               <span className="font-mono text-xs text-muted-foreground">
                 {task.identifier ?? task.id.slice(0, 8)}
               </span>
@@ -1368,7 +1364,7 @@ function AgentOverview({
                 identifier={issue.identifier ?? issue.id.slice(0, 8)}
                 title={issue.title}
                 to={`/issues/${issue.identifier ?? issue.id}`}
-                trailing={<StatusBadge status={issue.status} />}
+                trailing={<IssueStatusBadge {...taskStatusIconProps(issue)} />}
               />
             ))}
             {assignedIssues.length > 10 && (
@@ -3225,7 +3221,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 className="flex items-center justify-between w-full px-3 py-2 text-xs hover:bg-accent/20 transition-colors text-left no-underline text-inherit"
               >
                 <div className="flex items-center gap-2 min-w-0">
-                  <StatusBadge status={issue.status} />
+                  <IssueStatusBadge {...taskStatusIconProps({ ...issue, id: issue.issueId })} />
                   <span className="truncate">{issue.title}</span>
                 </div>
                 <span className="font-mono text-muted-foreground shrink-0 ml-2">{issue.identifier ?? issue.issueId.slice(0, 8)}</span>

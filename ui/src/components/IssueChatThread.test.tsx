@@ -463,7 +463,7 @@ describe("IssueChatThread", () => {
     const root = createRoot(container);
     const onCancelRun = vi.fn(async () => {});
     const waitingRun = {
-      id: "waiting-run", issueId: "issue-1", status: "queued", invocationSource: "assignment", triggerDetail: null,
+      runModel: null, id: "waiting-run", issueId: "issue-1", status: "queued", invocationSource: "assignment", triggerDetail: null,
       startedAt: null, finishedAt: null, createdAt: "2026-11-13T12:00:00.000Z",
       agentId: "agent-1", agentName: "Codie", adapterType: "codex_local",
     };
@@ -4185,6 +4185,7 @@ describe("IssueChatThread", () => {
             agentId: "agent-1",
             agentName: "Agent 1",
             adapterType: "codex_local",
+            runModel: null,
           },
         ],
       });
@@ -4226,6 +4227,7 @@ describe("IssueChatThread", () => {
             agentId: "agent-1",
             agentName: "Agent 1",
             adapterType: "codex_local",
+            runModel: null,
           },
         ],
       });
@@ -4257,6 +4259,7 @@ describe("IssueChatThread", () => {
             agentId: "agent-1",
             agentName: "Agent 1",
             adapterType: "codex_local",
+            runModel: null,
           },
         ],
         transcriptsByRunId: new Map([
@@ -4301,6 +4304,7 @@ describe("IssueChatThread", () => {
           id: "run-1",
           issueId: "issue-1",
           status: "running",
+          runModel: null,
           invocationSource: "comment",
           triggerDetail: null,
           startedAt: "2026-04-06T12:00:00.000Z",

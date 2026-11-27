@@ -30,6 +30,8 @@ import { requestTaskRetry } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
 import { taskAutomaticAttempts } from "./recovery/task-automatic-attempts.js";
+import { conversationOwedInputs } from "./conversation-owed-input.js";
+import { publishContinuousNativeReply } from "./native-runtime/native-continuous-reply.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -142,6 +144,57 @@ suite("fresh-continuation fallback", () => {
     expect(record!.ownerType).toBe("system");
     return next[0]!;
   }
+
+  it.each(["per_run", "task_retry", "task_retry_lost_context"] as const)("a person's new-session Retry attributes its answer to the source question and clears interruption: %s", async route => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "reusable_sandbox_resume_failed", hold: "none" });
+    const questionId = randomUUID(), oldSessionId = randomUUID(), newSessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
+    try {
+      await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+      await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId, conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+      await db.insert(issueComments).values({ id: questionId, companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+        body: "Please answer this saved question.", createdAt: new Date(Date.now() - 120_000) });
+      await db.update(heartbeatRuns).set({ nativeSessionId: oldSessionId, createdAt: new Date(Date.now() - 119_000),
+        startedAt: new Date(Date.now() - 118_000), contextSnapshot: { issueId: f.issueId,
+          ...(route === "task_retry_lost_context" ? {} : { wakeCommentId: questionId }), conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.runId));
+      expect((await conversationOwedInputs(db, companyId, [f.issueId])).get(f.issueId)?.commentId).toBe(questionId);
+      await occupySlot();
+      if (route !== "per_run") {
+        const retry = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, observedRunId: f.runId,
+          idempotencyKey: randomUUID() });
+        await heartbeatService(db).resumeTaskRetry(companyId, retry.requestId!);
+      } else await heartbeatService(db).wakeup(agentId, { failedRunId: f.runId,
+        source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", requestedByActorType: "user", requestedByActorId: userId,
+        payload: { issueId: f.issueId }, contextSnapshot: { issueId: f.issueId } });
+      const [next] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, agentId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`,
+        sql`${heartbeatRuns.id} <> ${f.runId}`));
+      expect(next).toBeDefined();
+      expect(next!.contextSnapshot).toMatchObject({ forceFreshSession: true, wakeCommentIds: [questionId] });
+      const { personRetryOwedQuestionIds } = await import("./fresh-continuation-retry-fold.js");
+      expect(await personRetryOwedQuestionIds(db, { companyId, issueId: f.issueId, agentId, sourceRunId: f.runId, userId: "another-person" })).toEqual([]);
+      const currentIssue = await issue(f.issueId);
+      await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.issueId,
+        nativeSessionId: newSessionId, startedAt: new Date(), contextSnapshot: { ...next.contextSnapshot,
+          conversationSessionGeneration: currentIssue.conversationSessionGeneration } }).where(eq(heartbeatRuns.id, next.id));
+      await db.update(issues).set({ status: "in_progress", executionRunId: next.id, conversationState: "active" }).where(eq(issues.id, f.issueId));
+      await publishContinuousNativeReply({ db, cursor: 10,
+        execution: { binding: { companyId, issueId: f.issueId, runId: next.id, agentId }, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: next.id, normalizedSessionId: newSessionId,
+          sourceEventId: "person-retry-final", itemId: "person-retry-final", turnId: "replacement-turn",
+          payload: { kind: "agentMessage", channel: "final", text: "Here is the answer to your saved question." } } });
+      const [answered] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id));
+      expect(answered.resultJson?.continuousReplies).toMatchObject({ "person-retry-final": { questionCommentIds: [questionId], commentId: expect.any(String) } });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.id));
+      await db.update(issues).set({ executionRunId: null, conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+      expect((await conversationOwedInputs(db, companyId, [f.issueId])).has(f.issueId)).toBe(false);
+      const presentation = await taskInterruptionPresentation(db, await issue(f.issueId));
+      expect(presentation).toBeNull();
+      expect(await getExecutionBlocker(db, companyId, f.issueId)).toBeNull();
+      process.stdout.write("person-retry-answer-proof " + JSON.stringify({ route, sourceRunId: f.runId, successorRunId: next.id,
+        oldSessionId, newSessionId, questionId, replies: answered.resultJson?.continuousReplies, owedAfterAnswer: false, presentation }) + "\n");
+    } finally { await db.update(agents).set({ adapterConfig: {} }).where(eq(agents.id, agentId)); }
+  }, 60_000);
 
   // The five most frequent endings on staging (2026-11-12): each left the task
   // Blocked for a person with no successor run.

@@ -12,7 +12,7 @@ vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({ useCoordinatorWorkspa
 vi.mock("@/context/DesignSandboxContext", () => ({ useDesignSandbox: () => false }));
 vi.mock("@/lib/router", () => ({
   Outlet: () => <div data-task-chat-shell="" />,
-  useLocation: () => ({ pathname: "/PAP/issues/PAP-1", search: "", hash: "", state: null }),
+  useLocation: () => ({ pathname: fixture.pathname, search: "", hash: "", state: null }),
   useNavigate: () => vi.fn(), useNavigationType: () => "PUSH", useParams: () => ({ companyPrefix: "PAP" }),
 }));
 vi.mock("./Sidebar", () => ({ Sidebar: () => null }));
@@ -26,7 +26,8 @@ vi.mock("./BoardDialogs", () => ({ BoardDialogs: () => null }));
 vi.mock("./KeyboardShortcutsCheatsheet", () => ({ KeyboardShortcutsCheatsheet: () => null }));
 vi.mock("./ToastViewport", () => ({ ToastViewport: () => null }));
 vi.mock("./AnnouncementWell", () => ({ AnnouncementWell: () => null }));
-vi.mock("./MobileBottomNav", () => ({ MobileBottomNav: () => null }));
+vi.mock("./MobileBottomNav", () => ({ MobileBottomNav: () => <nav aria-label="Mobile navigation" /> }));
+const fixture = vi.hoisted(() => ({ mobile: false, pathname: "/PAP/issues/PAP-1" }));
 vi.mock("./WorktreeBanner", () => ({ WorktreeBanner: () => null }));
 vi.mock("./DevRestartBanner", () => ({ DevRestartBanner: () => null }));
 vi.mock("./SidebarAccountMenu", () => ({ SidebarAccountMenu: () => null }));
@@ -38,7 +39,7 @@ vi.mock("../context/CompanyContext", () => ({ useCompany: () => ({
   selectedCompanyId: "company-1", loading: false, setSelectedCompanyId: vi.fn(),
 }) }));
 vi.mock("../context/SidebarContext", () => ({ useSidebar: () => ({
-  isMobile: false, sidebarOpen: true,
+  isMobile: fixture.mobile, sidebarOpen: true,
   setSidebarOpen: vi.fn(),
 }) }));
 vi.mock("../hooks/useKeyboardShortcuts", () => ({ useKeyboardShortcuts: () => undefined }));
@@ -49,7 +50,8 @@ vi.mock("../lib/company-selection", () => ({ shouldSyncCompanySelectionFromRoute
 vi.mock("../lib/main-content-focus", () => ({ scheduleMainContentFocus: () => () => undefined }));
 vi.mock("../plugins/slots", () => ({ usePluginSlots: () => ({ slots: [] }), resolveRouteSidebarSlot: () => null, PluginSlotMount: () => null }));
 
-it.each([["standard", Layout], ["production", ProductionLayout]] as const)("sizes desktop-width conversations above the keyboard in %s", async (_, Shell) => {
+for (const mobile of [false, true]) it.each([["standard", Layout], ["production", ProductionLayout]] as const)(`sizes conversations inside the keyboard shell (mobile=${mobile}) in %s`, async (_, Shell) => {
+  fixture.mobile = mobile;
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const viewport = Object.assign(new EventTarget(), { height: 1024, scale: 1 });
   vi.stubGlobal("visualViewport", viewport);
@@ -64,7 +66,12 @@ it.each([["standard", Layout], ["production", ProductionLayout]] as const)("size
     const shell = container.querySelector<HTMLElement>(".paperclip-app-shell")!;
     const conversation = shell.querySelector<HTMLElement>("[data-task-chat-shell]")!;
     await act(async () => { viewport.height = 600; viewport.dispatchEvent(new Event("resize")); });
-    expect(shell.dataset.mobile).toBeUndefined();
+    expect(shell.dataset.mobile).toBe(mobile ? "true" : undefined);
+    if (mobile) {
+      expect(shell.querySelector('nav[aria-label="Mobile navigation"]')).not.toBeNull();
+      expect(shell.querySelector("#main-content")?.className).toContain("pb-(--tc-composer-visible-nav-offset)");
+      expect(shell.querySelector<HTMLElement>("#main-content")?.style.getPropertyValue("--tc-composer-bottom")).toBe("var(--tc-composer-visible-nav-offset)");
+    }
     expect(shell.dataset.keyboardOpen).toBe("true");
     expect(shell.style.getPropertyValue("--mobile-chat-viewport-height")).toBe("600px");
     const stylesheet = readFileSync(resolve("ui/src/index.css"), "utf8");
@@ -77,12 +84,19 @@ it.each([["standard", Layout], ["production", ProductionLayout]] as const)("size
     expect(shell.style.getPropertyValue("--mobile-chat-viewport-height")).toBe("600px");
     await act(async () => { viewport.scale = 1; viewport.height = 1024; viewport.dispatchEvent(new Event("resize")); });
     expect(shell.dataset.keyboardOpen).toBeUndefined();
-    expect(shell.matches(sizingRule[1].trim())).toBe(false);
+    expect(shell.matches(sizingRule[1].trim())).toBe(mobile);
+    if (mobile) {
+      fixture.pathname = "/PAP/issues";
+      await act(async () => root.render(<QueryClientProvider client={queryClient}><Shell /></QueryClientProvider>));
+      expect(shell.querySelector("#main-content")?.className).toContain("pb-(--sz-calc-14)");
+    }
   } finally {
     await act(async () => root.unmount());
     queryClient.clear();
     container.remove();
     Reflect.deleteProperty(document.documentElement, "clientHeight");
     vi.unstubAllGlobals();
+    fixture.mobile = false;
+    fixture.pathname = "/PAP/issues/PAP-1";
   }
 });

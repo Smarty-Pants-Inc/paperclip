@@ -4,6 +4,10 @@ import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, authUsers, companyMemberships, environmentLeases, environments, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { beforeAll, expect, it, vi } from "vitest";
+import { chatCompletionDeliveries, chatTaskHandoffs } from "@paperclipai/db";
+import { prepareChatCompletionTurn } from "../services/chat-completion-delivery.js";
+import { publishContinuousNativeReply } from "../services/native-runtime/native-continuous-reply.js";
+import { NativeRunnerOwnershipUnverifiedError } from "../services/native-runtime/native-runner-ownership.js";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, environmentResumeErrorData } from "@paperclipai/plugin-sdk";
 import { DurablePrpControlPlane } from "../vendor/paperclip-runner/index.js";
 import * as storageBackend from "../storage/index.js";
@@ -141,6 +145,50 @@ describeEmbeddedPostgres("heartbeat native remote preparation failure retention"
     return { f, db, heartbeat, userId, workspaceId, environmentId, leaseId, providerLeaseId, remoteCwd,
       acquireAllocation, readyAllocation };
   }
+
+  it("reattaches the original lease for a held delivered completion without failing or selecting another completion", async () => {
+    let arranged: Awaited<ReturnType<typeof arrangeRemoteRestart>> | undefined;
+    // The existing driver fixture stops at the original runner's first remote
+    // read. A durable ownership hold avoids pretending a fake Runner exited.
+    const reached = vi.fn(async (): Promise<never> => { throw new NativeRunnerOwnershipUnverifiedError(); });
+    try {
+      arranged = await arrangeRemoteRestart("DELIVERED-COMPLETION-REATTACH", {
+        resumeLease: async ({ lease }) => lease, execute: reached,
+      });
+      const { f, db, heartbeat, userId, leaseId, readyAllocation, acquireAllocation } = arranged;
+      await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol", sessionContinuity: "continuous" } }).where(eq(agents.id, agentId));
+      await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId,
+        conversationState: "active", conversationSessionGeneration: 0 }).where(eq(issues.id, f.issueId));
+      const [task] = await db.insert(issues).values({ companyId, title: "Finished delegated task", status: "done" }).returning();
+      await db.insert(chatTaskHandoffs).values({ companyId, taskId: task.id, conversationId: f.issueId, agentId, sessionGeneration: 0 });
+      const [delivery] = await db.insert(chatCompletionDeliveries).values({ companyId, taskId: task.id, statusVersion: task.statusVersion }).returning();
+      const [original] = await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId,
+        wakeReason: "chat_task_completed", conversationSessionGeneration: 0, chatCompletionDeliveryIds: [delivery.id] } })
+        .where(eq(heartbeatRuns.id, f.runId)).returning();
+      const frozen = await prepareChatCompletionTurn(db, original);
+      expect(await publishContinuousNativeReply({ db, cursor: 1,
+        execution: { binding: { companyId, agentId, runId: f.runId, issueId: f.issueId }, provider: { kind: "pi_rpc" } },
+        event: { eventType: "item.completed", runId: f.runId, normalizedSessionId: f.native.normalizedSessionId,
+          sourceEventId: randomUUID(), itemId: "completion-final", payload: { kind: "agentMessage", channel: "final", text: "The delegated work is complete." } },
+      })).toBe(true);
+      const [published] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      const before = await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.id, delivery.id));
+      expect(before).toMatchObject([{ status: "delivered", targetRunId: f.runId, responseCommentId: expect.any(String) }]);
+      const { claims } = await heartbeat.recoverNativeRunsAfterRestart(new Date(), [f.runId]);
+      await heartbeat.drainActiveRunExecutions();
+      expect(claims).toEqual([expect.objectContaining({ kind: "reattach_remote_runner", runId: f.runId })]);
+      expect(readyAllocation).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ lease: expect.objectContaining({ id: leaseId, heartbeatRunId: f.runId }) }));
+      expect(acquireAllocation).not.toHaveBeenCalled();
+      expect(reached).toHaveBeenCalledOnce();
+      const [resumed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      expect(resumed).toMatchObject({ status: "running", finishedAt: null, runnerProfileJson: published.runnerProfileJson,
+        contextSnapshot: { chatCompletionDeliveryIds: frozen.contextSnapshot!.chatCompletionDeliveryIds,
+          chatCompletionUpdates: published.contextSnapshot!.chatCompletionUpdates }, resultJson: published.resultJson });
+      expect(await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.id, delivery.id))).toEqual(before);
+      expect(await db.select().from(issueComments).where(eq(issueComments.createdByRunId, f.runId))).toHaveLength(1);
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].executionRunId).toBe(f.runId);
+    } finally { await arranged?.restore(); }
+  }, 60_000);
 
   it.each(["modern", "legacy", "provider_history"] as const)("preserves the allocated workspace when restart preparation fails (%s)", async mode => {
     const preparationFailure = new Error("Sandbox failed to become ready within the timeout period");

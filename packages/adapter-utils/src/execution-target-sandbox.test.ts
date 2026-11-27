@@ -61,6 +61,7 @@ import {
   encodeDuplexFrame,
 } from "./duplex-frame-codec.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "./bridge-transport-contract.js";
+import * as callbackBridge from "./sandbox-callback-bridge.js";
 import {
   DUPLEX_COUNTER_CHANNEL_OPEN_TOTAL,
   DUPLEX_COUNTER_FALLBACK_TOTAL,
@@ -2356,6 +2357,67 @@ describe("sandbox adapter execution targets", () => {
       cwd: "/workspace",
       timeoutMs: 7000,
     }));
+  });
+
+  it.each([
+    [undefined, 100],
+    ["500", 500],
+    ["invalid", 100],
+    ["500ms", 100],
+    ["500.5", 100],
+    ["", 100],
+    ["   ", 100],
+    ["Infinity", 100],
+    ["1", 25],
+    ["-1", 25],
+    ["10000", 5000],
+  ] as const)("waits %s -> %i ms between empty bridge queue scans", async (configured, intervalMs) => {
+    vi.stubEnv("PAPERCLIP_SANDBOX_BRIDGE_POLL_INTERVAL_MS", configured);
+    const rootDir = await createSandboxRoot("paperclip-bridge-poll-interval-");
+    const target = queueSandboxTarget(rootDir);
+    target.streamRunLogs = false;
+    const scanTimes: number[] = [];
+    const queueSpy = vi.spyOn(callbackBridge, "createCommandManagedSandboxCallbackBridgeQueueClient")
+      .mockImplementation(() => {
+        vi.useFakeTimers();
+        return {
+          makeDir: async () => {},
+          makeDirs: async () => {},
+          listJsonFiles: async () => { scanTimes.push(Date.now()); return []; },
+          readTextFile: async () => "",
+          writeTextFile: async () => {},
+          rename: async () => {},
+          remove: async () => {},
+        };
+      });
+    const serverSpy = vi.spyOn(callbackBridge, "startSandboxCallbackBridgeServer")
+      .mockImplementation(async ({ queueDir }) => ({
+        baseUrl: "http://127.0.0.1:3100", host: "127.0.0.1", port: 3100, pid: 0,
+        directories: callbackBridge.sandboxCallbackBridgeDirectories(queueDir), stop: async () => {},
+      }));
+    let bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+    try {
+      bridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId: "run-poll-interval", target, adapterKey: "codex", runtimeRootDir: null,
+        hostApiToken: "real-run-jwt", hostApiUrl: "http://127.0.0.1:3100",
+        enableSandboxDuplexBridge: false,
+      });
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scanTimes).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(intervalMs - 1);
+      expect(scanTimes).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(scanTimes).toHaveLength(2);
+      expect(scanTimes[1]! - scanTimes[0]!).toBe(intervalMs);
+    } finally {
+      const stopping = bridge?.stop();
+      await vi.advanceTimersByTimeAsync(5000);
+      await stopping;
+      vi.useRealTimers();
+      serverSpy.mockRestore();
+      queueSpy.mockRestore();
+    }
   });
 
   it("starts a localhost Paperclip bridge for sandbox targets in bridge mode", async () => {

@@ -12,6 +12,10 @@ import {
 } from "./adapters/postgres.js";
 import { createQueuedCommentIssueLockWriter } from "./adapters/queued-comment-postgres.js";
 import { createQueuedCommentSteeringAdapter, lockBoardQueuedComments, readBoardQueuedComments } from "./adapters/queued-comment-board-postgres.js";
+import { closeConversationResetHold } from "./adapters/queued-comment-board-postgres.js";
+export { closeConversationResetHold };
+export { steerCommittedQueuedComment } from "./adapters/automatic-comment-steering.js";
+import { logger } from "../../middleware/logger.js";
 import type { QueuedCommentQueuePostgresAdapterDeps } from "./adapters/queued-comment-postgres.js";
 import { createFreshIssueRunAdmission } from "./application/fresh-issue-run.js";
 import { createWakeRecoveryAdmission } from "./application/recovery-admission.js";
@@ -41,7 +45,7 @@ export type {
 export { createAutomaticGoalCommentSteering } from "./application/automatic-goal-comment-steering.js";
 export { WakeQueueApplicationError } from "./application/types.js";
 export { hasRetainedExternalChatRetry } from "./domain/context.js";
-export { QUEUED_MESSAGES_DELIVERED_REASON } from "./domain/policy.js";
+export { QUEUED_MESSAGES_DELIVERED_REASON, isAutomaticSteeringComment } from "./domain/policy.js";
 export type {
   IssueSnapshot,
   RunSnapshot,
@@ -117,13 +121,13 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
       return outcome;
     },
     releaseIssueExecution: createReleaseIssueExecution({ issueLock, recovery: deps.recovery }),
-    admitIssueWake(
+    async admitIssueWake(
       { companyId, issueId, durableChatRequest }: IssueAdmissionTarget,
       // Specialized heartbeat gates and continuation writes still use this locked transaction.
       evaluateHeartbeatPolicy: (tx: IssueAdmissionDbTransaction, admission: LockedIssueAdmission) => Promise<IssueWakeAdmissionOutcome<HeartbeatRun>>,
       effects: IssueWakeAdmissionEffects<HeartbeatRun>,
     ) {
-      return admitIssueWake(() => withIssueAdmission({ companyId, issueId, durableChatRequest }, (tx, { lockedIssue, lockIssue, recovery, deferBlockedWake, reader, writer, fresh }) => {
+      const outcome = await admitIssueWake(() => withIssueAdmission({ companyId, issueId, durableChatRequest }, (tx, { lockedIssue, lockIssue, recovery, deferBlockedWake, reader, writer, fresh }) => {
         const admitBusy = createAdmitWakeBehindIssueExecution({ reader, writer, helpers: deps.wakeAdmissionHelpers });
         const admitFresh = createFreshIssueRunAdmission(fresh);
         return evaluateHeartbeatPolicy(tx, {
@@ -142,6 +146,11 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
           }, deferBlockedWake),
         });
       }), effects);
+      // Admission has committed: cover automation/receipt arrivals after the
+      // final too, without holding queue locks while interrupting the driver.
+      try { await closeConversationResetHold(db, { companyId, issueId }); }
+      catch (error) { logger.warn({ error, companyId, issueId }, "could not close deferred-work hold"); }
+      return outcome;
     },
   };
 }

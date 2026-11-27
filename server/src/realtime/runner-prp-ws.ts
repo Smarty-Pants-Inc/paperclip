@@ -1,5 +1,6 @@
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
+import { guardNativeTurnCommands } from "../services/native-runtime/native-turn-budget.js";
 
 import type {
   DurablePrpControlPlane,
@@ -108,6 +109,7 @@ export async function registerRunnerPrpAuthority(input: {
   readonly runId: string;
   readonly authority: DurablePrpControlPlane;
 }): Promise<{ readonly connectUrl: string; release(): Promise<void> }> {
+  guardNativeTurnCommands(input.authority);
   const apiUrl = new URL(resolveLocalRuntimeApiUrl());
   apiUrl.protocol = "ws:";
   const loopbackOrigin = apiUrl.origin;

@@ -47,6 +47,7 @@ import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
 import type { CaseDetail, IssueCaseLink } from "../api/cases";
 import { issuesApi } from "../api/issues";
+import { api } from "../api/client";
 import { authApi } from "../api/auth";
 import type { CompanyListResult } from "../api/companies-query";
 import { healthApi } from "../api/health";
@@ -1235,7 +1236,9 @@ function buildActivityToast(
     };
   }
 
-  const changeDesc = describeIssueUpdate(details);
+  // System admission/retry puts work back on the queue; keep other changes audible.
+  const changeDesc = describeIssueUpdate(actorType === "system" && action === "issue.updated" && details?.status === "todo"
+    ? { ...details, status: undefined, reopened: false } : details);
   if (action === "issue.updated") {
     if (details?.source === "comment" || !changeDesc) return null;
     return {
@@ -1366,8 +1369,26 @@ function buildRunStatusToast(
   const title = `${name} run ${statusLabel}`;
 
   let body: string | undefined;
-  if (error) {
-    body = truncate(error, 100);
+  if (error || errorCode) {
+    // Keep known classifications; preserve an unknown failure's readable cause.
+    const code = (errorCode ?? error ?? "").split(":", 1)[0]!.toLowerCase();
+    // Show a cause only when it is plain words: paths, URLs, credentials and long ids stay in the run.
+    const cause = error ?? errorCode ?? "";
+    body = ({
+      provider_quota: "Error: usage limit reached",
+      claude_auth_required: "Error: not logged in to Claude",
+      acpx_auth_required: "Error: agent login required",
+      native_provider_runtime_missing: "Runtime missing",
+      native_provider_model_rejected: "Model unavailable",
+      native_provider_approval_required: "Approval required",
+      native_provider_usage_limit: "Usage limit reached",
+      sandbox_disk_full: "Disk full",
+    } as Record<string, string>)[code] ?? (code.startsWith("native_controller_recovery_")
+      ? "Automatic recovery blocked"
+      : /[/@=]|[A-Za-z0-9]{20,}/.test(cause) ? "Open the run for details." : truncate(cause.replace(
+          /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?::[a-z0-9]+(?:_[a-z0-9]+)*)*\b/gi,
+          token => token.toLowerCase().replaceAll("_", " ").replaceAll(":", ": "),
+        ), 100));
   } else if (triggerDetail) {
     body = `Trigger: ${triggerDetail}`;
   }
@@ -1754,6 +1775,10 @@ function invalidateActivityQueries(
         queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(ref), ...invalidationOptions });
         if (action === "issue.comment_added" || action === "issue.conversation_session_started" || visibleConversation) {
           queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(ref), ...(visibleConversation ? undefined : invalidationOptions) });
+        }
+        // A server hold on a message (or its release) reaches the open page now, not on a reload.
+        if (action === "issue.comment_added" || action?.startsWith("issue.execution_") || action?.startsWith("issue.queued_comment")) {
+          queryClient.invalidateQueries({ queryKey: queryKeys.issues.queuedComments(ref) });
         }
         if (action?.startsWith("issue.attachment_") || action?.startsWith("issue.work_product_")) {
           // These cards are durable API objects, not streamed text. Refresh the
@@ -2183,7 +2208,24 @@ function handleLiveEvent(
     if (event.type === "heartbeat.run.status") {
       const toast = buildRunStatusToast(payload, nameOf);
       if (toast && event.toastEligible === true && !suppressRunToast) {
-        gatedPushToast(gate, pushToast, "run-status", toast);
+        const notify = () => gatedPushToast(gate, pushToast, "run-status", toast);
+        if (payload.status === "failed" || payload.status === "timed_out") {
+          // Recovery labels are provisional: only an existing successor can
+          // silence an automatic failure. Exhaustion and a person's run win.
+          // Use the shared bounded, fresh GET; errors and timeouts fail open.
+          void api.get<HeartbeatRun>(`/heartbeat-runs/${readString(payload.runId)!}`, {
+            fresh: true, timeoutMs: 5_000,
+          }).then((run) => {
+            const personStarted = payload.invocationSource === "on_demand" || payload.triggerDetail === "manual" ||
+              run.invocationSource === "on_demand" || run.triggerDetail === "manual" ||
+              (!run.retryOfRunId && (run.contextSnapshot?.triggeredBy === "board" ||
+                ["issue.comment", "issue.comment.reopen"].includes(readString(run.contextSnapshot?.source) ?? "")));
+            if (!personStarted && !run.retryExhaustedReason && run.execution?.successorRunId) return;
+            notify();
+          }, notify);
+        } else {
+          notify();
+        }
       }
     }
     return;
@@ -2589,7 +2631,10 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
             liveCompanyId,
             pathnameRef.current,
             parsed,
-            pushToast,
+            (toast) => !closed && socket === nextSocket && getPageVisibility().visible &&
+              !(parsed.type === "heartbeat.run.status" &&
+                shouldSuppressRunStatusToastForVisibleIssue(coalescingClient, pathnameRef.current, parsed.payload ?? {}))
+              ? pushToast(toast) : null,
             gateRef.current,
             {
               userId: currentActorRef.current.userId,

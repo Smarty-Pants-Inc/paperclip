@@ -4,6 +4,7 @@ import {
   CROSS_ISSUE_INFLUENCE_LIMIT,
   crossIssueInfluenceLimitError,
   evaluateCrossIssueInfluenceLimit,
+  resolveCrossIssueInfluenceLimit,
   observeCrossIssueInfluence,
 } from "../services/cross-issue-influence-limit.ts";
 
@@ -54,6 +55,36 @@ function counterDb(
     },
   };
 }
+
+describe("cross-issue influence limit configuration", () => {
+  it("defaults to the built-in limit and ignores invalid values", () => {
+    expect(resolveCrossIssueInfluenceLimit({})).toBe(CROSS_ISSUE_INFLUENCE_LIMIT);
+    for (const bad of ["", " ", "0", "-5", "1.5", "abc", "1e3"]) {
+      expect(
+        resolveCrossIssueInfluenceLimit({ PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT: bad }),
+      ).toBe(CROSS_ISSUE_INFLUENCE_LIMIT);
+    }
+  });
+
+  it("reads a positive integer from the environment", () => {
+    expect(
+      resolveCrossIssueInfluenceLimit({ PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT: " 200 " }),
+    ).toBe(200);
+  });
+
+  it("enforces the configured limit after the rollout flip", () => {
+    const now = CROSS_ISSUE_INFLUENCE_ENFORCE_AT;
+    expect(evaluateCrossIssueInfluenceLimit({ priorCount: 199, now, limit: 200 })).toMatchObject({
+      allowed: true,
+      cap: 200,
+    });
+    expect(evaluateCrossIssueInfluenceLimit({ priorCount: 200, now, limit: 200 })).toMatchObject({
+      allowed: false,
+      cap: 200,
+      count: 201,
+    });
+  });
+});
 
 describe("cross-issue influence limit rollout", () => {
   it("logs observations without enforcement during the one-week rollout", () => {

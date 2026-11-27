@@ -4,6 +4,15 @@ import { EXECUTION_RECONCILIATION_CAUSES, PROVIDER_QUOTA_MONITOR_SERVICE_NAME, t
 import { activeIssueInteractionCondition } from "./issue-question-context.js";
 import { LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
 
+/** The task-detail sign projection. Collection reads must use the same status
+ * calculation and explicit nullable descriptor, not lifecycle status alone. */
+export function issueStatusProjectionFields() {
+  return {
+    displayStatus: issueDisplayStatusSql(),
+    unblockDescriptor: issues.unblockDescriptor,
+  };
+}
+
 const DISPLAYED_NO_REPLAY_HOLD_CAUSES = EXECUTION_RECONCILIATION_CAUSES
   .filter(cause => cause !== "legacy_execution_requires_reconciliation");
 

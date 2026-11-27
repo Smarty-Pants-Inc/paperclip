@@ -2814,6 +2814,22 @@ describe("assembleThreadItems (PAP-367)", () => {
     expect(out.map((i) => i.id)).toEqual(["u1", "a1", "run-x:turn", "u2"]);
   });
 
+  it.each([false, true])("keeps a files-lost notice before the answer, not below a whole early-opening turn (anchored=%s)", anchored => {
+    const notice = entry("lost", 4_000, { author: "system",
+      text: "Paperclip could not recover the unsaved files from the previous run: saved files unavailable.",
+      createdAtIso: new Date(4_000).toISOString() });
+    const turn = { ...settledTurn("fresh:turn"), finalResponse: { id: "answer", kind: "message" as const, author: "agent" as const,
+      text: "The fresh session's answer.", createdAtIso: new Date(5_000).toISOString() } };
+    const backbone = [entry("stopped", 1_000), entry("session", 1_999), entry("person", 2_000), notice, entry("later", 6_000)];
+    const out = assembleThreadItems(backbone, anchored ? new Map([["person", [turn]]]) : noAnchors,
+      anchored ? [] : [{ turn, startMs: 3_000 }]);
+    expect(out.map(item => item.id)).toEqual(["stopped", "session", "person", "lost", "fresh:turn", "later"]);
+    // An ordinary system update keeps the existing opening-time placement.
+    const ordinary = assembleThreadItems([backbone[2], entry("lost", 4_000, { author: "system", text: "Workspace ready." })],
+      noAnchors, [{ turn, startMs: 3_000 }]);
+    expect(ordinary.map(item => item.id)).toEqual(["person", "fresh:turn", "lost"]);
+  });
+
   it("does not append a comment-less turn after the newest user message (the P11 bug)", () => {
     // The screenshot bug: an OLD stopped run (start 1_500) re-pinning its
     // "Worked · 34s" row under every NEW user bubble (3_000).

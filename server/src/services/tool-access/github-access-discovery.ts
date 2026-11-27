@@ -12,6 +12,7 @@ function gitHubRepositoryOwnerType(repository: Record<string, unknown>) {
 export async function loadGitHubTokenRepositories(
   headers: Record<string, string>,
   request: typeof fetch = fetch,
+  tokenKind: "user" | "installation" = "user",
 ) {
   const repositories: Array<{
     id: string;
@@ -21,7 +22,7 @@ export async function loadGitHubTokenRepositories(
   }> = [];
   for (let page = 1; ; page += 1) {
     const response = await request(
-      `https://api.github.com/user/repos?per_page=100&page=${page}`,
+      `https://api.github.com/${tokenKind === "installation" ? "installation/repositories" : "user/repos"}?per_page=100&page=${page}`,
       {
         headers: {
           ...headers,
@@ -39,7 +40,8 @@ export async function loadGitHubTokenRepositories(
         "Could not load GitHub repositories. Reconnect GitHub and try again.",
       );
     }
-    const rows: unknown = await response.json();
+    const data: unknown = await response.json();
+    const rows = tokenKind === "installation" && recordValue(data) ? data.repositories : tokenKind === "user" ? data : undefined;
     if (!Array.isArray(rows))
       throw unprocessable("GitHub returned invalid repositories");
     for (const row of rows) {

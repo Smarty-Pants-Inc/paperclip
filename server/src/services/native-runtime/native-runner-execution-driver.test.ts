@@ -16,7 +16,7 @@ vi.mock("../../realtime/runner-prp-outbound.js", () => ({ connectRunnerPrpIngres
 vi.mock("./native-runner-checkpoint.js", () => ({ nativeRunnerCheckpointRegistration: transport.checkpointRegistration }));
 
 const binding = { companyId: "company", issueId: "issue", agentId: "agent", runId: "run-a" };
-const authority = {} as Parameters<NonNullable<ReturnType<typeof createNativeRunnerExecutionDriver>["controlPlaneRegistration"]>>[0];
+const authority = { queueCommand: vi.fn() } as unknown as Parameters<NonNullable<ReturnType<typeof createNativeRunnerExecutionDriver>["controlPlaneRegistration"]>>[0];
 const ssh = { kind: "remote", transport: "ssh", remoteCwd: "/workspace", spec: {} } as AdapterExecutionTarget;
 const sandbox = (ingress = true): AdapterExecutionTarget => ({
   kind: "remote", transport: "sandbox", remoteCwd: "/workspace", leaseId: "lease",
@@ -40,6 +40,22 @@ beforeEach(() => {
 });
 
 describe("shared Runner execution driver", () => {
+  it("signals finalGuardInstalled only after the managed driver installs the real command guard", async () => {
+    let finalGuardInstalled = false;
+    const core = { queueCommand: (_type: string, payload: Record<string, unknown>) => payload } as unknown as typeof authority;
+    const driver = createNativeRunnerExecutionDriver({ target: { kind: "local" }, binding,
+      onFinalGuardInstalled: () => {
+        // The positive signal must follow installation, never precede it.
+        expect(() => core.queueCommand("steer", { text: "a".repeat(600000) })).toThrow("native_turn_prompt_exceeds_command_bound");
+        finalGuardInstalled = true;
+      } });
+    expect(finalGuardInstalled).toBe(false);
+    expect(() => core.queueCommand("steer", { text: "a".repeat(600000) })).not.toThrow();
+    await driver.controlPlaneRegistration!(core);
+    expect(finalGuardInstalled).toBe(true);
+    expect(() => core.queueCommand("steer", { text: "whole small command" })).not.toThrow();
+  });
+
   it.each(["ingress", "preparation", "unknown"])("limits ingress evidence and public error serialization at %s", async phase => {
     const failure = { phase: "private_preview", httpStatus: 502 } as const;
     const raw = new JsonRpcCallError({ code: -32000, message: "fixture-private-provider-response",

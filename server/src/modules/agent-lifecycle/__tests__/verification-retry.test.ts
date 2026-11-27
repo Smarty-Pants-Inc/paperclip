@@ -13,6 +13,10 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-
 import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
 
 import { aiConnectionService } from "../../../services/ai-connections.js";
+import { heartbeatRuns } from "@paperclipai/db";
+import { executionProjectionsForRuns } from "../../../services/execution-projection.js";
+import { assertHarnessTestPassed } from "../../../services/agent-harness-verification.js";
+import { logger } from "../../../middleware/logger.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_LIFECYCLE_VERIFICATION_RETRY_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -32,6 +36,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   });
   afterEach(async () => {
     for (const worker of workers.splice(0)) await worker.stop();
+    vi.restoreAllMocks();
     // Retire only this test's synthetic records so later coordinator reads stay isolated.
     await db.update(agents).set({ lifecycleState: "terminated", status: "terminated" }).where(eq(agents.companyId, companyId));
   });
@@ -55,6 +60,60 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     return { agent: await current(agent.id), work, driver, runHost };
   }
 
+  it("keeps a native 401 diagnostic in the operation and existing warning without changing public copy, then clears it on a passing retry", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    let pass = false;
+    const driver = { requiredPluginIds: async () => [], runPlugin: async () => "complete" as const,
+      runHost: async (agent: LifecycleAgent) => {
+        if (agent.lifecycleState === "verifying") assertHarnessTestPassed({ adapterType: "paperclip_runner",
+          status: pass ? "pass" : "fail", testedAt: new Date().toISOString(), checks: [{
+            code: pass ? "codex_hello_probe_passed" : "codex_hello_probe_auth_required", level: pass ? "info" : "error",
+            message: "401 Unauthorized: sk-proj-FakeToken1234567890 https://alice:private-password@gateway.invalid/responses\nprivate second line",
+          }] });
+        return "complete" as const;
+      } };
+    const lifecycle = createAgentLifecycle(db), work = configureAgentLifecycle(db, driver); workers.push(work);
+    const hired = await lifecycle.requestHire(companyId, { name: "Native auth diagnostic", adapterType: "process" });
+    await work.process(hired.id);
+    const held = await current(hired.id);
+    expect(held.lifecycleOperation).toMatchObject({ retryRequired: true, failureCode: "harness_auth_failed",
+      failureReason: "401 Unauthorized: [REDACTED] https://[REDACTED]@gateway.invalid/responses" });
+    expect(held.lifecycleError).toBe("Execution configuration check failed. Authentication failed. Check the agent's AI connection or sign in to its execution tool, then retry. Automatic verification is paused. Update Configuration or choose Retry now.");
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      failureCode: "harness_auth_failed", failureReason: held.lifecycleOperation!.failureReason,
+    }), "Agent lifecycle operation failed");
+    expect(JSON.stringify([held.lifecycleOperation, warn.mock.calls])).not.toMatch(/FakeToken|alice|private-password|second line/);
+    pass = true;
+    await lifecycle.retry(hired.id);
+    expect((await current(hired.id)).lifecycleOperation).not.toHaveProperty("failureReason");
+    await work.process(hired.id);
+    const ready = await current(hired.id);
+    expect(ready).toMatchObject({ lifecycleState: "ready", lifecycleError: null });
+    expect(ready.lifecycleOperation).not.toHaveProperty("failureReason");
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["configuration", "repair-recheck", "wait-for-signal", "pending", "recheck-race"])("clears an old native diagnostic on %s", async action => {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Old diagnostic", status: "paused",
+      adapterType: "process", lifecycleState: "verifying", lifecycleHolds: [], lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0,
+        failureReason: "Old redacted reason" } }).returning();
+    const store = createLifecycleStore(db, createAgentLifecycleEffects());
+    if (action === "configuration") {
+      await createAgentLifecycle(db).updateConfiguration(agent!.id, { adapterConfig: { command: process.execPath } });
+    } else if (action === "repair-recheck") {
+      await db.transaction(tx => requestAgentLifecycleRecheckInTransaction(tx, { companyId, agentId: agent!.id, configurationRepaired: true }, async () => {}));
+    } else {
+      const claimed = await store.claim(agent!.id, "diagnostic-owner", new Date());
+      expect(claimed).not.toBeNull();
+      if (action === "recheck-race") await db.transaction(tx => requestAgentLifecycleRecheckInTransaction(tx,
+        { companyId, agentId: agent!.id, configurationRepaired: true }, async () => {}));
+      await store.defer(claimed!, "diagnostic-owner", action === "recheck-race" ? "Old failure" : null, new Date(),
+        action === "wait-for-signal" ? { waitForSignal: true } : { failureReason: "Must not survive without an error", failureCode: "harness_auth_failed" });
+    }
+    expect((await current(agent!.id)).lifecycleOperation).not.toHaveProperty("failureReason");
+  });
+
   it("parks a real missing-default selection across restart and permits repair through the normal ready handoff", async () => {
     const userId = randomUUID();
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active" });
@@ -71,8 +130,13 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const driver = { requiredPluginIds: async () => [], runHost, runPlugin: async () => "complete" as const, onReady };
     const work = configureAgentLifecycle(db, driver); workers.push(work);
     const hired = await createAgentLifecycle(db).requestHire(companyId, { name: "Missing default", adapterType: "process" });
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId: hired.id, status: "queued" }).returning();
     await work.process(hired.id);
     const held = await current(hired.id);
+    expect((await executionProjectionsForRuns(db, companyId, [queued!.id])).get(queued!.id)).toMatchObject({
+      cause: "agent_setup_failed", setupFailure: { code: "no_ai_connection", title: "No AI connection attached" },
+      nextAction: "Attach an AI connection in the agent's settings, then retry verification.",
+    });
     expect(held).toMatchObject({ lifecycleState: "verifying", status: "paused", lifecycleOperation: { retryRequired: true } });
     expect(held.lifecycleError).toContain("personal default");
     expect(held.lifecycleError).not.toContain("retry automatically");
@@ -88,6 +152,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     // Repair and Retry must still pass verification before the normal ready handoff.
     repaired = true;
     await createAgentLifecycle(db).retry(hired.id);
+    expect((await current(hired.id)).lifecycleOperation).not.toHaveProperty("failureCode");
     await restarted.sweep();
     expect(await current(hired.id)).toMatchObject({ lifecycleState: "ready", status: "idle", lifecycleError: null });
     expect(onReady).toHaveBeenCalledOnce();
@@ -164,10 +229,11 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         expectedVersion: agent!.lifecycleVersion, configurationRepaired: true },
       () => notifyDeliveryWork(tx, DELIVERY_QUEUES.agentLifecycle))).toBe(true);
     });
-    await store.defer(claimed!, owner, "Old missing account", new Date(), { retryRequired: true });
+    await store.defer(claimed!, owner, "Old missing account", new Date(), { retryRequired: true, failureCode: "ai_connection_default_missing" });
     const repaired = await current(agent!.id);
     expect(repaired.lifecycleError).toBeNull();
     expect(repaired.lifecycleOperation).not.toHaveProperty("retryRequired");
+    expect(repaired.lifecycleOperation).not.toHaveProperty("failureCode");
     expect(repaired.lifecycleOperation).not.toHaveProperty("retryAt");
     expect(repaired.lifecycleOperation).not.toHaveProperty("verificationFailures");
     expect(await store.claim(agent!.id, "new-check", new Date())).not.toBeNull();

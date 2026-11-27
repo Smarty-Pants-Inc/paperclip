@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -30,7 +30,7 @@ describeEmbeddedPostgres("agent task hierarchy depth", () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
-      name: "Paperclip",
+      name: "example-org",
       issuePrefix: `D${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
@@ -94,6 +94,31 @@ describeEmbeddedPostgres("agent task hierarchy depth", () => {
       requestedParent: { id: childId, identifier: childIdentifier },
       effectiveParent: { id: rootId, identifier: rootIdentifier },
     });
+  });
+
+  it("allows deeper agent tasks with the server override and flattens at stock depth when unset", async () => {
+    const { companyId } = await seedCompany();
+    const { rootId, childId } = await seedTree(companyId);
+    try {
+      vi.stubEnv("PAPERCLIP_MAX_AGENT_TASK_DEPTH", undefined);
+      const stock = await issueService(db).create(companyId, {
+        title: "Stock depth", parentId: childId, expectedParentId: rootId,
+      });
+      expect(stock.parentId).toBe(rootId);
+      vi.stubEnv("PAPERCLIP_MAX_AGENT_TASK_DEPTH", "4");
+      const grandchild = await issueService(db).create(companyId, { title: "Third level", parentId: childId });
+      expect(grandchild.parentId).toBe(childId);
+      expect(grandchild.parentAdjusted).toBeUndefined();
+      const fourth = await issueService(db).create(companyId, { title: "Fourth level", parentId: grandchild.id });
+      expect(fourth.parentId).toBe(grandchild.id);
+      const fifth = await issueService(db).create(companyId, {
+        title: "Fifth level flattened", parentId: fourth.id, expectedParentId: grandchild.id,
+      });
+      expect(fifth.parentId).toBe(grandchild.id);
+      expect(fifth.parentAdjusted?.reason).toBe("max_agent_depth");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("lets board users create grandchildren", async () => {

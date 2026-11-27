@@ -57,6 +57,7 @@ describe("issueActiveRun", () => {
     const staleActiveRun: ActiveRunForIssue = {
       id: "run-123",
       status: "running",
+      runModel: null,
       invocationSource: "assignment",
       triggerDetail: "system",
       startedAt: "2026-04-13T01:29:00.000Z",

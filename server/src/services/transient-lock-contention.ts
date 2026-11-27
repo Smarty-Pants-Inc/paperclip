@@ -14,13 +14,24 @@ export function isTransientLockContention(error: unknown): boolean {
   return code !== null && TRANSIENT_LOCK_CONTENTION_CODES.has(code);
 }
 
-export async function retryTransientLockContention<T>(write: () => Promise<T>, attempts = 5): Promise<T> {
+/** Replay a COMPLETE transaction once, only when PostgreSQL proves it rolled
+ * back as a deadlock victim. Never retry uncertain commits or just a statement
+ * inside an aborted transaction. Both competing configuration saves may lose. */
+export function retryDeadlockedTransactionOnce<T>(transaction: () => Promise<T>): Promise<T> {
+  return retryTransientLockContention(transaction, 2, { shouldRetry: error => postgresErrorCode(error) === "40P01" });
+}
+
+export async function retryTransientLockContention<T>(
+  write: () => Promise<T>,
+  attempts = 5,
+  options: { shouldRetry?: (error: unknown) => boolean; backoffMs?: (attempt: number) => number } = {},
+): Promise<T> {
   for (let attempt = 1; ; attempt += 1) {
     try {
       return await write();
     } catch (error) {
-      if (attempt >= attempts || !isTransientLockContention(error)) throw error;
-      await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+      if (attempt >= attempts || !(options.shouldRetry ?? isTransientLockContention)(error)) throw error;
+      await new Promise(resolve => setTimeout(resolve, options.backoffMs?.(attempt) ?? 100 * attempt));
     }
   }
 }

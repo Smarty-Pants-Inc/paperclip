@@ -226,7 +226,9 @@ curl -sS -X POST "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/agent-h
     "role": "qa",
     "adapterType": "codex_local",
     "adapterConfig": {
-      "cwd": "/abs/path/to/repo"
+      "cwd": "/abs/path/to/repo",
+      "model": "o4-mini",
+      "modelReasoningEffort": "medium"
     },
     "desiredSkills": [
       "agent-browser"

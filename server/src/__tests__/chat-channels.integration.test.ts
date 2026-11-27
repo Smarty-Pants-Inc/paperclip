@@ -66678,7 +66678,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           policy: { trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} },
             useIsolatedTaskDirectory: false, explicitTaskDirectory: false, requestedExecutionWorkspaceMode: "shared_workspace" },
           environment: { selectedEnvironmentId: (await environmentService(db).ensureLocalEnvironment(agent.companyId)).id, selectedEnvironmentForConfig: null,
-            resolvedInstanceSettings: await instanceSettingsService(db).get(), persistedNativeExecutionInput: null },
+            environmentSelectionSnapshot: null, resolvedInstanceSettings: await instanceSettingsService(db).get(), persistedNativeExecutionInput: null },
           services: { secretsSvc: secretService(db), companySkills: companySkillService(db),
             appendRunEvent: async (source, event) => { await appendHeartbeatRunEvent(db, { companyId: source.companyId,
               agentId: source.agentId, runId: source.id, ...event }); }, finalizeAiConnectionBusyDeferral: vi.fn() },

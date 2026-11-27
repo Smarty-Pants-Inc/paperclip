@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import { sandboxSyncMinimumTimeoutMs } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { invalidArchive, readProviderPackLayers, stageProviderPackLayers, verifyArchive } from "./provider-pack-layers.js";
 import { providerPackExtractionProbe } from "./provider-pack-extraction.js";
@@ -53,7 +54,7 @@ export async function stageProviderPackArchive(input: {
     await measure("provider_pack.archive.transfer", () => input.runner.syncIn!([{
       operationId: `runner-provider-archive-${randomUUID()}`,
       files: [{ kind: "file", sourcePath: archive.sourcePath, targetPath: archivePath, mode: 0o600 }],
-    }]));
+    }], { minimumTimeoutMs: sandboxSyncMinimumTimeoutMs(archive.bytes) }));
     const result = await measure("provider_pack.archive.extract", () => input.runner.execute({
       command: "sh",
       args: ["-c", [

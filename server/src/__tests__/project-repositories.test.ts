@@ -46,6 +46,29 @@ describe("project repository access", () => {
       "https://api.github.com/user/repos?per_page=100&page=1", "https://api.github.com/user/repos?per_page=100&page=2",
     ]);
   });
+  it("loads every installation repository page with the same metadata validation", async () => {
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json({ total_count: 2, repositories: [{ id: 1, full_name: "example-org/public", owner: { type: "Organization" }, private: false }] }, { headers: { link: '<https://evil.test/steal>; rel="next"' } }))
+      .mockResolvedValueOnce(Response.json({ total_count: 2, repositories: [{ id: 2, full_name: "second-org/private", owner: { type: "Organization" }, private: true }] }));
+    expect(await loadGitHubTokenRepositories({ Authorization: "Bearer fixture" }, request, "installation")).toEqual([
+      { id: "1", fullName: "example-org/public", ownerType: "organization", private: false },
+      { id: "2", fullName: "second-org/private", ownerType: "organization", private: true },
+    ]);
+    expect(request.mock.calls.map(([url]) => String(url))).toEqual([
+      "https://api.github.com/installation/repositories?per_page=100&page=1", "https://api.github.com/installation/repositories?per_page=100&page=2",
+    ]);
+  });
+  it("preserves installation catalog failure classification and rejects malformed envelopes, rows, and pagination", async () => {
+    const unavailable = new Response("private-provider-detail", { status: 503, headers: { "retry-after": "60" } });
+    await expect(loadGitHubTokenRepositories({}, vi.fn().mockResolvedValue(unavailable), "installation"))
+      .rejects.toMatchObject({ code: "repository_catalog_unavailable", retryAt: expect.any(Number) });
+    for (const response of [Response.json([]), Response.json({ repositories: {} }),
+      Response.json({ repositories: [{ id: 1, full_name: "../bad" }] }),
+      Response.json({ repositories: [] }, { headers: { link: '<https://api.github.com/installation/repositories?page=2>; rel="next"' } }),
+      new Response("private-provider-detail", { status: 403 })]) {
+      await expect(loadGitHubTokenRepositories({}, vi.fn().mockResolvedValue(response), "installation")).rejects.toThrow(/GitHub/);
+    }
+  });
   it("surfaces failed or invalid provider responses without exposing their body", async () => {
     for (const response of [new Response("secret", { status: 401 }), new Response(JSON.stringify([{ id: 1, full_name: "../bad" }]))]) {
       await expect(loadGitHubTokenRepositories({}, vi.fn().mockResolvedValue(response))).rejects.toThrow(/GitHub/);

@@ -197,7 +197,7 @@ export class PaperclipRunnerSemanticAuthority {
             const arrived = await commentsArrivedDuringRun(this.#db, { companyId: this.#binding.companyId,
               runId: this.#binding.runId, agentId: this.#binding.agentId, comments: rows }).catch(() => [] as string[]);
             return {
-              value: jsonValue({ comments, ...taskHistoryHandlingGuidance(arrived) }),
+              value: jsonValue({ comments, ...taskHistoryHandlingGuidance(arrived, context.run) }),
               references: [{ kind: "task", id: context.issue.id }],
             };
           }

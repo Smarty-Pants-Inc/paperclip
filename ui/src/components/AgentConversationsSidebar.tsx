@@ -13,7 +13,7 @@ import { useDialogActions } from "@/context/DialogContext";
 import { AgentChatPin, agentChatPinKey, useAgentChatPins } from "./AgentChatPin";
 
 /** Account- and company-scoped data for the secondary chat navigation. */
-export function AgentConversationsSidebar({ compact = false }: { compact?: boolean } = {}) {
+export function AgentConversationsSidebar({ compact = false, detailed = false }: { compact?: boolean; detailed?: boolean } = {}) {
   const { companyId, userId, agents, chats, session } = useAgentChatNavigation();
   const agentChatPins = useAgentChatPins();
   const unreadMessageCounts = useMemo(() => new Map((chats.data ?? [])
@@ -58,8 +58,10 @@ export function AgentConversationsSidebar({ compact = false }: { compact?: boole
     .filter(agent => !listedIds.has(agent.id) && agent.status !== "terminated"
       && (!memberships.isSuccess || resourceMembershipState(memberships.data, "agent", agent.id) !== "left"))
     .sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" }));
-  const previews = Object.fromEntries((chats.data ?? []).filter(chat => chat.conversationState === "active")
-    .map(chat => [chat.conversationAgentId!, "Working…"]));
+  // Prefer the latest visible message; chats without messages retain their title/role fallback.
+  const listed = detailed ? chats.data ?? [] : [];
+  const previews = Object.fromEntries(listed.filter(chat => chat.latestMessagePreview != null || !chat.title.startsWith("Chat with ")).map(chat => [chat.conversationAgentId!, chat.latestMessagePreview || chat.title]));
+  const chatActivity = Object.fromEntries(listed.map(chat => [chat.conversationAgentId!, { at: chat.updatedAt }]));
   const pinnedAgentIds = useMemo(() => {
     const prefix = `agent-chat:${companyId}:`;
     return agentChatPins.orderedKeys.filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length));
@@ -67,7 +69,7 @@ export function AgentConversationsSidebar({ compact = false }: { compact?: boole
   return <AgentConversationSidebar key={`${companyId}:${userId}`} agents={[...conversations, ...teammates]} availableAgents={roster}
     compact={compact}
     existingChatAgentIds={existingChatAgentIds}
-    activeId={active?.id} previews={previews}
+    activeId={active?.id} previews={previews} chatActivity={chatActivity}
     unreadAgentIds={unreadAgentIds}
     unreadMessageCounts={unreadMessageCounts}
     pinnedAgentIds={pinnedAgentIds}

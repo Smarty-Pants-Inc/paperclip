@@ -2381,6 +2381,34 @@ function sessionParamsWithConfigMetadata(
 }
 
 describe("effective run session config freshness", () => {
+  it("exempts only continuous Pi issue model and thinking aliases from session fingerprints", async () => {
+    const modelKeys = ["model", "piRpcThinkingLevel", "piThinkingLevel", "thinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort", "variant"];
+    for (const mode of [
+      { adapterType: "paperclip_runner", provider: "pi_rpc", continuity: "continuous", retain: true },
+      { adapterType: "paperclip_runner", provider: "pi_rpc", retain: true },
+      { adapterType: "paperclip_runner", provider: "pi_rpc", continuity: "paperclip", retain: false },
+      { adapterType: "paperclip_runner", provider: "codex", continuity: "continuous", retain: false },
+      { adapterType: "pi_local", provider: "pi_rpc", continuity: "continuous", retain: false },
+      { adapterType: "paperclip_runner", provider: "pi_rpc", continuity: "continuous", legacyComposition: true, retain: false },
+    ]) {
+      const input = { adapterType: mode.adapterType, legacyComposition: mode.legacyComposition,
+        effectiveAdapterConfig: { provider: mode.provider, model: "fixture/model-a", sessionContinuity: mode.continuity } };
+      const base = await buildSessionConfigMetadata(input);
+      for (const key of modelKeys) {
+        const next = await buildSessionConfigMetadata({ ...input, issueOverrides: { adapterConfig: { [key]: "changed" } } });
+        expect(next.categoryFingerprints.issueOverrides === base.categoryFingerprints.issueOverrides, `${mode.adapterType}/${mode.provider}/${mode.continuity}/${key}`).toBe(mode.retain);
+      }
+      for (const issueOverrides of [
+        { adapterConfig: { fixtureOption: "changed" } },
+        { fixtureOption: "changed" },
+        { adapterConfig: { model: "fixture/model-b", fixtureOption: "changed" } },
+      ]) {
+        const next = await buildSessionConfigMetadata({ ...input, issueOverrides });
+        expect(next.categoryFingerprints.issueOverrides).not.toBe(base.categoryFingerprints.issueOverrides);
+      }
+    }
+  });
+
   it("resets legacy sessions after connection instructions change or disappear", async () => {
     const first = await buildSessionConfigMetadata({ effectiveAdapterConfig: { paperclipConnectionInstructions: { text: "Use the handbook.", digest: "before" } } });
     for (const instructions of [null, { text: "Use the updated handbook.", digest: "after" }]) {

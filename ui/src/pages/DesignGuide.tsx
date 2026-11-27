@@ -1279,7 +1279,7 @@ export function DesignGuide() {
                 companyId="design-guide"
                 run={{
                   id: `design-guide-${status}`, agentId: "design-guide-agent", agentName: "CodexCoder",
-                  status, adapterType: "codex_local", invocationSource: "on_demand", triggerDetail: "manual",
+                  runModel: null, status, adapterType: "codex_local", invocationSource: "on_demand", triggerDetail: "manual",
                   startedAt: null, finishedAt: null, createdAt: "2026-09-11T12:00:00Z", issueId: "design-guide-task",
                 }}
                 issue={{ identifier: "PAP-559", title: "Recreate this wireframe on pages Paperclip", status: status === "succeeded" ? "done" : "in_progress" }}

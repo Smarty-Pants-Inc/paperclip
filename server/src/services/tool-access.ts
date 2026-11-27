@@ -1,4 +1,5 @@
 import { notifyGitHubCredentialChange } from "./github-connection-notifications.js";
+import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { AWS_MCP_ISSUER_CONFIG_KEY, AWS_ROLE_ARN_PATTERN, awsMcpMethodUsesIssuer, isAwsMcpConnection, type AwsMcpClients } from "./connectors/aws/mcp-credentials.js";
 import { awsRoleSetup } from "./connectors/aws/setup.js";
 import { workloadIdentityIssuer, workloadIdentityIssuerOrigin, workloadIdentityService } from "./workload-identity.js";
@@ -721,7 +722,9 @@ async function gitHubReadGrantAccess(db: Db, companyId: string, connectionId: st
   }));
   const allowed: typeof candidates = [];
   for (const grant of candidates) {
-    const ref = grant.credentialSecretRefs.find(ref => ref.configPath === "oauth.access_token" || /authorization|token|api_key/i.test(ref.configPath));
+    const ref = isGitHubAppConnection(connection)
+      ? grant.credentialSecretRefs.find(ref => ref.configPath === "credentials.privateKey")
+      : grant.credentialSecretRefs.find(ref => ref.configPath === "oauth.access_token" || /authorization|token|api_key/i.test(ref.configPath));
     if (!ref) continue;
     try {
       await validateConnectionGrantSecretOwnership(db, connection, grant, ref);
@@ -730,7 +733,7 @@ async function gitHubReadGrantAccess(db: Db, companyId: string, connectionId: st
       if (!(error instanceof HttpError && asRecord(error.details).code === "grant_credential_invalid")) throw error;
     }
   }
-  const legacyShared = !grants.length && connection.credentialPolicy === "shared";
+  const legacyShared = !isGitHubAppConnection(connection) && !grants.length && connection.credentialPolicy === "shared";
   if (!allowed.length && !legacyShared) throw forbidden("Choose a GitHub connection with an active authorization you can use.");
   return { connection, allowed, legacyShared };
 }
@@ -4575,6 +4578,9 @@ export function toolAccessService(
       if (legacyShared && !grantId) return resolveCredentialHeaders(connection, actor);
       let grant = grantId ? allowed.find(candidate => candidate.id === grantId) : allowed.length === 1 ? allowed[0] : undefined;
       if (!grant) throw forbidden("Choose an active GitHub authorization you can use.");
+      if (isGitHubAppConnection(connection)) {
+        return { Authorization: `Bearer ${(await resolveGitHubAppCredential(db, connection, grant, { forceRefresh })).token}` };
+      }
       if (asRecord(asRecord(connection.config).oauth).connectorProfile === "github.code") {
         grant = await refreshOAuthGrantCredentials({ companyId, connectionId, grantId: grant.id, actor, forceRefresh });
       }
@@ -4590,7 +4596,7 @@ export function toolAccessService(
       localTrusted = false,
       options?: { requiredRepositoryIds: readonly string[] },
     ) => measureRunPhase("connectors.github.catalog", async () => {
-      const [connections, grants, members, memberships] = await Promise.all([
+      const [connections, grants, members, memberships, installs] = await Promise.all([
         measureRunPhase("connectors.github.connections", () => db
           .select()
           .from(toolConnections)
@@ -4621,7 +4627,11 @@ export function toolAccessService(
                 ),
               ))
           : Promise.resolve([]),
+        db.select({ connectionId: toolConnectionInstalls.connectionId })
+          .from(toolConnectionInstalls)
+          .where(eq(toolConnectionInstalls.companyId, companyId)),
       ]);
+      const installedConnectionIds = new Set(installs.map(install => install.connectionId));
       const repositories = new Map<
         string,
         import("@paperclipai/shared").ProjectRepository
@@ -4633,7 +4643,8 @@ export function toolAccessService(
       for (const connection of connections) {
         if (
           connection.status !== "active" ||
-          asRecord(connection.config).sourceTemplateKey !== "github"
+          asRecord(connection.config).sourceTemplateKey !== "github" ||
+          (isGitHubAppConnection(connection) && !installedConnectionIds.has(connection.id))
         )
           continue;
         const connectionGrants = grants.filter(
@@ -4657,7 +4668,7 @@ export function toolAccessService(
         // Legacy shared PAT connections predate grants. Never fall back when a
         // grant exists but is revoked, private, or outside the caller's audience.
         const legacyShared =
-          connectionGrants.length === 0 &&
+          !isGitHubAppConnection(connection) && connectionGrants.length === 0 &&
           connection.credentialPolicy === "shared" &&
           (localTrusted || (!!userId && memberships.length > 0));
         if (!availableGrants.length && !legacyShared) continue;
@@ -4676,7 +4687,7 @@ export function toolAccessService(
               private?: boolean;
             }>;
             if (
-              initialGrant &&
+              initialGrant && !isGitHubAppConnection(connection) &&
               asRecord(asRecord(connection.config).oauth).connectorProfile ===
                 "github.code"
             ) {
@@ -4689,6 +4700,9 @@ export function toolAccessService(
             } else {
               const headers = await measureRunPhase("connectors.github.credentials", () => initialGrant
                 ? (async () => {
+                    if (isGitHubAppConnection(connection)) {
+                      return { Authorization: `Bearer ${(await resolveGitHubAppCredential(db, connection, initialGrant)).token}` };
+                    }
                     const ref = initialGrant.credentialSecretRefs.find(
                       (ref) =>
                         ref.configPath === "oauth.access_token" ||
@@ -4708,7 +4722,7 @@ export function toolAccessService(
                     return { Authorization: `Bearer ${secret.value}` };
                   })()
                 : resolveCredentialHeaders(connection, actor));
-              rows = await measureRunPhase("connectors.github.repositories", () => loadGitHubTokenRepositories(headers));
+              rows = await measureRunPhase("connectors.github.repositories", () => loadGitHubTokenRepositories(headers, undefined, isGitHubAppConnection(connection) ? "installation" : "user"));
             }
             for (const row of rows) {
               mergeProjectRepository(repositories, row, connection.name, connection.id);

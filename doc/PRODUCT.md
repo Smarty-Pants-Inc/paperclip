@@ -219,11 +219,12 @@ and board-column membership keep their existing server order.
 Search and pagination apply the routine origin filter on the server. Creation-time
 sorting also runs before pagination, with task ID as a stable tie-breaker.
 
-Tasks and project lists hide agent-created and system-created tasks by default.
+Tasks and project lists show agent-created and system-created tasks by default
+unless a saved collection preference hides them.
 The Filters menu's **Show agent-created tasks** checkbox includes routine runs,
 recovery/watchdog tasks, chat-channel tasks, and other automation. Channel tasks
 remain bot-created for this filter even when a human starts the conversation. The choice is saved per company
-and collection; Clear filters restores the hidden default. Nested lists preserve
+and collection; unchecking the checkbox hides them, and Clear filters restores the shown default. Nested lists preserve
 ancestors and expandable subtasks as context without promoting unrelated automated
 work to independent results. Agent profiles, routine histories, and task-detail
 subtasks retain their full history.
@@ -447,6 +448,24 @@ chat turn. Delivery obeys membership, run authority and task privacy. This versi
 in-app only.
 
 Coordinator is the standard workspace for everyone. Settings → Experimental offers a personal **Classic workspace** opt-in, off by default. Historical Coordinator experiment settings do not enable Classic. Agent Chat is available to everyone on new and existing instances. The retired `enableAgentChat` key remains accepted for compatibility; stored and managed off values are ignored. Each person has one persistent task-backed conversation per agent and company, with ordinary company task visibility. The shared task composer, transcript, tools, files, and document panel remain the interaction surface. Agents clarify goals and hand substantial execution to linked, assigned tasks; a reply ends a turn without completing the conversation. `/new` starts fresh provider context in the same conversation while preserving visible history and artifacts. Healthy idle conversations wait for a message and do not count as unfinished execution work. See `doc/plans/2026-09-10-agent-chat.md` for the implementation contract.
+
+After publishing a continuous Pi chat's final answer, the server first drains
+queued person messages into the held turn. A `/new` head or any deferred
+non-person wake (such as a sub-task report, approval, or automation) then ends
+an idle open-turn hold through the normal turn interrupt. These wakes stay
+queued for ordinary admission; `/new` is never sent as steering text. Active
+provider work is not interrupted, the run is not marked person-stopped, and no
+messages are returned to the draft by this idle-hold release.
+
+When a Pi turn fails before any runner/provider execution started, its saved
+person inputs remain pending. The next admitted turn takes these inputs through
+the first-turn queued-input claim, oldest first, including when a new message
+starts that turn. A deferred input-only receipt is not permission to start work:
+automatic starts retain their existing retry budget, and exhaustion leaves Retry
+available rather than silently discarding input. An operator-waiting recovery
+action without committed delivery does not hide Retry. Failures after provider
+work retain their existing recovery rules; Stop and `/new` still retire their
+own inputs.
 
 Document links labeled to open in the sidebar keep the conversation on screen
 and show the requested document revision. **Open source task** in the sidebar

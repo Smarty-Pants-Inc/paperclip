@@ -1,7 +1,12 @@
 import { NativePullRequestCompletionError, verifyNativePullRequestCompletion } from "./native-pull-request-completion.js";
 import { notifyNativeStatusWakeWork } from "../deferred-execution-notifications.js";
+import { currentRunFailureText } from "./native-exact-resume-failure.js";
+import { redactSensitiveText } from "../../redaction.js";
 import { toolCallLoopContinuationKey } from "./repeated-tool-failure-guard.js";
+import { nativeRunHasStopRequest } from "./native-tool-receipt-limit.js";
+import { hasUnclaimedTaskPersonInput, PI_UNCLAIMED_CONTINUATION_KEY, UNCLAIMED_TASK_OWNER_REASON, UNCLAIMED_TASK_OWNER_MISSING_REASON, UNCLAIMED_TASK_OWNER_MISSING_NOTICE } from "./unclaimed-task.js";
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
+import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { forbidden, HttpError } from "../../errors.js";
 import { agentInteractionDeliveryDenial, agentWakeInteractionTexts, INTERACTION_DELIVERY_DENIED, withInteractionDeliveryOrigin } from "../agent-interaction-delivery.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
@@ -34,14 +39,17 @@ import { isConversation } from "../agent-conversations.js";
 import { hasPendingNativeChildCompletion, type NativeChildCompletionRecipient } from "./native-child-completion-delivery.js";
 import { and, asc, desc, eq, inArray, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { answeredContinuousHeldRun } from "./continuous-session-input.js";
 import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
   agents,
   approvals,
   completionContracts,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
+  issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
@@ -754,6 +762,17 @@ async function materializeDecisionEffect(input: {
     };
   }
   if (effect.kind === "notify_owner") {
+    // Reuse the scoped review wake when governance permits it. A human-only
+    // company cap can suppress that wake; then use the existing owner notice
+    // below, without granting reviewer execution or retrying finalization.
+    if (effect.reason === UNCLAIMED_TASK_OWNER_REASON) {
+      const [reviewWake] = await input.tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, effect.agentId),
+        sql`${agentWakeupRequests.payload}->>'nativeReviewDecisionId' = ${input.decisionId}`,
+      )).limit(1);
+      if (reviewWake) return { effectKind: effect.kind, targetType: "agent_wakeup_request", targetId: reviewWake.id,
+        payload: { reason: effect.reason } };
+    }
     const wakeId = await enqueueWake({
       tx: input.tx,
       originRunId: input.runId,
@@ -851,7 +870,8 @@ async function materializeDecisionEffect(input: {
       companyId: input.companyId,
       issueId: input.issue.id,
       agentId: effect.agentId,
-      reason: "issue_status_changed",
+      reason: effect.idempotencyKey === PI_UNCLAIMED_CONTINUATION_KEY ? "issue_continuation_needed" : "issue_status_changed",
+      contextSnapshot: effect.idempotencyKey === PI_UNCLAIMED_CONTINUATION_KEY ? { nativeTaskUnclaimed: true } : undefined,
       idempotencyKey: `native-status:${input.decisionId}:continuation`,
       payload: {
         nativeDecisionId: input.decisionId,
@@ -929,6 +949,61 @@ async function materializeDecisionEffect(input: {
       return { effectKind: effect.kind, targetType: "heartbeat_run", targetId: retryId,
         payload: { cause: effect.cause, summary: effect.summary } };
     }
+    let retrySummary = effect.summary;
+    let turnSubmitted = false;
+    let providerOutputObserved = false;
+    let sourceTurnCompleted = false;
+    let sourceTurnId: string | null = null;
+    if (effect.cause === "native_run_failed") {
+      const [run] = await input.tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, effect.agentId), eq(heartbeatRuns.nativeIssueId, input.issue.id),
+      )).limit(1);
+      if (run?.nativeSessionId && run.runnerInstanceId) {
+        // PaperclipControlPlanePort commits these only after validating the
+        // run/session/source binding. Session/checkpoint existence is NOT a
+        // submitted-turn receipt: input preparation can fail between them.
+        const boundEvent = and(eq(heartbeatRunEvents.companyId, input.companyId),
+          eq(heartbeatRunEvents.runId, input.runId), eq(heartbeatRunEvents.agentId, effect.agentId),
+          eq(heartbeatRunEvents.sourceInstanceId, run.runnerInstanceId),
+          sql`${heartbeatRunEvents.sourceEventId} is not null`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'runId' = ${input.runId}`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'normalizedSessionId' = ${run.nativeSessionId}`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'sourceKind' = 'runner'`);
+        const [submitted] = await input.tx.select({ turnId: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId'` })
+          .from(heartbeatRunEvents).where(and(boundEvent, inArray(heartbeatRunEvents.eventType, ["turn.started", "turn.accepted"])))
+          .orderBy(desc(heartbeatRunEvents.sourceSeq)).limit(1);
+        sourceTurnId = submitted?.turnId ?? null;
+        turnSubmitted = !!sourceTurnId;
+        // Keep output as a diagnostic only: a delta may be partial output before
+        // error/cancel, or old assistant history replayed under the new turn ID.
+        const [output] = submitted?.turnId ? await input.tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+          boundEvent, inArray(heartbeatRunEvents.eventType, ["item.delta", "item.completed"]),
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${submitted.turnId}`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'agentMessage'`,
+          sql`length(trim(coalesce(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'text', ''))) > 0`,
+        )).limit(1) : [];
+        providerOutputObserved = !!output;
+        const [completed] = sourceTurnId ? await input.tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+          boundEvent, sql`${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${sourceTurnId}`,
+          or(eq(heartbeatRunEvents.eventType, "turn.completed"), and(
+            eq(heartbeatRunEvents.eventType, "item.completed"),
+            sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'agentMessage'`,
+            sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'channel' = 'final'`,
+            sql`length(trim(coalesce(${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'text', ''))) > 0`,
+          )),
+        )).limit(1) : [];
+        sourceTurnCompleted = !!completed;
+        const [failure] = await input.tx.select({ message: sql<string | null>`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->'error'->>'message'` })
+          .from(heartbeatRunEvents).where(and(boundEvent, eq(heartbeatRunEvents.eventType, "turn.failed")))
+          .orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+        // Project one diagnostic line, not a stored stderr/stack tail. Reapply
+        // redaction because not every writer of run.error is PRP ingestion.
+        const reason = currentRunFailureText(run)?.trim() || failure?.message?.trim();
+        retrySummary = reason ? Array.from(redactSensitiveText(reason).split(/\r?\n/)[0]!.trim()).slice(0, 1_500).join("")
+          || "The failure reason was not recorded." : "The failure reason was not recorded.";
+      } else retrySummary = "The failure reason was not recorded.";
+    }
     const wakeId = await enqueueWake({
       tx: input.tx,
       companyId: input.companyId,
@@ -941,6 +1016,10 @@ async function materializeDecisionEffect(input: {
         nativeDecisionId: input.decisionId,
         retryCause: effect.cause,
         retrySummary: effect.summary,
+      },
+      contextSnapshot: {
+        nativeStatusRetry: { cause: effect.cause, summary: retrySummary, sourceRunId: input.runId, sourceTurnId,
+          turnSubmitted, providerOutputObserved, sourceTurnCompleted },
       },
     });
     return {
@@ -1653,14 +1732,15 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "record_recovery") {
     failAt("recovery_materialization", input.failpoint);
+    const ownerlessTask = effect.cause === UNCLAIMED_TASK_OWNER_MISSING_REASON;
     const recovery = await issueRecoveryActionService(
       input.tx,
     ).upsertSourceScoped({
       companyId: input.companyId,
       sourceIssueId: input.issue.id,
       kind: "active_run_watchdog",
-      ownerType: "agent",
-      ownerAgentId: effect.agentId,
+      ownerType: ownerlessTask ? "board" : "agent",
+      ownerAgentId: ownerlessTask ? null : effect.agentId,
       cause: effect.cause,
       fingerprint: nativeSha256({
         runId: input.runId,
@@ -1669,7 +1749,7 @@ async function materializeDecisionEffect(input: {
       }),
       evidence: { runId: input.runId, decisionId: input.decisionId },
       nextAction: effect.nextAction,
-      wakePolicy: { kind: "resume_native_run", runId: input.runId },
+      wakePolicy: ownerlessTask ? null : { kind: "resume_native_run", runId: input.runId },
       maxAttempts: 3,
     });
     return {
@@ -1880,6 +1960,29 @@ export async function commitNativeStatusDecision(input: {
     ) {
       throw new NativeStatusRaceError();
     }
+    const unclaimedTask = reasonCode === UNCLAIMED_TASK_OWNER_MISSING_REASON || input.decision.effects.some(effect =>
+      (effect.kind === "enqueue_continuation" && effect.idempotencyKey === PI_UNCLAIMED_CONTINUATION_KEY) ||
+      (effect.kind === "bind_reviewer" && effect.requestKey === UNCLAIMED_TASK_OWNER_REASON));
+    if (unclaimedTask) {
+      // A Stop or person message may have landed after the finalizer read it.
+      // Retry assessment under the issue lock instead of committing stale repair.
+      const [run] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+      )).for("share");
+      if (!run || nativeRunHasStopRequest(run.resultJson) || record(run.resultJson?.personStop).requestedAt !== undefined ||
+          await hasUnclaimedTaskPersonInput(tx as unknown as Db, run, input.issueId)) throw new NativeStatusRaceError();
+      if (reasonCode === UNCLAIMED_TASK_OWNER_MISSING_REASON) {
+        if (issue.responsibleUserId || issue.createdByUserId) throw new NativeStatusRaceError();
+        if (issue.createdByAgentId && issue.createdByAgentId !== run.agentId) {
+          const [creator] = await tx.select().from(agents).where(and(
+            eq(agents.companyId, input.companyId), eq(agents.id, issue.createdByAgentId),
+          ));
+          // The finalizer deliberately skips a non-invokable creator. Only a
+          // now-invokable owner invalidates its ownerless Blocked assessment.
+          if (creator && (await evaluateAgentInvokabilityFromDb(tx as unknown as Db, creator)).invokable) throw new NativeStatusRaceError();
+        }
+      }
+    }
     const unblockOwner = input.decision.unblockDescriptor?.owner;
     const assessedUserId = unblockOwner && typeof unblockOwner === "object" && "userId" in unblockOwner
       ? unblockOwner.userId : null;
@@ -2017,6 +2120,9 @@ export async function commitNativeStatusDecision(input: {
           })) throw new NativeStatusRaceError();
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
     }
+    if (reasonCode === "continuous_held_input_already_answered" && !await answeredContinuousHeldRun(tx as unknown as Db, {
+      companyId: input.companyId, issueId: input.issueId, runId: input.runId,
+    })) throw new NativeStatusRaceError();
     // Recheck under the parent status lock: a child can finish between the
     // finalizer's read and this commit. Re-arbitrate instead of discarding its wake.
     if (input.requireNoPendingChildCompletion && await hasPendingNativeChildCompletion(
@@ -2336,6 +2442,19 @@ export async function commitNativeStatusDecision(input: {
     }
     if (!decisionRow) throw new Error("native_status_decision_not_persisted");
 
+    if (reasonCode === UNCLAIMED_TASK_OWNER_MISSING_REASON) {
+      // The issue lock and decision transaction fence notice replay, including
+      // a crash before the finalizer projects the run's committed phase.
+      const clientRequestId = `native-unclaimed-task-owner-missing:${input.runId}`;
+      const [notice] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+        eq(issueComments.authorType, "system"), eq(issueComments.clientRequestId, clientRequestId),
+      )).limit(1);
+      if (!notice) await issueService(tx as unknown as Db).addComment(input.issueId,
+        UNCLAIMED_TASK_OWNER_MISSING_NOTICE,
+        {}, { authorType: "system", clientRequestId,
+          presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false } }, tx);
+    }
     if (planWait) {
       await issueService(tx as unknown as Db).addComment(
         input.issueId, planWait.result.summary,
@@ -2347,7 +2466,7 @@ export async function commitNativeStatusDecision(input: {
       // no chat presentation authorization is supplied: this is Board-only.
       await issueService(tx as unknown as Db).addComment(
         input.issueId,
-        boardResponseWait.summary,
+        boardResponseWait.replyText,
         { agentId: boardResponseWait.source.agentId, runId: input.runId },
         undefined,
         tx,

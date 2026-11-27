@@ -15,6 +15,7 @@ export const INHERITABLE_NATIVE_RUNNER_CONFIG_KEYS = [
   "acpxPermissionMode",
   "acpxSessionMode",
   "piThinkingLevel",
+  "piRpcThinkingLevel",
   "lifecycleMode",
   "modelReasoningEffort",
   "maxIterations",

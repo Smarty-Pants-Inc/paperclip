@@ -69,6 +69,7 @@ function createRun(index: number) {
   return {
     id: `run-${index}`,
     status: "running",
+    runModel: null,
     invocationSource: "assignment",
     triggerDetail: null,
     startedAt: "2026-04-24T12:00:00.000Z",
@@ -304,7 +305,7 @@ describe("ActiveAgentsPanel", () => {
     ]);
     expect(headers.every((header) => header.querySelector("svg") === null)).toBe(true);
     expect(container.querySelector(".status-chip")).toBeNull();
-    expect(container.querySelectorAll('[aria-label="Task in review"]')).toHaveLength(7);
+    expect(container.querySelectorAll('[aria-label="In Review"]')).toHaveLength(7);
     expect(container.querySelectorAll(".motion-safe\\:animate-spin")).toHaveLength(0);
     expect(container.querySelector('a[aria-label="Agent 0 — Running. View run"]')?.getAttribute("href"))
       .toBe("/agents/agent-0/runs/run-0");
@@ -319,8 +320,8 @@ describe("ActiveAgentsPanel", () => {
         issue={{ title: "Slack conversation", identifier: "PAP-559", status: "in_review", externalConversationState: "waiting" }} />);
     });
     expect(container.querySelector('[aria-label="Agent 0 — Succeeded. View run"]')).not.toBeNull();
-    expect(container.querySelector('[aria-label="Task idle"]')).not.toBeNull();
-    expect(container.querySelector('[aria-label="Task in review"]')).toBeNull();
+    expect(container.querySelector('[aria-label="Idle"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="In Review"]')).toBeNull();
     await act(async () => root.unmount());
   });
 

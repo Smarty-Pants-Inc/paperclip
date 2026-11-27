@@ -463,6 +463,21 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(startOAuthMock).not.toHaveBeenCalled();
   });
 
+  it("keeps a GitHub App private key masked and multiline through submission", async () => {
+    mockSearch.value = "source=github&method=app-installation";
+    await render();
+    const key = container.querySelector<HTMLTextAreaElement>('[aria-label="Your GitHub key"]')!;
+    expect(key.matches("textarea.secret-value-masked.ph-no-capture")).toBe(true);
+    await act(async () => {
+      setInputValue(container.querySelector<HTMLInputElement>('input[placeholder="123456"]')!, "123456");
+      setInputValue(container.querySelector<HTMLInputElement>('input[placeholder="12345678"]')!, "12345678");
+      setTextareaValue(container.querySelector<HTMLTextAreaElement>('textarea[placeholder="acme/backend, acme/frontend"]')!, "example/repository");
+      setTextareaValue(key, "line-1\nline-2\nline-3");
+    });
+    await act(async () => buttonByText("Connect")!.click());
+    expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({ credentialValues: { "credentials.privateKey": "line-1\nline-2\nline-3" } }));
+  });
+
   it("sends a plugin connector's settings from its settings schema", async () => {
     const app = pluginAppDefinition("example.records", {
       schemaVersion: 1, slug: "records", name: "Records", description: "Look up records", categories: ["data"],

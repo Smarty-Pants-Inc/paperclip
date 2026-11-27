@@ -62,6 +62,123 @@ afterEach(() => {
   container = null;
 });
 
+describe("stacked model and level picker", () => {
+  it.each([false, true])("shows catalog short names and the level in one trigger (mobile: %s)", async mobile => {
+    const pi = { ...agent, adapterType: "pi_rpc", adapterConfig: { model: "paperclip/claude-fable-5-2" } } as Agent;
+    render(vi.fn(), vi.fn(), false, { triggerLayout: "stacked", mobile, agents: new Map([[pi.id, pi]]),
+      settings: { model: null, effort: "xhigh", fast: false },
+      modelOptionsOverride: [{ id: "paperclip/claude-fable-5-2", label: "Claude Fable 5.2" }] });
+    const trigger = container!.querySelector<HTMLButtonElement>('button[aria-label="Model and level: Claude Fable 5.2, Extra High"]')!;
+    expect(trigger).not.toBeNull();
+    expect(trigger.textContent).not.toContain("paperclip/");
+    expect(trigger.querySelector('[data-testid="task-chat-composer-model-label"]')?.textContent).toBe("Claude Fable 5.2");
+    expect(trigger.querySelector('[data-testid="task-chat-composer-level-label"]')?.textContent).toBe("Extra High");
+    expect(container!.querySelector('[data-testid="task-chat-composer-assignee"]')).toBeNull();
+    await click("Model and level: Claude Fable 5.2, Extra High");
+    expect(document.querySelector('[aria-label="Choose assignee"]')).not.toBeNull();
+    expect(trigger.querySelector('[data-testid="task-chat-composer-model-label"]')?.textContent).toBe("Claude Fable 5.2");
+  });
+
+  it("announces the Default stop by name while the trigger shows its configured level", async () => {
+    const pi = { ...agent, adapterType: "pi_local", adapterConfig: { model: "paperclip/phone-fixture", thinking: "high" } } as Agent;
+    render(vi.fn(), vi.fn(), false, { triggerLayout: "stacked", settings: null, agents: new Map([[pi.id, pi]]),
+      modelOptionsOverride: [{ id: "paperclip/phone-fixture", label: "Phone Model" }] });
+    await click("Model and level: Phone Model, High");
+    expect(document.querySelector("#composer-run-effort")?.getAttribute("aria-valuetext")).toBe("Default");
+    expect(container!.querySelector('[data-testid="task-chat-composer-level-label"]')?.textContent).toBe("High");
+  });
+
+  it("never exposes a provider path even before the catalog loads", () => {
+    const pi = { ...agent, adapterType: "pi_rpc", adapterConfig: { model: "provider/vendor/private-model" } } as Agent;
+    render(vi.fn(), vi.fn(), false, { triggerLayout: "stacked", settings: null, agents: new Map([[pi.id, pi]]) });
+    expect(container!.querySelector('[data-testid="task-chat-composer-model-label"]')?.textContent).toBe("private-model");
+    expect(container!.textContent).not.toContain("provider/");
+  });
+
+  it("shows one line and no level section for a model without levels", async () => {
+    render(vi.fn(), vi.fn(), false, { triggerLayout: "stacked", settings: { model: "plain-model", effort: null, fast: false },
+      modelOptionsOverride: [{ id: "plain-model", label: "Plain model" }] });
+    expect(container!.querySelector('[data-testid="task-chat-composer-level-label"]')).toBeNull();
+    await click("Model: Plain model");
+    expect(document.querySelector("#composer-run-effort")).toBeNull();
+    expect(document.body.textContent).not.toContain("Reasoning level");
+    expect(document.body.textContent).not.toContain("applies to your next message");
+  });
+
+  it.each([
+    { adapterType: "codex_local", config: { modelReasoningEffort: "high" }, expected: "High" },
+    { adapterType: "codex_local", config: {}, expected: "Default" },
+    { adapterType: "pi_rpc", config: {}, expected: "Medium" },
+    { adapterType: "pi_rpc", config: { piRpcThinkingLevel: "max" }, expected: "Max" },
+    { adapterType: "pi_local", config: { thinking: "low" }, expected: "Low" },
+    { adapterType: "claude_local", config: { effort: "high" }, expected: "High" },
+  ])("reads Default from $adapterType configuration ($expected)", ({ adapterType, config, expected }) => {
+    const model = adapterType === "claude_local" ? "claude-opus-5" : "gpt-6-sol";
+    const configured = { ...agent, adapterType, adapterConfig: { model, ...config } } as Agent;
+    render(vi.fn(), vi.fn(), false, { triggerLayout: "stacked", settings: null, agents: new Map([[agent.id, configured]]),
+      modelOptionsOverride: [{ id: model, label: "Short name" }] });
+    expect(container!.querySelector('[data-testid="task-chat-composer-level-label"]')?.textContent).toBe(expected);
+  });
+
+  it.each([false, true])("keeps the assignee-only fallback for an unsupported harness (changeable: %s)", async allowAssigneeChange => {
+    const process = { ...agent, adapterType: "process" } as Agent;
+    render(vi.fn(), vi.fn(), false, { triggerLayout: "stacked", allowAssigneeChange, agents: new Map([[agent.id, process]]) });
+    expect(container!.querySelector('[data-testid="task-chat-composer-model-label"]')).toBeNull();
+    expect(container!.querySelector('[data-testid="task-chat-composer-level-label"]')).toBeNull();
+    if (allowAssigneeChange) {
+      expect(container!.textContent).toContain("Clippy");
+      await click("Select assignee");
+      expect(document.querySelector('[aria-label="Search assignees"]')).not.toBeNull();
+    } else expect(container!.textContent).toBe("");
+  });
+
+  it.each([false, true])("renders named stops, endpoints and next-message notes (reply running: %s)", async replyRunning => {
+    function ControlledPicker() {
+      const [settings, setSettings] = useState<ComposerRunSettings | null>(null);
+      return <ComposerRunSettingsPicker companyId="company-1" assigneeValue="agent:a1" currentAssigneeValue="agent:a1"
+        options={options} agents={agents} settings={settings} onSettingsChange={setSettings} onAssigneeChange={vi.fn()}
+        triggerLayout="stacked" replyRunning={replyRunning} modelOptionsOverride={[]} />;
+    }
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    flushSync(() => root!.render(<QueryClientProvider client={new QueryClient()}><ControlledPicker /></QueryClientProvider>));
+    await click("Model and level: gpt-6-sol, Default");
+    const range = document.querySelector<HTMLInputElement>("#composer-run-effort")!;
+    expect(range.type).toBe("range");
+    expect(range.step).toBe("1");
+    expect(range.getAttribute("aria-valuetext")).toBe("Default");
+    const ends = document.querySelector('[data-testid="composer-run-effort-ends"]')!;
+    expect(ends.textContent).toBe("DefaultUltra");
+    expect(document.querySelectorAll(".composer-run-effort-marks > span")).toHaveLength(Number(range.max) + 1);
+    expect(document.body.textContent).toContain("Reasoning level");
+    expect(document.body.textContent).toContain("Default applies to your next message.");
+    expect(document.body.textContent).toContain("Earlier messages are unchanged.");
+    expect(document.body.textContent?.includes("The current reply is unchanged.")).toBe(replyRunning);
+    flushSync(() => {
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(range, range.max);
+      range.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(range.getAttribute("aria-valuetext")).toBe("Ultra");
+    expect(document.querySelector('[data-testid="selected-effort"] strong')?.textContent).toBe("Ultra");
+    expect(document.body.textContent).toContain("Ultra applies to your next message.");
+    expect(container!.querySelector('[data-testid="task-chat-composer-level-label"]')?.textContent).toBe("Ultra");
+    await click("Reset to agent default");
+    expect(range.value).toBe("0");
+    expect(range.getAttribute("aria-valuetext")).toBe("Default");
+  });
+
+  it("keeps the explicit inline trigger identical to the default presentation", () => {
+    render(vi.fn(), vi.fn());
+    const original = container!.querySelector('[data-testid="task-chat-composer-selection"]')!.outerHTML;
+    flushSync(() => root!.unmount());
+    container!.remove();
+    render(vi.fn(), vi.fn(), false, { triggerLayout: "inline" });
+    expect(container!.querySelector('[data-testid="task-chat-composer-selection"]')!.outerHTML).toBe(original);
+    expect(container!.querySelector('[data-testid="task-chat-composer-level-label"]')).toBeNull();
+  });
+});
+
 describe("composer assignee picker", () => {
   it.each(["antigravity", "copilot"])("applies the Cloud allowlist to saved %s model settings", async acpxAgent => {
     const selectedAgent = { ...agent, adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent, model: "saved-model" } } as Agent;

@@ -6,6 +6,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { PaperclipRunnerToolAuthority } from "./native-runtime/paperclip-runner-tool-authority.js";
 import { taskHistoryReadsForRun } from "./queued-comment-delivery.js";
+import { PaperclipRunnerSemanticAuthority } from "./native-runtime/runner-semantic-authority.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const USER = "history-read-user";
@@ -38,6 +39,34 @@ describe.skipIf(!support.supported)("task history reads", () => {
     const reader = new PaperclipRunnerToolAuthority(db, { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: f.runId });
     try { await reader.execute({ tool: "get_task_history", callId: randomUUID(), arguments: {} }); } finally { reader.close(); }
   }
+
+  it("marks opening and delivered steer requests, not queued arrivals, until saved replies cover them", async () => {
+    const f = await seed(), opening = await comment(f, "Check the report."), steer = await comment(f, "Explain the totals."), queued = await comment(f, "Sort the ledger.");
+    const tool = new PaperclipRunnerToolAuthority(db, f), semantic = new PaperclipRunnerSemanticAuthority(db, f);
+    const check = async (ids?: string[]) => {
+      const actual = await tool.execute({ tool: "get_task_history", callId: randomUUID(), arguments: {} });
+      const result = await semantic.dispatch({ callId: randomUUID(), operationId: "get_task_history", input: {},
+        correlation: { runId: f.runId, normalizedSessionId: randomUUID(), turnId: "history", itemId: "history" } });
+      for (const history of [actual, result.ok && result.value]) {
+        expect((history as Record<string, unknown>).beingAnsweredByYouInThisTurn).toEqual(ids?.map(id => `comment:${id}`));
+        expect(history).toMatchObject({ arrivedDuringThisTurn: expect.arrayContaining([`comment:${queued.id}`]) });
+      }
+    };
+    try {
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentIds: [opening.id], wakeCommentId: opening.id } }).where(eq(heartbeatRuns.id, f.runId));
+      await check([opening.id]);
+      const acknowledgements = { [steer.id]: { status: "acknowledged" }, [queued.id]: { status: "pending" } };
+      await db.update(heartbeatRuns).set({ resultJson: { queuedSteeringAcknowledgements: acknowledgements } }).where(eq(heartbeatRuns.id, f.runId));
+      await check([opening.id, steer.id]);
+      const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId, body: "The totals match." }).returning();
+      await db.update(heartbeatRuns).set({ resultJson: { queuedSteeringAcknowledgements: acknowledgements,
+        continuousReplies: { final: { questionCommentIds: [opening.id, steer.id], commentId: reply!.id } } } }).where(eq(heartbeatRuns.id, f.runId));
+      await check();
+      await db.update(heartbeatRuns).set({ resultJson: { queuedSteeringAcknowledgements: acknowledgements,
+        personStop: { returned: [opening.id, steer.id] } } }).where(eq(heartbeatRuns.id, f.runId));
+      await check();
+    } finally { tool.close(); }
+  });
 
   const finish = (f: { runId: string }, status: "succeeded" | "failed") => db.update(heartbeatRuns)
     .set({ status, finishedAt: new Date(Date.now() + 1_000) }).where(eq(heartbeatRuns.id, f.runId));

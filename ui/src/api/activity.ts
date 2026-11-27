@@ -1,4 +1,4 @@
-import type { ActivityEvent, ExecutionProjection, RunLivenessState } from "@paperclipai/shared";
+import type { ActivityEvent, ExecutionProjection, IssueDisplayStatus, IssueUnblockDescriptor, RunLivenessState } from "@paperclipai/shared";
 import { api, type RequestOptions } from "./client";
 
 export type { RunLivenessState } from "@paperclipai/shared";
@@ -65,6 +65,8 @@ export interface RunForIssue {
 }
 
 export interface IssueForRun {
+  displayStatus?: IssueDisplayStatus;
+  unblockDescriptor?: IssueUnblockDescriptor | null;
   issueId: string;
   identifier: string | null;
   title: string;

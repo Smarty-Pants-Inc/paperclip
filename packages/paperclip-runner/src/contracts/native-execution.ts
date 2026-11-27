@@ -1,3 +1,4 @@
+import { PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } from "./runtime-context-prompts.js";
 import { parseNativeCursorCloudConfig, type NativeCursorCloudConfig } from "./cursor-cloud.js";
 import { resolveGrokDisableWebSearch } from "../drivers/acpx/grok-web-search.js";
 import { resolveGrokEffort } from "../drivers/acpx/grok-effort.js";
@@ -124,6 +125,7 @@ export type NativeProviderConfig =
   | { kind: "cursor_cloud"; model: string; cursorCloud: NativeCursorCloudConfig }
   | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy }
   | { kind: "opencode"; model: string; permissionMode?: NativeOpenCodePermissionMode }
+  | { kind: "pi_rpc"; model: string; conversationMode?: true; sessionContinuity?: "continuous" | "paperclip"; piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
   | {
       kind: "claude_managed";
       model: string;
@@ -156,6 +158,7 @@ export type NativeProviderConfig =
 export type NativeProviderConfigV4 =
   | { kind: "codex"; model: string | null; approvalPolicy: NativeCodexApprovalPolicy }
   | { kind: "opencode"; model: string; permissionMode: NativeOpenCodePermissionMode }
+  | Extract<NativeProviderConfig, { kind: "pi_rpc" }>
   | Extract<NativeProviderConfig, { kind: "claude_managed" | "aws_agentcore" | "cursor_cloud" }>
   | {
       kind: "acpx";
@@ -197,7 +200,7 @@ export interface NativeExecutionInputV1 {
   };
   session: {
     normalizedSessionId: string | null;
-    driverKind: "cursor_cloud_api" | "codex_app_server" | "opencode_server" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
+    driverKind: "cursor_cloud_api" | "codex_app_server" | "opencode_server" | "pi_rpc" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
     protocolVersion: 1;
     lifecyclePolicy: NativeSessionLifecyclePolicy;
   };
@@ -288,6 +291,10 @@ export interface NativeExecutionInputV8 extends Omit<NativeExecutionInputV6, "sc
 }
 
 export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
+
+export function isNativePiConversation(input: Pick<NativeExecutionInput, "provider">): boolean {
+  return input.provider.kind === "pi_rpc" && input.provider.conversationMode === true;
+}
 
 /** The only task data that may enter provider-visible model input. */
 export interface NativeModelEnvelopeV1 {
@@ -535,6 +542,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       session.driverKind !== "cursor_cloud_api"
       && session.driverKind !== "codex_app_server"
       && session.driverKind !== "opencode_server"
+      && session.driverKind !== "pi_rpc"
       && session.driverKind !== "claude_managed_agents_api"
       && session.driverKind !== "aws_agentcore_harness_api"
       && session.driverKind !== "acpx_runtime"
@@ -575,11 +583,12 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     provider.kind !== "cursor_cloud"
     && provider.kind !== "codex"
     && provider.kind !== "opencode"
+    && provider.kind !== "pi_rpc"
     && provider.kind !== "claude_managed"
     && provider.kind !== "aws_agentcore"
     && provider.kind !== "acpx"
   ) {
-    throw new NativeExecutionInputError("input.provider.kind must be cursor_cloud, codex, opencode, claude_managed, aws_agentcore, or acpx");
+    throw new NativeExecutionInputError("input.provider.kind must be cursor_cloud, codex, opencode, pi_rpc, claude_managed, aws_agentcore, or acpx");
   }
   exactKeys(
     provider,
@@ -593,6 +602,8 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
         ? ["kind", "agent", "model", isV4 ? "permissionMode" : "permissionPolicy", "profile", "piThinkingLevel", ...(isV4 ? ["mode"] : []), ...(isV9 ? ["claudeEffort"] : []), ...(isV10 ? ["grokEffort", "grokDisableWebSearch"] : [])]
       : provider.kind === "codex" && isV4
         ? ["kind", "model", "approvalPolicy", ...(isV5 ? ["reasoningEffort", "webSearch"] : [])]
+        : provider.kind === "pi_rpc"
+          ? ["kind", "model", "piRpcThinkingLevel", "conversationMode", "sessionContinuity"]
         : provider.kind === "opencode" && isV4
           ? ["kind", "model", "permissionMode"]
           : ["kind", "model"],
@@ -602,6 +613,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     (provider.kind === "cursor_cloud" && session.driverKind !== "cursor_cloud_api")
     || (provider.kind === "codex" && session.driverKind !== "codex_app_server")
     || (provider.kind === "opencode" && session.driverKind !== "opencode_server")
+    || (provider.kind === "pi_rpc" && session.driverKind !== "pi_rpc")
     || (provider.kind === "claude_managed" && session.driverKind !== "claude_managed_agents_api")
     || (provider.kind === "aws_agentcore" && session.driverKind !== "aws_agentcore_harness_api")
     || (provider.kind === "acpx" && session.driverKind !== "acpx_runtime")
@@ -793,6 +805,13 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
         commandDigest: text(profile.commandDigest, "input.provider.profile.commandDigest"),
       },
     };
+  } else if (provider.kind === "pi_rpc") {
+    if (provider.conversationMode !== undefined && provider.conversationMode !== true) throw new NativeExecutionInputError("input.provider.conversationMode must be true when present");
+    if (provider.sessionContinuity !== undefined && provider.sessionContinuity !== "continuous" && provider.sessionContinuity !== "paperclip") throw new NativeExecutionInputError("input.provider.sessionContinuity must be continuous or paperclip");
+    parsedProvider = { kind: "pi_rpc", model: providerModel!,
+      ...(provider.conversationMode === true ? { conversationMode: true as const } : {}),
+      ...(provider.sessionContinuity === undefined ? {} : { sessionContinuity: provider.sessionContinuity }),
+      ...(provider.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: provider.piRpcThinkingLevel as Extract<NativeProviderConfig, { kind: "pi_rpc" }>["piRpcThinkingLevel"] }) };
   } else if (provider.kind === "opencode") {
     if (isV4 && provider.permissionMode !== "allow" && provider.permissionMode !== "ask" && provider.permissionMode !== "deny") {
       throw new NativeExecutionInputError("input.provider.permissionMode must be allow, ask, or deny");
@@ -998,7 +1017,7 @@ export function buildNativeModelEnvelope(input: NativeExecutionInput, options?: 
       completion: {
         revision: input.completionContract.contract.revision,
         criterionIds: input.completionContract.contract.criteria.map((criterion) => criterion.id),
-        instruction: "Before ending this turn, obtain one accepted paperclip_finish or paperclip_block result. Earlier reports belong to earlier turns; a final message alone does not complete this turn.",
+        instruction: isNativePiConversation(input) ? PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION : "Before ending this turn, obtain one accepted paperclip_finish or paperclip_block result. Earlier reports belong to earlier turns; a final message alone does not complete this turn.",
       },
     };
   }

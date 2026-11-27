@@ -12,6 +12,8 @@ import { automationShareLabel, automationSplitWords, conversationButtonLabel } f
 import { capList, workBearings, type BearingItem, type WorkBearing, type WorkItemKind } from "@/lib/responsibility-views";
 import { Link } from "@/lib/router";
 import { cn } from "@/lib/utils";
+import { resolveTaskStatusPresentation, taskStatusIconProps } from "@/lib/task-status-presentation";
+import { taskStatusIconVar } from "@/lib/status-colors";
 import { MakeRoutineDialog, type RoutineTaskTarget } from "./MakeRoutineDialog";
 import { MetricGlance } from "./MetricGlance";
 import { ResponsibilityMetrics } from "./ResponsibilityMetricSet";
@@ -70,6 +72,8 @@ interface AutomateActions {
  */
 function BearingRow({ entry, automate }: { entry: BearingItem; automate?: AutomateActions }) {
   const { item, bearing, reason } = entry;
+  const taskPresentation = item.kind === "task" && item.task.status === "blocked"
+    ? resolveTaskStatusPresentation(taskStatusIconProps(item.task)) : null;
   const onMakeRoutine = automate?.onByHand;
   return (
     <li
@@ -98,7 +102,7 @@ function BearingRow({ entry, automate }: { entry: BearingItem; automate?: Automa
               {item.title}
             </span>
           </span>
-          <span className={cn("flex min-w-0 items-center gap-1 text-xs", BEARING_TEXT[bearing])} data-bearing-reason="">
+          <span className={cn("flex min-w-0 items-center gap-1 text-xs", BEARING_TEXT[bearing])} style={taskPresentation ? { color: `var(${taskStatusIconVar[taskPresentation.glyphStatus]})` } : undefined} data-bearing-reason="">
             <BearingIcon bearing={bearing} />
             <span className="line-clamp-1" title={reason}>
               <span className="sr-only">{BEARING_PREFIX[bearing]}</span>

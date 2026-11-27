@@ -454,6 +454,12 @@ export interface SandboxTransferProgressOptions {
 
 export const MAX_SANDBOX_SYNC_TIMEOUT_MS = 30 * 60_000;
 
+/** Unknown directory sizes keep the baseline; known sizes get a bounded transfer budget. */
+export function sandboxSyncMinimumTimeoutMs(byteSize?: number): number {
+  if (typeof byteSize !== "number" || !Number.isSafeInteger(byteSize) || byteSize <= 0) return 60_000;
+  return Math.min(MAX_SANDBOX_SYNC_TIMEOUT_MS, 60_000 + Math.ceil(byteSize / 1024 ** 2) * 1_000);
+}
+
 export interface SandboxSyncOptions {
   minimumTimeoutMs?: number;
 }
@@ -1584,7 +1590,9 @@ export async function prepareSandboxManagedRuntime(input: {
         params.progressLabel,
         { sink: input.onRuntimeProgress, phase: params.statusPhase },
       );
-      const syncResult = await runStepSpan("workspace.transfer", () => syncIn(operations));
+      const syncResult = await runStepSpan("workspace.transfer", () => syncIn(operations, {
+        minimumTimeoutMs: sandboxSyncMinimumTimeoutMs(params.progressBytes),
+      }));
       // Prefer the transport's own byte total. It is the real count for a
       // provider that has no host tarball to stat (a referenced project rides
       // a `directory` mapping). Fall back to the caller-supplied count when

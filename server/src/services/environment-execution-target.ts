@@ -1,3 +1,4 @@
+import { sandboxRestartMetadata } from "./sandbox-snapshot-restore.js";
 import { environmentTaskOperationSchema } from "@paperclipai/plugin-sdk";
 import type { Db } from "@paperclipai/db";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
@@ -76,6 +77,7 @@ function toBoolean(value: unknown): boolean | undefined {
 function sandboxLeaseAcquisitionFromMetadata(
   value: unknown,
   providerLeaseId: string | null | undefined,
+  leaseMetadata?: Record<string, unknown> | null,
 ): SandboxLeaseAcquisition | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
@@ -104,6 +106,8 @@ function sandboxLeaseAcquisitionFromMetadata(
       ? { previousProviderLeaseId: candidate.previousProviderLeaseId }
       : {}),
     ...(reason ? { reason } : {}),
+    ...sandboxRestartMetadata({ metadata: { ...candidate,
+      handledProcessRestartKey: leaseMetadata?.handledProcessRestartKey ?? candidate.handledProcessRestartKey } }),
   };
 }
 
@@ -423,6 +427,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
       sandboxLeaseAcquisition: sandboxLeaseAcquisitionFromMetadata(
         input.lease?.metadata?.sandboxLeaseAcquisition,
         input.lease?.providerLeaseId,
+        input.lease?.metadata,
       ),
       // Attach the host duplex observability recorder next to the runner. The bridge
       // binds it to the fixed observability surface. Absent keeps the no-op

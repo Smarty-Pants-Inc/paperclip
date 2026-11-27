@@ -1,11 +1,20 @@
 import { isNativeSessionId } from "../native-runtime/index.js";
-import { and, desc, eq } from "drizzle-orm";
-import { agentConfigRevisions, type Db, type agents, type agentTaskSessions, type heartbeatRuns, type issues, type projects } from "@paperclipai/db";
-import type { AiConnectionBinding, AiRuntimeConnectionBinding } from "@paperclipai/shared";
+import { and, desc, eq, isNull, lte, ne, or, sql } from "drizzle-orm";
+import { agentConfigRevisions, heartbeatRunEvents, heartbeatRuns, issues, type Db, type agents, type agentTaskSessions, type projects } from "@paperclipai/db";
+import type { AiConnectionBinding, AiRuntimeConnectionBinding, ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
+import { decideNativeContinuation, isWarmRecoveryRefusal, resolveSessionContinuity, sessionCannotContinue } from "../native-runtime/continued-session.js";
+import { isChatTask } from "../fresh-continuation-retry-fold.js";
+import { issueService } from "../issues.js";
+import { instanceSettingsService } from "../instance-settings.js";
+import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
+import { logger } from "../../middleware/logger.js";
+import { keyValueRow, runLinkRow, systemNoticePresentation } from "../recovery/notice-format.js";
+import { deriveTaskKey } from "./run-preparation.js";
+import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 import { agentInstructionsService } from "../agent-instructions.js";
 import {
   describeSessionResetReason, shouldResetTaskSessionForWake, isCanonicalSessionIdForAdapter,
@@ -15,7 +24,7 @@ import {
 import {
   buildEffectiveRunSessionConfigMetadata, readConfigFingerprintFromSessionParams,
   readConfiguredModelFromAdapterConfig, resolveTaskSessionConfigFreshness,
-  stripPaperclipSessionMetadataFromSessionParams, type EffectiveRunSessionConfigMetadata,
+  stripPaperclipSessionMetadataFromSessionParams,
 } from "./workspaces.js";
 import type { HeartbeatWorkspacePreparationInput, prepareHeartbeatWorkspace } from "./workspace-preparation.js";
 import type { prepareHeartbeatTaskContext } from "./task-context.js";
@@ -177,12 +186,30 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
       ...(importedManagedInstructions ? [{ ...sessionConfigMetadataInput, ...candidate, retainManagedInstructionPaths: true }] : []),
     ]));
   }
+  const continuousPi = runtimeConfig.provider === "pi_rpc" &&
+    resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous";
+  const historicalInputs: SessionMetadataInput[] = [];
+  if (storedFingerprintDiffers && agent.adapterType === "paperclip_runner" && continuousPi) {
+    const previousCompositions = [
+      { retainSkillKeys: true },
+      { retainAdapterConfigEnvironment: true, retainSkillKeys: true },
+      { continuousPiFingerprintComposition: "issue_overrides" as const, retainAdapterConfigEnvironment: true, retainSkillKeys: true },
+      { continuousPiFingerprintComposition: "model_inputs" as const },
+    ];
+    // Category compatibility uses only old shapes of the current inputs, never
+    // alternate account/revision candidates that could mask a real change.
+    historicalInputs.push(...previousCompositions.map(composition => ({ ...sessionConfigMetadataInput, ...composition })));
+    compatibleInputs.push(...compatibleInputs.flatMap(candidate =>
+      previousCompositions.map(composition => ({ ...candidate, ...composition })),
+    ));
+  }
   const legacyInputs = storedFingerprintDiffers
-    ? [sessionConfigMetadataInput, ...compatibleInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
+    ? [sessionConfigMetadataInput, ...compatibleInputs, ...historicalInputs].map(candidate => ({ ...candidate, legacyComposition: true }))
     : [];
-  const compatibleConfigMetadata: EffectiveRunSessionConfigMetadata[] = await Promise.all(
-    [...compatibleInputs, ...legacyInputs].map(candidate => buildEffectiveRunSessionConfigMetadata(candidate)),
-  );
+  const [compatibleConfigMetadata, historicalConfigMetadata] = await Promise.all([
+    Promise.all([...compatibleInputs, ...legacyInputs].map(candidate => buildEffectiveRunSessionConfigMetadata(candidate))),
+    Promise.all(historicalInputs.map(candidate => buildEffectiveRunSessionConfigMetadata(candidate))),
+  ]);
   const configuredModel =
     readConfiguredModelFromAdapterConfig(runtimeConfig);
   if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {
@@ -194,16 +221,158 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
     hasTaskSession: taskSession != null,
     configuredModel,
+    preserveSessionOnModelChange: runtimeConfig.provider === "pi_rpc" && resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous",
     taskSessionParams:
       taskSession?.sessionParamsJson ?? taskSessionDecodedParams,
     configMetadata: sessionConfigMetadata,
-    compatibleConfigMetadata,
+    compatibleConfigMetadata: [...compatibleConfigMetadata, ...historicalConfigMetadata],
+    compatibleCategoryMetadata: historicalConfigMetadata,
     wakeResetReason: wakeSessionResetReason,
     preserveLegacySessionWithoutConfigMetadata:
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });
-  const resetTaskSession =
+  // Adapter config exemptions are per-key in the fingerprint, never per-category.
+  // Instruction content, environment/binding/secret revisions and skill lists may advance here;
+  // each run resolves current values; missing/versioned metadata and mixed changes still reset.
+  const continuableConfigChange = continuousPi && sessionConfigFreshness.changedCategories.length > 0 &&
+    sessionConfigFreshness.changedCategories.every(category =>
+      ["instructions", "environment", "envBindings", "secrets", "runtimeSkills"].includes(category));
+  let warmRecoveryResetRequired = false;
+  let warmRecoveryRetainSessionId: string | null = null;
+  let warmRecoveryReplacementSessionId: string | null = null;
+  if (continuousPi && issueRef && context.forceFreshSession === true &&
+      context.explicitFreshSession !== true && context.conversationReset !== true &&
+      (context.source === "execution.reconciled" || context.wakeReason === "issue_recovery_action_restored") &&
+      !(await isChatTask(db, agent.companyId, issueRef.id))) {
+    // The first fresh attempt can fail BEFORE publishing a task-session
+    // pointer. Keep the bound on its durable run, not that lagging/empty pointer
+    // or a recovery action (which stock may replace on every retry).
+    const [event] = await db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt, status: heartbeatRuns.status,
+      nativeSessionId: heartbeatRuns.nativeSessionId, sessionIdAfter: heartbeatRuns.sessionIdAfter,
+      context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id), ne(heartbeatRuns.id, run.id),
+      lte(heartbeatRuns.createdAt, run.createdAt), or(eq(heartbeatRuns.issueId, issueRef.id), eq(heartbeatRuns.nativeIssueId, issueRef.id)),
+      or(eq(heartbeatRuns.status, "succeeded"),
+        sql`${heartbeatRuns.contextSnapshot}#>>'{warmRecoveryFreshSession,runId}' = ${heartbeatRuns.id}::text`),
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    // Success ends the incident; otherwise require an explicit fresh request
+    // (including a forceFreshSession wake), stock's reset receipt, or its run-bound
+    // stored-credential reset receipt AND a different session actually started.
+    // A plain wake resuming an older session through a lagging pointer is neither.
+    // Native selection alone precedes startup: require its session.started receipt.
+    // Legacy adapters publish sessionIdAfter on completion, not at selection.
+    let incident = event?.status !== "succeeded" ? event : undefined;
+    const marker = incident?.context?.warmRecoveryFreshSession as Record<string, unknown> | undefined;
+    const incidentSessionId = incident?.nativeSessionId ?? incident?.sessionIdAfter ?? readNonEmptyString(marker?.retainedSessionId);
+    const [replacement] = incident && incidentSessionId ? await db.select({
+      nativeSessionId: heartbeatRuns.nativeSessionId, sessionIdAfter: heartbeatRuns.sessionIdAfter,
+    }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id), ne(heartbeatRuns.id, run.id),
+      lte(heartbeatRuns.createdAt, run.createdAt), or(eq(heartbeatRuns.issueId, issueRef.id), eq(heartbeatRuns.nativeIssueId, issueRef.id)),
+      sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${incident.createdAt.toISOString()}::timestamptz, ${incident.id}::uuid)`,
+      or(sql`${heartbeatRuns.contextSnapshot}->>'explicitFreshSession' = 'true'`,
+        sql`${heartbeatRuns.resultJson}#>>'{configFreshness,session,reset}' = 'true'`,
+        sql`${heartbeatRuns.resultJson}#>>'{configFreshness,session,credentialIdentityResetRunId}' = ${heartbeatRuns.id}::text`),
+      or(and(isNull(heartbeatRuns.nativeSessionId), sql`${heartbeatRuns.sessionIdAfter} is not null`), sql`exists (select 1 from ${heartbeatRunEvents}
+        where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+          and ${heartbeatRunEvents.eventType} = 'session.started'
+          and ${heartbeatRunEvents.payload}#>>'{prpEvent,normalizedSessionId}' = ${heartbeatRuns.nativeSessionId}::text)`),
+      sql`coalesce(${heartbeatRuns.nativeSessionId}::text, ${heartbeatRuns.sessionIdAfter}) <> ${incidentSessionId}`,
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1) : [];
+    if (replacement) {
+      incident = undefined;
+      warmRecoveryReplacementSessionId = replacement.nativeSessionId ?? replacement.sessionIdAfter;
+    }
+    if (incident) warmRecoveryRetainSessionId = incidentSessionId;
+    const retainedSessionId = warmRecoveryReplacementSessionId ?? warmRecoveryRetainSessionId ??
+      readNonEmptyString(taskSessionDecodedParams?.sessionId) ?? taskSession?.sessionDisplayId;
+    // lastRunId can lag a refused pre-claim turn. The newest run on this exact
+    // session (or its unpublished first fresh attempt) decides, never an older refusal.
+    const [previous] = retainedSessionId ? await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, error: heartbeatRuns.error,
+      errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id), ne(heartbeatRuns.id, run.id),
+      lte(heartbeatRuns.createdAt, run.createdAt), or(eq(heartbeatRuns.issueId, issueRef.id), eq(heartbeatRuns.nativeIssueId, issueRef.id)),
+      or(incident ? eq(heartbeatRuns.id, incident.id) : undefined,
+        isNativeSessionId(retainedSessionId) ? eq(heartbeatRuns.nativeSessionId, retainedSessionId) : undefined,
+        and(isNull(heartbeatRuns.nativeSessionId), or(eq(heartbeatRuns.sessionIdBefore, retainedSessionId), eq(heartbeatRuns.sessionIdAfter, retainedSessionId)))),
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1) : [];
+    if (isWarmRecoveryRefusal(previous)) {
+      if (incident) {
+        const reason = "warm_recovery_fresh_session_already_attempted";
+        context.warmRecoveryNoticeReason = reason;
+        // Record once per incident, atomically with the receipt. This is a
+        // notice, NOT a new recovery owner or wake: stock's bound stays intact.
+        const publications: ActivityPublication[] = [];
+        try {
+          await db.transaction(async tx => {
+            // addComment updates issues.updatedAt even for a system notice. Take
+            // the issue fence FIRST, matching admission/mutation's issue -> run
+            // order; holding only the incident run here would invert that order.
+            const [issue] = await tx.select({ id: issues.id }).from(issues).where(and(
+              eq(issues.companyId, agent.companyId), eq(issues.id, issueRef.id),
+            )).for("update");
+            if (!issue) return;
+            const [started] = await tx.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.id, incident.id),
+            )).for("update");
+            const marker = started?.context?.warmRecoveryFreshSession as Record<string, unknown> | undefined;
+            if (!marker || marker.noticeRecorded === true) return;
+            // This caller-owned system_notice has no agent/user/run author and
+            // bypasses HTTP/plugin comment wake delivery. addComment itself only
+            // persists it; system notices are not actionable continuation input.
+            await issueService(db).addComment(issueRef.id,
+              "This task's saved session could not be resumed. Paperclip already tried one new session without a successful turn, " +
+              "so automatic recovery will not request another new session for this incident. Other session-reset rules still apply. " +
+              "Retry on the task starts a new session when the failed run reports that its saved session cannot continue; " +
+              "otherwise it tries the saved session again.", {}, {
+                authorType: "system",
+                presentation: systemNoticePresentation({ tone: "warning", title: "Fresh-session recovery already attempted" }),
+                // A dated record, not a live execution blocker: TaskChatThread
+                // hides system-owned recovery notices and obsolete sourceRunId
+                // diagnostics. Keep the durable run link in the detail rows.
+                metadata: { version: 1, sections: [{
+                  title: "Recovery", rows: [keyValueRow("Reason", reason),
+                    runLinkRow("Fresh-session attempt", { id: incident.id, status: incident.status, agentId: agent.id })],
+                }] },
+              }, tx);
+            await tx.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) ||
+              ${JSON.stringify({ warmRecoveryFreshSession: { ...marker, noticeRecorded: true } })}::jsonb` })
+              .where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.id, incident.id)));
+            await logActivity(tx as unknown as Db, { companyId: agent.companyId, actorType: "system", actorId: "recovery",
+              action: "issue.warm_recovery_fresh_session_already_attempted", entityType: "issue", entityId: issueRef.id,
+              details: { reason, freshSessionRunId: incident.id, refusedRunId: previous!.id } }, publications);
+          });
+          // Nothing escapes a rolled-back transaction. The receipt and notice
+          // commit together, just like the existing New session marker.
+          for (const publication of publications) publishActivity(publication);
+        } catch (err) {
+          logger.warn({ err, runId: run.id, issueId: issueRef.id }, "Could not record recovery notice; continuing recovery");
+        }
+      } else if (sessionCannotContinue(previous) &&
+          (await instanceSettingsService(db).getExperimentalReadOnly()).autoFreshSessionOnRecovery === true) {
+        // Spend only on a session that can never resume, not a self-clearing refusal.
+        // For incidents opened while ON, boundaries, receipts and authorized-newer
+        // selection remain active when the setting is later switched OFF.
+        warmRecoveryResetRequired = true;
+        context.warmRecoveryFreshSession = { runId: run.id, refusedRunId: previous!.id, retainedSessionId };
+        // Write before workspace/provider startup can fail, and merge rather
+        // than replace unrelated admission context. Re-preparation is idempotent.
+        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) ||
+          ${JSON.stringify({ warmRecoveryFreshSession: context.warmRecoveryFreshSession })}::jsonb` })
+          .where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.id, run.id)));
+      }
+    }
+  }
+  let resetTaskSession =
     context.workspaceSelectionChanged === true || shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+  if (decideNativeContinuation({
+    provider: runtimeConfig.provider, sessionContinuity: runtimeConfig.sessionContinuity, hasSession: taskSession != null || warmRecoveryRetainSessionId != null, wakeReset: true,
+    resetRequired: warmRecoveryResetRequired || context.explicitFreshSession === true || context.conversationReset === true ||
+      (context.workspaceSelectionChanged === true && (agent.adapterType !== "paperclip_runner" || runtimeConfig.provider !== "pi_rpc")) ||
+      sessionConfigFreshness.reasons.some(reason => reason !== wakeSessionResetReason &&
+        !(continuableConfigChange && reason.startsWith("effective run configuration changed: "))) ||
+      (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null)),
+  }).continue) resetTaskSession = false;
   const sessionResetReason =
     sessionConfigFreshness.reasons.join("; ") || null;
   const taskSessionForRun = resetTaskSession ? null : taskSession;
@@ -212,15 +381,35 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     managedAiRuntime.sessionIdentity,
     managedAiRuntime.identity,
   );
+  // Missing task-session identity is not a credential change: the first fresh
+  // try may have failed before publishing that row. Keep its pin in that case.
+  // A real stored identity change must let stock choose a new native session.
+  const credentialIdentityResetRunId = taskSession?.sessionParamsJson?.paperclipAiCredentialIdentity != null &&
+    !taskSessionCredentialCompatible ? run.id : null;
+  if (resetTaskSession || credentialIdentityResetRunId) {
+    warmRecoveryRetainSessionId = null;
+  }
+  // Boundary recognition must reach dispatch, not only refusal classification.
+  // Stock reset and credential compatibility still decide whether any resume is safe.
+  const warmRecoveryResumeSessionId = warmRecoveryReplacementSessionId ?? warmRecoveryRetainSessionId;
   const taskSessionId = readNonEmptyString(taskSessionDecodedParams?.sessionId);
-  const taskResumeSessionId = taskSessionCredentialCompatible && taskSessionForRun?.lastRunId &&
-    taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
+  const taskResumeSessionId = !resetTaskSession && taskSessionCredentialCompatible && isNativeSessionId(warmRecoveryResumeSessionId)
+    ? warmRecoveryResumeSessionId
+    : taskSessionCredentialCompatible && taskSessionForRun?.lastRunId &&
+      taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
+    continuation: context.executionContinuation as ExecutionContinuationEnvelope | undefined,
+    mode: resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous" ? "whole" : "bounded",
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
+    excludeCommentIds: [...new Set([...queuedCommentIdsFromRunContext(context),
+      ...[wakeCommentId, readNonEmptyString(context.wakeCommentId), readNonEmptyString(context.commentId)]
+        .filter((id): id is string => id !== null)])],
   }) : undefined;
   const previousSessionParams =
     explicitResumeSessionParams ??
+    (!resetTaskSession && taskSessionCredentialCompatible && warmRecoveryResumeSessionId
+      ? { sessionId: warmRecoveryResumeSessionId } : null) ??
     (isCanonicalSessionIdForAdapter(
       agent.adapterType,
       explicitResumeSessionDisplayId,
@@ -242,7 +431,7 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     if (handoff) context.paperclipFreshSessionHandoffMarkdown = handoff;
   }
   return { sessionConfigMetadata, configuredModel, sessionConfigFreshness, resetTaskSession, sessionResetReason, taskSessionForRun,
-    taskSessionCredentialCompatible, taskResumeSessionId, getFreshSessionHandoff, previousSessionParams };
+    taskSessionCredentialCompatible, credentialIdentityResetRunId, taskResumeSessionId, warmRecoveryRetainSessionId, getFreshSessionHandoff, previousSessionParams };
 }
 
 export interface HeartbeatAdapterSessionInput {
@@ -362,8 +551,7 @@ export async function resolveHeartbeatAdapterSession(input: HeartbeatAdapterSess
     (!taskSessionForRun ||
       !taskSession?.sessionDisplayId ||
       runtimeForAdapter.sessionDisplayId !== taskSession.sessionDisplayId ||
-      resetTaskSession ||
-      context.forceFreshSession === true)
+      resetTaskSession)
   ) {
     delete executionContinuation.resumeDelta;
   }
@@ -373,6 +561,9 @@ export async function resolveHeartbeatAdapterSession(input: HeartbeatAdapterSess
       fingerprintVersion: sessionConfigMetadata.version,
       categories: sessionConfigMetadata.categories,
       reset: resetTaskSession,
+      // This identity-only reset is independent of configuration freshness.
+      // Bind its authority to this run; a matching start receipt is still required.
+      credentialIdentityResetRunId: prepared.credentialIdentityResetRunId,
       resetReasons: sessionConfigFreshness.reasons,
       changedCategories: sessionConfigFreshness.changedCategories,
       taskSessionAvailable: taskSession != null,

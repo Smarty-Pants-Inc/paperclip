@@ -1,7 +1,7 @@
 import { useWorkspaceBaseRefRecovery, useWorkspaceRetry } from "@/components/WorkspaceBaseRefRecovery";
 import { WorkspaceBaseRefRecoveryNotice } from "@/components/WorkspaceBaseRefRecoveryNotice";
 import { DispositionRecoveryNotice, useDispositionRecoverySnapshot } from "@/components/DispositionRecoveryNotice";
-import { useId, useState } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { useProviderLimitMessage } from "@/hooks/useProviderLimitMessage";
 import {
   ChevronDown,
@@ -23,7 +23,7 @@ import { humanizeSystemNotice } from "@/lib/system-notice-humanizer";
 import { mapCommentMetadataToSystemNoticeSections } from "@/lib/system-notice-comment";
 import { timeAgo } from "@/lib/timeAgo";
 import type { TaskChatMessageItem } from "./task-chat-model";
-import { isNoLiveExecutionPathNotice } from "./adjacent-errors";
+import { isNoLiveExecutionPathNotice, isUnrecoveredFilesNotice } from "./adjacent-errors";
 
 const TONE_ICON: Record<SystemNoticeTone, LucideIcon> = {
   neutral: Info,
@@ -52,10 +52,12 @@ const TONE_ICON_CLASS: Record<SystemNoticeTone, string> = {
  */
 export function TaskChatSystemNotice({
   item,
+  actions,
   onTryAgainNoLiveExecutionPath,
   tryAgainNoLiveExecutionPathPending = false,
 }: {
   item: TaskChatMessageItem;
+  actions?: ReactNode;
   onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
   tryAgainNoLiveExecutionPathPending?: boolean;
 }) {
@@ -63,13 +65,16 @@ export function TaskChatSystemNotice({
   const branchRecovery = useWorkspaceBaseRefRecovery(item.metadata);
   const workspaceRetry = useWorkspaceRetry(item.metadata);
   const streamlined = useStreamlinedTaskChatPresentation();
-  const [open, setOpen] = useState(Boolean(item.presentation?.detailsDefaultOpen));
+  const persistent = isUnrecoveredFilesNotice(item);
+  const [detailsOpen, setOpen] = useState(Boolean(item.presentation?.detailsDefaultOpen));
+  const open = persistent || detailsOpen;
   const detailsId = useId();
   const body = useProviderLimitMessage(item.text);
-  const { title, tone, detail } = humanizeSystemNotice({
+  const { title: humanizedTitle, tone, detail } = humanizeSystemNotice({
     body,
     presentation: item.presentation,
   });
+  const title = persistent ? "Some files were not recovered" : humanizedTitle;
   const sections = mapCommentMetadataToSystemNoticeSections(item.metadata, {
     runAgentId: item.runAgentId,
   });
@@ -77,7 +82,7 @@ export function TaskChatSystemNotice({
     item.presentation?.kind === "system_notice" &&
     item.presentation.title?.trim().toLowerCase().startsWith("workspace ready") === true &&
     sections.some((section) => section.title?.trim().toLowerCase() === "workspace");
-  const showBody = !isStructuredWorkspaceReadyNotice;
+  const showBody = persistent || !isStructuredWorkspaceReadyNotice;
   const ToneIcon = TONE_ICON[tone];
   const relative = item.createdAtIso ? timeAgo(item.createdAtIso) : undefined;
   const showTryAgain =
@@ -105,7 +110,7 @@ export function TaskChatSystemNotice({
       role={streamlined ? "group" : undefined}
       aria-label={streamlined ? `System update: ${title}` : undefined}
     >
-      <div className="flex max-w-(--pct-85) items-center gap-1.5">
+      {!persistent ? <div className="flex max-w-(--pct-85) items-center gap-1.5">
         <button
           type="button"
           onClick={() => setOpen((v) => !v)}
@@ -126,6 +131,7 @@ export function TaskChatSystemNotice({
             aria-hidden
           />
         </button>
+        {actions}
         {showTryAgain && !open ? (
           <Button
             type="button"
@@ -138,7 +144,7 @@ export function TaskChatSystemNotice({
             {tryAgainNoLiveExecutionPathPending ? "Trying again..." : "Try again"}
           </Button>
         ) : null}
-      </div>
+      </div> : actions}
       {open ? (
         <div
           id={detailsId}
@@ -147,6 +153,10 @@ export function TaskChatSystemNotice({
         >
           {showBody ? (
             <div className="px-3 py-2.5 text-foreground/90">
+              {persistent ? <div className="mb-2 flex items-center gap-1.5 font-medium">
+                <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                <span>{title}</span>
+              </div> : null}
               <MarkdownBody softBreaks linkIssueReferences>
                 {body}
               </MarkdownBody>

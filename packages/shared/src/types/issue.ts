@@ -307,6 +307,7 @@ export interface AcceptedPlanDecompositionSummary extends AcceptedPlanDecomposit
 
 export interface IssueRelationIssueSummary {
   displayStatus?: IssueDisplayStatus;
+  unblockDescriptor?: IssueUnblockDescriptor | null;
   id: string;
   identifier: string | null;
   title: string;
@@ -904,7 +905,7 @@ export type IssueChanges = Record<string, IssueChangeReceiptEntry>;
 
 export type IssueSummary = Pick<
   Issue,
-  "id" | "companyId" | "title" | "identifier" | "status" | "displayStatus" | "updatedAt"
+  "id" | "companyId" | "title" | "identifier" | "status" | "displayStatus" | "unblockDescriptor" | "updatedAt"
 > & {
   externalConversationState: "active" | "waiting" | null;
   /** Present for blocked tasks so summary views resolve the same status glyph as detail views. */
@@ -1038,6 +1039,7 @@ export interface Issue {
   lastActivityAt?: Date | null;
   isUnreadForMe?: boolean;
   unreadMessageCount?: number;
+  latestMessagePreview?: string | null;
   isArchivedForMe?: boolean;
   archivedAt?: Date | null;
   archivedByActorType?: "user" | "agent" | null;
@@ -1052,6 +1054,7 @@ export type IssueInboxArchiveFilter = "include" | "archived";
 export type CompactIssue = Pick<
   Issue,
   | "listProjection"
+  | "unblockDescriptor"
   | "externalConversationState"
   | "id"
   | "companyId"
@@ -1281,6 +1284,17 @@ export interface IssueCommentMetadata {
   attachmentPreparation?: { attachmentId: string };
   /** Inbound channel attribution; never an authorization input. */
   sourceChannel?: ChatProvider;
+  /** Semantic classification, independent of the generic system-notice presentation. */
+  kind?: typeof import("../unrecovered-files-notice.js").UNRECOVERED_FILES_NOTICE_KIND;
+  /** On unrecovered-files notices, sourceRunId is the stopped run. */
+  successorRunId?: string | null;
+  /** Display evidence only; a new session alone never proves files were restored. */
+  workspaceContinuity?: {
+    mode: "fresh_isolated_workspace" | "resume_preserved_workspace" | "reuse_current_workspace"
+      | "resume_stopped_native_workspace" | "reuse_issue_workspace" | "new_workspace" | "unknown";
+    sourceRunId: string | null;
+    contentOrigin: "configured_source" | "empty" | "existing_workspace" | "unknown";
+  };
   sourceRunId?: string | null;
   sourceIdentityContextId?: string | null;
   authorizationReason?: string | null;
@@ -1363,6 +1377,17 @@ export interface ConversationTaskHandoff {
   identifier: string | null;
   title: string;
   status: IssueStatus;
+  /** Status evidence is optional for compatibility with older servers. */
+  displayStatus?: Issue["displayStatus"];
+  externalConversationState?: "active" | "waiting" | null;
+  blockerAttention?: IssueBlockerAttention;
+  /** Current servers always send this key, null when no descriptor is saved. */
+  unblockDescriptor?: Issue["unblockDescriptor"] | null;
+  interruption?: Issue["interruption"] | null;
+  blockedInboxAttention?: Issue["blockedInboxAttention"] | null;
+  assigneeAgentId?: string | null;
+  assigneeUserId?: string | null;
+  updatedAt?: string;
   createdAt: string;
   /** Durable creation provenance; null for older or human-created handoffs. */
   sourceRunId: string | null;
@@ -1816,6 +1841,8 @@ export interface AskUserQuestionsInteraction extends IssueThreadInteractionBase 
 
 export interface RequestConfirmationInteraction extends IssueThreadInteractionBase {
   kind: "request_confirmation";
+  /** Actor-scoped read projection; POST revalidates the same pending review under locks. */
+  canResumeReview?: boolean;
   payload: RequestConfirmationPayload;
   result?: RequestConfirmationResult | null;
 }

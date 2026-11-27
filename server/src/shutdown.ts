@@ -9,6 +9,13 @@ type ShutdownLogger = {
 
 export const PRE_DRAIN_SHUTDOWN_BUDGET_MS = 20_000;
 
+/** Smarty seam: the shared pre-drain budget by env, so the restart
+ * sweep can suspend every idle owner. Unset, invalid or below stock = stock's 20 s; at most 10 min. */
+export function preDrainShutdownBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+  const value = Number(env.PAPERCLIP_PRE_DRAIN_SHUTDOWN_BUDGET_MS);
+  return Number.isSafeInteger(value) && value > PRE_DRAIN_SHUTDOWN_BUDGET_MS ? Math.min(value, 600_000) : PRE_DRAIN_SHUTDOWN_BUDGET_MS;
+}
+
 export type ShutdownStepResult<T> =
   | { outcome: "completed"; value: T; durationMs: number }
   | { outcome: "timed_out"; durationMs: number }
@@ -70,7 +77,9 @@ export function createPreDrainShutdownBudget(input: {
   now?: () => number;
 }) {
   const now = input.now ?? Date.now;
-  const deadline = now() + (input.budgetMs ?? PRE_DRAIN_SHUTDOWN_BUDGET_MS);
+  const budgetMs = input.budgetMs ?? preDrainShutdownBudgetMs();
+  input.log.info({ signal: input.signal, budgetMs }, "pre-drain shutdown budget");
+  const deadline = now() + budgetMs;
   return {
     run<T>(step: string, run: (abort: AbortSignal) => Promise<T>) {
       return runBoundedShutdownStep({

@@ -658,13 +658,14 @@ export interface TaskChatTurnItem {
     tokensLabel?: string;
     /** Failed/interrupted turns get a ✗ affordance instead of ✓. */
     failed?: boolean;
+    personStopped?: boolean;
   };
 }
 
 export interface TaskChatTaskCreatedItem {
   id: string;
   kind: "task_created";
-  task: Pick<Issue, "id" | "identifier" | "title" | "status" | "displayStatus" | "externalConversationState" | "blockerAttention">;
+  task: Pick<Issue, "id" | "identifier" | "title" | "status" | "displayStatus" | "externalConversationState" | "blockerAttention" | "unblockDescriptor" | "blockedInboxAttention" | "interruption">;
   isSubtask: boolean;
   timestamp: string;
 }

@@ -153,7 +153,11 @@ it("uses the selected duplex transport across credential rotation without file p
   const commandsAfterStartup = b.execute.mock.calls.length;
   expect((await request(b)).status).toBe(403);
   const releaseA = b.activate(run("a"));
-  expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-a" } });
+  const operation = await promisify(execFile)(path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), ["repo", "view", "second-org/x", "--json", "name"], {
+    env: { ...process.env, ...b.env }, timeout: 15_000,
+  });
+  expect(operation.stdout).toBe("fixture-a");
+  expect(b.resolveCredentials).toHaveBeenCalledWith({ ...run("a"), repository: "second-org/x" });
   releaseA();
   expect((await request(b)).status).toBe(403);
   const releaseB = b.activate(run("b"));

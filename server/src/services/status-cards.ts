@@ -23,6 +23,7 @@ import type {
   WriteStatusCardSummary,
 } from "@paperclipai/shared";
 import { companySearchQuerySchema, ISSUE_PRIORITIES, ISSUE_STATUSES, STATUS_CARD_AGENT_MAX_CARDS } from "@paperclipai/shared";
+import { readLimitFromEnv } from "./env-limits.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { readBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
@@ -305,8 +306,9 @@ export function statusCardService(
         .from(statusCards)
         .where(and(eq(statusCards.companyId, companyId), eq(statusCards.createdByAgentId, agentId)))
         .then((rows) => rows[0]?.count ?? 0);
-      if (authoredCount >= STATUS_CARD_AGENT_MAX_CARDS) {
-        throw unprocessable(`Agents can author at most ${STATUS_CARD_AGENT_MAX_CARDS} status cards`);
+      const maxCards = readLimitFromEnv("PAPERCLIP_MAX_STATUS_CARDS_PER_AGENT", STATUS_CARD_AGENT_MAX_CARDS);
+      if (authoredCount >= maxCards) {
+        throw unprocessable(`Agents can author at most ${maxCards} status cards`);
       }
 
       return tx.insert(statusCards).values(values).returning().then((rows) => rows[0]!);

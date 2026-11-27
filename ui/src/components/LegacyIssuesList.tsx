@@ -1,6 +1,6 @@
 import { QueryErrorState } from "./QueryView";
 import { ISSUE_SORT_FIELDS, sortIssues, type IssueSort, type IssueSortField } from "../lib/issue-sort";
-import { saveTaskCollectionPreferences } from "../lib/task-collection-preferences";
+import { restoreTaskCollectionViewState, saveTaskCollectionPreferences } from "../lib/task-collection-preferences";
 import { useWarmTaskDetailCode } from "@/hooks/useWarmTaskDetailCode";
 import { topRenderedNavEntryRefs, usePreloadTaskChats } from "../hooks/usePreloadTaskChats";
 import { useShowAgentCreatedTasks } from "../hooks/useShowAgentCreatedTasks";
@@ -94,7 +94,8 @@ import { hasBlockingShortcutDialog, isKeyboardShortcutTextInputTarget } from "..
 import { buildSubIssueDefaultsForViewer } from "../lib/subIssueDefaults";
 import { statusBadge } from "../lib/status-colors";
 import { isSuccessfulRunHandoffRequired } from "../lib/successful-run-handoff";
-import { deriveOriginatingActor, ISSUE_STATUSES, ISSUE_DISPLAY_STATUSES, type Issue, type IssueDisplayStatus, type IssueStatus, type Project } from "@paperclipai/shared";
+import { deriveOriginatingActor, ISSUE_STATUSES, type Issue, type IssueDisplayStatus, type IssueStatus, type Project } from "@paperclipai/shared";
+import { taskProgressSegmentClasses } from "../lib/status-colors";
 import { Badge } from "@/components/ui/badge";
 import { taskStatusIconProps } from "@/lib/task-status-presentation";
 const ISSUE_SEARCH_DEBOUNCE_MS = 250;
@@ -132,26 +133,6 @@ function findIssuesScrollContainer(element: HTMLElement | null): HTMLElement | n
   return null;
 }
 const boardIssueStatuses = [...ISSUE_STATUSES, "monitoring"] as const;
-const issueStatusLabels: Record<IssueDisplayStatus, string> = {
-  backlog: "Backlog",
-  todo: "Todo",
-  in_progress: "In progress",
-  monitoring: "Monitoring",
-  in_review: "In review",
-  done: "Done",
-  blocked: "Blocked",
-  cancelled: "Cancelled",
-};
-const progressSegmentClasses: Record<IssueDisplayStatus, string> = {
-  backlog: "bg-muted-foreground/40",
-  todo: "bg-blue-500",
-  in_progress: "bg-yellow-500",
-  monitoring: "bg-(--status-task-monitoring)",
-  in_review: "bg-violet-500",
-  done: "bg-green-500",
-  blocked: "bg-red-500",
-  cancelled: "bg-neutral-400",
-};
 
 /* ── View state ── */
 
@@ -209,7 +190,7 @@ function getViewState(key: string): IssueViewState {
       return {
         ...defaultViewState,
         ...parsed,
-        ...normalizeIssueFilterState(parsed),
+        ...normalizeIssueFilterState(restoreTaskCollectionViewState(parsed)),
         workspaces: [],
         sortField: ISSUE_SORT_FIELDS.includes(parsed.sortField) ? parsed.sortField : defaultViewState.sortField,
         sortDir: parsed.sortDir === "asc" ? "asc" : "desc",
@@ -558,9 +539,7 @@ function SubIssueProgressSummaryStrip({
   const targetIssue = target?.issue ?? null;
   const targetPathId = targetIssue?.identifier ?? targetIssue?.id ?? "";
   const targetState = targetIssue ? withIssueDetailHeaderSeed(issueLinkState, targetIssue) : undefined;
-  const statusEntries = ISSUE_DISPLAY_STATUSES
-    .map((status) => ({ status, count: summary.countsByStatus[status] ?? 0 }))
-    .filter((entry) => entry.count > 0);
+  const statusEntries = summary.presentationSegments;
 
   // Refresh fast enough that the runtime ticks up while a sub-issue is still
   // running, but slow enough not to hammer the recursive CTE on idle trees.
@@ -618,12 +597,12 @@ function SubIssueProgressSummaryStrip({
             aria-valuemax={summary.totalCount}
             className="flex h-2 w-full overflow-hidden rounded-full bg-muted"
           >
-            {statusEntries.map(({ status, count }) => (
+            {statusEntries.map(({ glyphStatus, label, count }) => (
               <span
-                key={status}
-                className={cn("h-full", progressSegmentClasses[status])}
+                key={`${glyphStatus}:${label}`}
+                className={cn("h-full", taskProgressSegmentClasses[glyphStatus])}
                 style={{ width: `${(count / summary.totalCount) * 100}%` }}
-                title={`${issueStatusLabels[status]}: ${count}`}
+                title={`${label}: ${count}`}
                 aria-hidden="true"
               />
             ))}

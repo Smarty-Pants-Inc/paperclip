@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { LifecycleDriver, LifecycleStore, LifecycleFailure } from "./ports.js";
 import { isLifecycleWorkPending } from "../domain/policy.js";
-import { lifecycleFailureCode, lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "./failure.js";
+import { lifecycleFailureCode, lifecycleFailureMessage, lifecycleFailureReason, lifecycleVerificationNeedsRetry } from "./failure.js";
 
 /** Database leases protect each attempt across server processes. */
 export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
@@ -83,14 +83,16 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         if (changed && !isLifecycleWorkPending(changed.lifecycleState)) return;
       } catch (error) {
         // Claims can defer before runHost. Only a failed host test spends this budget.
+        const failureCode = lifecycleFailureCode(error);
         const verificationFailures = failureContext.stage === "host" && agent.lifecycleState === "verifying"
-          && lifecycleFailureCode(error) === "harness_test_failed"
+          && failureCode === "harness_test_failed"
           ? (agent.lifecycleOperation?.verificationFailures ?? 0) + 1 : undefined;
         failureContext = { ...failureContext, verificationFailures };
         const message = lifecycleFailureMessage(failureContext, error);
         const retryRequired = lifecycleVerificationNeedsRetry(failureContext, error);
-        if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined
-          ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(verificationFailures !== undefined ? { verificationFailures } : {}) })
+        const failureReason = lifecycleFailureReason(error);
+        if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined || failureReason
+          ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(retryRequired && failureCode ? { failureCode } : {}), ...(failureReason ? { failureReason } : {}), ...(verificationFailures !== undefined ? { verificationFailures } : {}) })
           : store.defer(agent, owner, message, new Date()))) continue;
         return;
       } finally {

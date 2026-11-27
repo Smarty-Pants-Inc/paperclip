@@ -80,7 +80,7 @@ fn invalid_tool_call_result(
 }
 
 fn serialize_provider_state(state: &CodexProviderState) -> Result<Vec<u8>, DurableRunnerError> {
-    let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
+    let bytes = serde_json::to_vec(state).map_err(|error| {
         DurableRunnerError::invalid(format!("failed to serialize Codex provider state: {error}"))
     })?;
     if bytes.len() as u64 > MAX_PROVIDER_STATE_BYTES {
@@ -497,6 +497,7 @@ fn local_process_definitely_gone(_id: u32, _group: bool) -> bool {
 fn facade_provider_name(provider: &str) -> &'static str {
     match provider {
         "opencode" => "OpenCode",
+        "pi_rpc" => "Pi",
         "cursor_cloud" => "Cursor Cloud",
         _ => "Codex",
     }
@@ -506,7 +507,10 @@ fn validate_proxy_run_result(
     state: &CodexProviderState,
     params: &Value,
 ) -> Result<(Value, String, String), DurableRunnerError> {
-    if !matches!(state.config.provider.as_str(), "opencode" | "cursor_cloud") {
+    if !matches!(
+        state.config.provider.as_str(),
+        "opencode" | "pi_rpc" | "cursor_cloud"
+    ) {
         return Err(DurableRunnerError::invalid(
             "paperclip/runResult is reserved for verified provider proxies",
         ));
@@ -947,6 +951,13 @@ fn terminal_events(
                 }),
             },
         ];
+    }
+    if state.config.provider == "pi_rpc"
+        && event_type == "turn.completed"
+        && state.config.conversation_mode.as_deref() == Some("conversation")
+        && state.active_provider_result_fingerprint.is_none()
+    {
+        return Vec::new(); // Core resolves the bound final reply as a conversation yield.
     }
     // Once the correlated semantic-tool result has been accepted, Paperclip's
     // bounded controller finalizer may interrupt the provider after the result
@@ -1722,7 +1733,7 @@ impl CodexProviderState {
                     !matches!(disposition, "done" | "blocked" | "needs_review" | "yielded")
                         || !matches!(
                             self.config.provider.as_str(),
-                            "codex" | "opencode" | "cursor_cloud"
+                            "codex" | "opencode" | "pi_rpc" | "cursor_cloud"
                         )
                 })
             || (matches!(
@@ -3599,10 +3610,18 @@ impl CodexCommandExecutor {
                 next_state.config.include_skill_instructions = config.include_skill_instructions;
                 upgraded_skill_config = true;
             }
-            if next_state.config.provider == "cursor_cloud"
-                && config.provider == "cursor_cloud"
+            if matches!(
+                next_state.config.provider.as_str(),
+                "cursor_cloud" | "pi_rpc"
+            ) && config.provider == next_state.config.provider
                 && self.provider.is_none()
-                && next_state.lifecycle == "prepared"
+                && (next_state.lifecycle == "prepared"
+                    || (config.provider == "pi_rpc"
+                        && self.awaiting_new_run_attach
+                        && matches!(
+                            next_state.lifecycle.as_str(),
+                            "session_open" | "provider_exited"
+                        )))
             {
                 next_state.config.instructions = config.instructions.clone();
             }
@@ -4347,7 +4366,7 @@ impl CodexCommandExecutor {
         // Record cause and pending identities before touching the provider.
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
-        self.ensure_provider()?.interrupt_turn().map_err(|error| {
+        self.ensure_provider()?.interrupt_turn(Some(reason)).map_err(|error| {
             DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
         })?;
         Ok(CommandExecution::result(json!({
@@ -4451,7 +4470,8 @@ impl CodexCommandExecutor {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| DurableRunnerError::invalid("turn.steer payload.text is required"))?;
-        self.ensure_provider()?.steer_turn(text).map_err(|error| {
+        let correlation_id = payload.get("correlationId").and_then(Value::as_str);
+        self.ensure_provider()?.steer_turn(text, correlation_id).map_err(|error| {
             DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
         })?;
         Ok(CommandExecution::result(json!({"status": "steered"})))
@@ -5874,7 +5894,7 @@ impl CodexCommandExecutor {
                                 "prompt": prompt,
                                 "input": question_set,
                                 "origin": {
-                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
+                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "pi_rpc" => "pi-rpc", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
                                     "provider": state.config.provider,
                                     "method": "item/tool/requestUserInput",
                                 },
@@ -7308,6 +7328,11 @@ done
         assert_eq!(terminal[0].event_type, "run.terminal");
         assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
         assert!(state.validate().is_ok());
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = "pi-rpc-v1".to_owned();
+        assert!(validate_proxy_run_result(&state, &params).is_ok());
+        assert!(state.validate().is_ok());
     }
 
     fn cursor_cloud_result_state() -> CodexProviderState {
@@ -8363,6 +8388,68 @@ done
         ] {
             assert_eq!(payload.pointer(path), Some(&Value::Null), "{path}");
         }
+    }
+
+    // Unit test agreed: the serializer must preserve nested durable results without pretty-print overhead.
+    #[test]
+    fn compact_provider_state_round_trips_nested_bridge_results() {
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".to_owned();
+        state.config.driver = "codex_app_server".to_owned();
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        state
+            .tool_bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        for index in 0..128 {
+            let call_id = format!("call-{index}");
+            state
+                .tool_bridge
+                .begin_call(call_id.clone(), "get_task_context".to_owned(), json!({}))
+                .unwrap();
+            state
+                .tool_bridge
+                .apply_result(ToolResult {
+                    call_id,
+                    operation_id: "get_task_context".to_owned(),
+                    result: json!({"task": {"id": index, "status": "completed",
+                        "details": {"summary": "Finished the assigned work.",
+                            "evidence": [{"path": "result.txt", "verified": true}]}}}),
+                    is_error: false,
+                })
+                .unwrap();
+        }
+        let pretty = serde_json::to_vec_pretty(&state).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-compact-provider-state-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let executor = CodexCommandExecutor::new(&directory);
+        executor.persist_state(&state).unwrap();
+        let bytes = fs::read(executor.state_path()).unwrap();
+        let mut restored = CodexCommandExecutor::new(&directory);
+        restored.load_state_without_provider().unwrap();
+        assert_eq!(restored.state.as_ref(), Some(&state));
+        fs::remove_dir_all(directory).unwrap();
+        println!(
+            "provider state with 128 completed nested bridge results: pretty={} compact={} reduction={:.2}%",
+            pretty.len(),
+            bytes.len(),
+            100.0 * (pretty.len() - bytes.len()) as f64 / pretty.len() as f64
+        );
+        assert!(bytes.len() < pretty.len());
     }
 
     #[test]

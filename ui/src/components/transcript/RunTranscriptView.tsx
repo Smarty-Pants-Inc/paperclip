@@ -554,6 +554,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
   const blocks: TranscriptBlock[] = [];
   const pendingToolBlocks = new Map<string, Extract<TranscriptBlock, { type: "tool" }>>();
   const pendingActivityBlocks = new Map<string, Extract<TranscriptBlock, { type: "activity" }>>();
+  const toolExecutionBlocks = new Map<string, Extract<TranscriptBlock, { type: "provider_activity" }>>();
 
   for (const entry of entries) {
     const previous = blocks[blocks.length - 1];
@@ -596,7 +597,24 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
     }
 
     if (entry.kind === "provider_activity") {
-      blocks.push({ type: "provider_activity", ts: entry.ts, family: entry.family, eventType: entry.eventType, status: entry.status, title: entry.title, summary: entry.summary, payload: entry.payload });
+      const executionId = entry.family === "tool_execution" && typeof entry.payload.executionId === "string"
+        ? entry.payload.executionId : undefined;
+      const existing = executionId ? toolExecutionBlocks.get(executionId) : undefined;
+      if (existing) {
+        // Lifecycle snapshots belong to one execution, not one card per event.
+        // Keep its opening position/key and never reopen it on a late progress frame.
+        if (existing.status !== "running" && entry.status === "running") continue;
+        existing.eventType = entry.eventType;
+        existing.status = entry.status;
+        if (entry.summary !== entry.eventType) existing.summary = entry.summary;
+        existing.payload = { ...existing.payload, ...entry.payload };
+      } else {
+        const block: Extract<TranscriptBlock, { type: "provider_activity" }> = {
+          type: "provider_activity", ts: entry.ts, family: entry.family, eventType: entry.eventType, status: entry.status, title: entry.title, summary: entry.summary, payload: entry.payload,
+        };
+        blocks.push(block);
+        if (executionId) toolExecutionBlocks.set(executionId, block);
+      }
       continue;
     }
 
@@ -858,6 +876,9 @@ function transcriptBlockIdentity(block: TranscriptBlock): string {
     case "event":
       return `event:${block.label}:${block.ts}`;
     case "provider_activity":
+      if (block.family === "tool_execution" && typeof block.payload.executionId === "string" && block.payload.executionId) {
+        return `provider_activity:tool_execution:${block.payload.executionId}`;
+      }
       return `provider_activity:${block.eventType}:${block.ts}`;
   }
 }

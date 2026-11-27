@@ -121,6 +121,7 @@ export const inspectStagedRunAttachmentHeader = runner.inspectStagedRunAttachmen
 export type StagedRunAttachment = import("@paperclipai/paperclip-runner").StagedRunAttachment;
 export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
 export const readLinuxProcessStartedAt = runner.readLinuxProcessStartedAt;
+export const NativeRunnerClosedBeforeAttachmentError = runner.NativeRunnerClosedBeforeAttachmentError;
 export const NativeSessionCloseUnrecoverableError =
   runner.NativeSessionCloseUnrecoverableError;
 export const NativeSessionCleanupQuarantinedError =
@@ -142,6 +143,8 @@ export const HarnessRuntimeRequestResolutionError =
   runner.HarnessRuntimeRequestResolutionError;
 export const NATIVE_RUNTIME_ASSET_SCHEMA = runner.NATIVE_RUNTIME_ASSET_SCHEMA;
 export const PAPERCLIP_EXECUTION_PROMPT = runner.PAPERCLIP_EXECUTION_PROMPT;
+export const PAPERCLIP_EXECUTION_FINISH_INSTRUCTION = runner.PAPERCLIP_EXECUTION_FINISH_INSTRUCTION;
+export const PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION = runner.PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION;
 export const PAPERCLIP_EXECUTION_PROMPT_REVISION =
   runner.PAPERCLIP_EXECUTION_PROMPT_REVISION;
 export const acpxRuntimeSessionDirectoryName =

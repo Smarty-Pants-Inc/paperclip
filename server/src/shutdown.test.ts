@@ -8,6 +8,7 @@ import {
   finalizeServerShutdown,
   finishServiceShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
+  preDrainShutdownBudgetMs,
   runBoundedShutdownStep,
 } from "./shutdown.js";
 
@@ -454,6 +455,14 @@ describe("runBoundedShutdownStep", () => {
 });
 
 describe("createPreDrainShutdownBudget", () => {
+  it("reads its budget from PAPERCLIP_PRE_DRAIN_SHUTDOWN_BUDGET_MS, else stock's 20 s", () => {
+    expect(preDrainShutdownBudgetMs({})).toBe(20_000);
+    expect(preDrainShutdownBudgetMs({ PAPERCLIP_PRE_DRAIN_SHUTDOWN_BUDGET_MS: "180000" })).toBe(180_000);
+    expect(preDrainShutdownBudgetMs({ PAPERCLIP_PRE_DRAIN_SHUTDOWN_BUDGET_MS: "700000" })).toBe(600_000);
+    for (const bad of ["", "0", "180", "0x10", "1.5", "abc"]) {
+      expect(preDrainShutdownBudgetMs({ PAPERCLIP_PRE_DRAIN_SHUTDOWN_BUDGET_MS: bad })).toBe(20_000);
+    }
+  });
   it("gives each step only the time that is left in the shared budget", async () => {
     vi.useFakeTimers();
     try {

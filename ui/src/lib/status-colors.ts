@@ -260,11 +260,29 @@ export const taskStatusVar: Record<string, string> = {
   in_review: "--status-task-in_review",
   done: "--status-task-done",
   blocked: "--status-task-blocked",
+  blocked_lifecycle: "--muted-foreground",
   cancelled: "--status-task-cancelled",
-  // Covered-blocked: the blocked shape on the in-progress blue (mirrors the icon var).
+  paused: "--muted-foreground",
+  // Waiting: the blocked shape on the in-progress blue (mirrors the icon var).
   in_queue: "--status-task-in_progress",
 };
 export const taskStatusVarDefault = "--status-task-backlog";
+
+/** Progress strips retain their established non-blocked palette. Only the
+ * blocked buckets change: known waits blue, human/unknown aggregates neutral. */
+export const taskProgressSegmentClasses: Record<string, string> = {
+  backlog: "bg-muted-foreground/40",
+  todo: "bg-blue-500",
+  in_progress: "bg-yellow-500",
+  monitoring: "bg-(--status-task-monitoring)",
+  in_review: "bg-violet-500",
+  done: "bg-green-500",
+  cancelled: "bg-neutral-400",
+  in_queue: "bg-blue-500",
+  blocked_lifecycle: "bg-muted-foreground/40",
+  idle: "bg-muted-foreground/40",
+  paused: "bg-muted-foreground/40",
+};
 
 /**
  * Task/issue status → AA-tuned ICON-hue CSS var (PAP-238). Drives the standalone
@@ -282,7 +300,9 @@ export const taskStatusIconVar: Record<string, string> = {
   in_review: "--status-task-icon-in_review",
   done: "--status-task-icon-done",
   blocked: "--status-task-icon-blocked",
+  blocked_lifecycle: "--muted-foreground",
   cancelled: "--status-task-icon-cancelled",
+  paused: "--muted-foreground",
   in_queue: "--status-task-icon-in_queue",
 };
 export const taskStatusIconVarDefault = "--status-task-icon-backlog";

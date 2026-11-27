@@ -12,12 +12,12 @@ export function useShowAgentCreatedTasks(companyId: string | null, collectionKey
       const valid = envelope?.version === TASK_COLLECTION_PREFERENCES_VERSION
         && envelope.companyId === (companyId ?? "__unscoped__") && envelope.collectionKey === collectionKey;
       const view = valid ? envelope.viewState : legacy ? JSON.parse(legacy) : null;
-      return view?.showAgentCreatedTasks === true;
+      return view?.hideAgentCreatedTasks !== true;
     } catch {
-      return false;
+      return true;
     }
   }, [companyId, collectionKey]);
-  return useSyncExternalStore(subscribe, getSnapshot, () => false);
+  return useSyncExternalStore(subscribe, getSnapshot, () => true);
 }
 
 function subscribe(onChange: () => void) {

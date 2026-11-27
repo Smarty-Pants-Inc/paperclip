@@ -25,6 +25,19 @@ function createUtilitySql(url: string) {
 
 type RegisteredPostgresClient = ReturnType<typeof postgres>;
 
+/** A code attested by the database client, never a runner/socket code alone.
+ * postgres.js gives server SQLSTATEs their own class; its connection errors
+ * instead carry a distinct driver code, matching errno and connection address.
+ * Return only the code, never diagnostics or connection details. */
+export function databaseClientErrorCode(error: unknown): string | null {
+  if (error instanceof postgres.PostgresError) return error.code;
+  if (!(error instanceof Error)) return null;
+  const { code, errno, address } = error as Error & { code?: unknown; errno?: unknown; address?: unknown };
+  if (typeof code !== "string" || errno !== code ||
+    !["CONNECTION_CLOSED", "CONNECTION_ENDED", "CONNECTION_DESTROYED", "CONNECT_TIMEOUT"].includes(code)) return null;
+  return typeof address === "string" || Array.isArray(address) && address.length > 0 && address.every(host => typeof host === "string") ? code : null;
+}
+
 /**
  * Derives a registry key from a connection URL's host and port only. We must
  * not retain or log the full URL, because it carries credentials.

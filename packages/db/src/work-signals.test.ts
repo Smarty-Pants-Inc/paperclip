@@ -127,7 +127,10 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { unsubscribe(); }
   });
 
-  it.each(["commit", "abort"])("does not clear a late %s until PostgreSQL reports a settled transaction", async outcome => {
+  it.each([
+    { outcome: "commit", broad: false }, { outcome: "abort", broad: false },
+    { outcome: "commit", broad: true }, { outcome: "abort", broad: true },
+  ])("does not clear a late $outcome (broad=$broad) until PostgreSQL reports a settled transaction", async ({ outcome, broad }) => {
     // Inject a lost response at the client boundary while a REAL transaction
     // remains open on PostgreSQL. The status probe and row visibility are real.
     const raw = drizzle(db.$client);
@@ -150,14 +153,18 @@ const support = await getEmbeddedPostgresTestSupport();
       return written.then(() => { throw new Error("lost transaction response"); });
     }) as typeof raw.transaction;
     const owner = installDatabaseWorkSignals(raw);
-    const topic = `late-${outcome}`;
-    const settled: string[][] = [];
+    const topic = `late-${outcome}-${broad}`;
+    const settled: Array<string[] | null> = [];
     const unsubscribe = subscribeDatabaseWork(owner, topic, (event, hints) => {
-      if (event === "settled") settled.push([...(hints ?? [])]);
+      if (event === "settled") settled.push(hints ? [...hints] : null);
     });
     try {
       await expect(owner.transaction(async tx => {
         await signalDatabaseWork(tx, topic, "connection-late");
+        if (broad) {
+          await signalDatabaseWork(tx, topic);
+          await signalDatabaseWork(tx, topic, "later-scoped");
+        }
         await tx.execute(sql`insert into work_signal_test values (${topic})`);
       })).rejects.toThrow("lost transaction response");
       await reconcileDatabaseWork(owner, topic);
@@ -166,9 +173,10 @@ const support = await getEmbeddedPostgresTestSupport();
       settled.length = 0;
       release(); await serverDone.catch(() => {});
       await reconcileDatabaseWork(owner, topic);
-      expect(settled).toEqual([["connection-late"]]);
+      expect(settled).toEqual(broad ? [null] : [["connection-late"]]);
       expect(databaseWorkPending(owner, topic)).toBe(false);
       expect(await db.execute(sql`select * from work_signal_test where id = ${topic}`)).toHaveLength(outcome === "commit" ? 1 : 0);
+      console.log("V14_UNCERTAIN_SIGNAL", JSON.stringify({ topic, outcome, broad, settled }));
     } finally { release(); await serverDone?.catch(() => {}); unsubscribe(); }
   });
 
@@ -484,19 +492,28 @@ describe("database work scope identity", () => {
     } finally { await other.close(); }
   });
 
-  it("scopes an unhinted signal alongside a hinted one to the hinted set, locally and in another process", async () => {
+  it.each(["first", "last", "nested"])("v14 broad invalidation dominates scoped hints (%s), locally, remotely and on reconnect", async order => {
     const other = receiving(["alongside"]);
     const local: Array<string[] | null> = [];
     const stop = subscribeDatabaseWork(db, "alongside", (event, hints) => { if (event === "settled") local.push(hints ? [...hints] : null); });
     try {
       const result = await run(root => root.transaction(async tx => {
-        await signalDatabaseWork(tx, "alongside");
+        if (order === "first") await signalDatabaseWork(tx, "alongside");
         await signalDatabaseWork(tx, "alongside", "company-1");
+        if (order === "last") await signalDatabaseWork(tx, "alongside");
+        if (order === "nested") await tx.transaction(async nested => {
+          await signalDatabaseWork(nested, "alongside");
+          await signalDatabaseWork(nested, "alongside", "company-2");
+        });
       }));
-      expect(local).toEqual([["company-1"]]);
-      expect(result.payloads.map(payload => JSON.parse(payload).hints)).toEqual([["company-1"]]);
+      expect(local).toEqual([null]);
+      expect(result.payloads.map(payload => JSON.parse(payload).hints)).toEqual([undefined]);
       other.deliver(result.payloads);
-      expect(other.wakes).toEqual([["alongside", ["company-1"]]]);
+      expect(other.wakes).toEqual([["alongside", null]]);
+      other.wakes.length = 0;
+      reconcileDatabaseWorkNotifications(other.receiver);
+      expect(other.wakes).toEqual([["alongside", null]]);
+      console.log("V14_BROAD_SIGNAL", JSON.stringify({ order, local, remote: result.payloads.map(payload => JSON.parse(payload)), reconnect: other.wakes }));
     } finally { stop(); await other.close(); }
   });
 

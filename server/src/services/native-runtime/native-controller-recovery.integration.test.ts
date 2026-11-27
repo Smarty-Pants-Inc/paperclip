@@ -3,7 +3,7 @@ import { nativeProviderRecoveryEvidence, nativeSessionFailureSourceCode, restore
   verifyRemoteRunnerReattachment } from "./native-session-executor.js";
 import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { RunnerIngressConnectionError } from "../../realtime/runner-prp-outbound.js";
-import { nativeToolContractFingerprintForTarget, rebindNativeSessionCheckpoint } from "./native-session-resume.js";
+import { findNativeSessionResumeRun, nativeToolContractFingerprintForTarget, rebindNativeSessionCheckpoint } from "./native-session-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agentTaskSessions, agents, companies, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
-import { DurablePrpControlPlane, parseNativeExecutionInput, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+import { DurablePrpControlPlane, parseNativeExecutionInput, type NativeExecutionInput, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
@@ -56,7 +56,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     else process.env.PAPERCLIP_HOME = previousHome;
   });
 
-  async function seed() {
+  async function seed(cursor?: string) {
     const issueId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue retained execution", assigneeAgentId: agentId, status: "in_progress" });
     const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId }).returning();
@@ -72,7 +72,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     await core.flushCheckpoint();
     await core.stop();
     const snapshot: PersistedNativeSession = { backendKind: "mock", sessionId: native.normalizedSessionId,
-      identity: { companyId, agentId, issueId, runId, sessionId: native.normalizedSessionId } };
+      ...(cursor ? { cursor } : {}), identity: { companyId, agentId, issueId, runId, sessionId: native.normalizedSessionId } };
     const [prepared] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const [result] = await db.insert(nativeRunResults).values({ companyId, issueId, runId,
       completionContractId: prepared.completionContractId!, serverFingerprint: "fixture", schemaStatus: "accepted",
@@ -84,6 +84,53 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     return { scope, native, profile, snapshot, owner,
       supervisor: { schema: "paperclip.native-session-supervisor.v1", ...compatibility, snapshot } };
   }
+
+  // Gate 7: idle saved session, message + Stop before Pi starts, then two messages.
+  it.each(["pre-dispatch", "staged", "handed-off-once", "handed-off-twice"] as const)("selects the committed idle session past %s Stop and failed admissions for two messages", async stage => {
+    const handedOff = stage.startsWith("handed-off");
+    const fixture = await seed(handedOff ? "14" : stage === "staged" ? "7" : undefined);
+    if (handedOff) {
+      Object.assign(fixture.snapshot, { backendKind: "runner", driverKind: "pi_rpc", providerSessionId: "retained-provider-session",
+        activeTurnId: null, pendingRuntimeRequests: [] });
+      await db.update(heartbeatRuns).set({ runnerProfileJson: fixture.profile }).where(eq(heartbeatRuns.id, fixture.scope.runId));
+    }
+    expect(await importNativeControllerRecovery(db, { ...fixture.scope,
+      expectedConfigDigest: compatibility.configDigest, supervisor: fixture.supervisor })).toEqual({ kind: "imported" });
+    const baseTime = Date.now();
+    const statuses = handedOff ? Array<string>(stage === "handed-off-once" ? 1 : 2).fill("failed") : ["cancelled", "failed", "failed"];
+    for (const [index, status] of statuses.entries()) {
+      const id = randomUUID();
+      await db.insert(heartbeatRuns).values({ id, companyId, agentId, nativeIssueId: fixture.scope.issueId,
+        nativeSessionId: fixture.scope.normalizedSessionId, runtimeMode: "native", status,
+        createdAt: new Date(baseTime + index * 10), finishedAt: new Date(baseTime + index * 10 + 1),
+        runnerProfileJson: { ...fixture.profile, nativeControllerRecovery: undefined,
+          nativeExecutionInput: { staged: true }, sessionCheckpoint: { ...fixture.snapshot,
+          cursor: stage === "staged" ? fixture.snapshot.cursor : null,
+          identity: { ...fixture.snapshot.identity, runId: id } } },
+        resultJson: status === "cancelled" ? { nativeCancellation: { beforeStart: true } }
+          : handedOff ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } : {},
+        ...(handedOff ? { usageJson: { budgetDispatch: { handedOffAt: new Date().toISOString() } },
+          errorCode: "runner_state_identity_mismatch", error: "runner_state_identity_mismatch: journal_unsettled" } : {}),
+      });
+      if (handedOff) await db.insert(nativeRunFinalizations).values({ companyId, issueId: fixture.scope.issueId,
+        runId: id, phase: "terminal_failure" });
+    }
+    for (let message = 0; message < 2; message++) {
+      const currentRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: currentRunId, companyId, agentId, nativeIssueId: fixture.scope.issueId,
+        nativeSessionId: fixture.scope.normalizedSessionId, runtimeMode: "native", status: "running",
+        createdAt: new Date(baseTime + 100 + message) });
+      const barrier = await findNativeSessionResumeRun(db, { ...fixture.scope, currentRunId,
+        beforeCreatedAt: new Date(baseTime + 100 + message) });
+      expect(barrier?.id).toBe(fixture.scope.runId);
+      const recovered = await resolveNativeControllerRecovery(db, { ...fixture.scope, currentRunId });
+      expect(recovered.kind).toBe("recoverable");
+      if (recovered.kind !== "recoverable") throw new Error(JSON.stringify(recovered));
+      expect(recovered.metadata.checkpoint?.runId).toBe(fixture.scope.runId);
+      expect(recovered.snapshot.sessionId).toBe(fixture.snapshot.sessionId);
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, currentRunId));
+    }
+  });
 
   it("imports a retained source once, rejects stale input, and resolves it without any local projection", async () => {
     const fixture = await seed();
@@ -576,21 +623,21 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     expect(await claimNativeSessionResumptions({ db, runnerInstanceId: "duplicate", runIds: [runId], now: deadline })).toEqual([]);
   });
 
-  async function seedWarmFollowUpOnOldServer() {
+  async function seedWarmFollowUpOnOldServer(provider: NativeExecutionInput["provider"] = { kind: "codex", model: null }) {
     const fixture = await seed(), runId = randomUUID(), environmentId = randomUUID();
     const previous = parseNativeExecutionInput({
-      schema: "paperclip.native-execution-input.v1", provider: { kind: "codex", model: null },
+      schema: "paperclip.native-execution-input.v1", provider,
       binding: { companyId, agentId, issueId: fixture.scope.issueId, runId: fixture.scope.runId, executionWorkspaceId: randomUUID() },
       task: { identifier: "NCD-9", title: "Answer the follow-up", description: null, prompt: "Continue.", workMode: "standard" },
       workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
-      session: { normalizedSessionId: fixture.scope.normalizedSessionId, driverKind: "codex_app_server",
+      session: { normalizedSessionId: fixture.scope.normalizedSessionId, driverKind: provider.kind === "pi_rpc" ? "pi_rpc" : "codex_app_server",
         protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 600_000 } },
       completionContract: { id: randomUUID(), sha256: "fixture", schemaVersion: "paperclip.completion-contract.v1",
         contract: { revision: "1", objective: "Continue.", criteria: [{ id: "objective", requirement: "Save the result." }] } },
       credentialBindings: [], interactionResponses: [],
     });
     const current = { ...previous, binding: { ...previous.binding, runId } };
-    const checkpoint: PersistedNativeSession = { ...fixture.snapshot, driverKind: "codex_app_server",
+    const checkpoint: PersistedNativeSession = { ...fixture.snapshot, driverKind: previous.session.driverKind,
       providerSessionId: "warm-provider-session", activeTurnId: null, pendingRuntimeRequests: [] };
     await db.update(heartbeatRuns).set({ finishedAt: new Date(), runnerProfileJson: { ...fixture.profile, nativeExecutionInput: previous,
       sessionCheckpoint: checkpoint, nativeControllerRecovery: createNativeControllerRecovery(checkpoint, compatibility,
@@ -608,18 +655,88 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     const identity = { runId: fixture.scope.runId, normalizedSessionId: fixture.scope.normalizedSessionId,
       runnerInstanceId: fixture.native.runnerInstanceId, environmentLeaseId: fixture.native.environmentLeaseId,
       turnId: fixture.native.turnId, itemId: fixture.native.itemId };
-    const inspect = () => inspectRemoteWarmSessionRecovery({ db, execution: current, identity,
+    const inspect = (overrides: Partial<Parameters<typeof inspectRemoteWarmSessionRecovery>[0]> = {}) => inspectRemoteWarmSessionRecovery({ db, execution: current, identity,
       target: { kind: "remote", transport: "sandbox", environmentId, leaseId: randomUUID(), providerKey: "daytona",
         remoteCwd: "/workspace", sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "warm-sandbox" } } as never,
       readControlState: () => ({ identity, commands: [{ type: "turn.start", status: "completed" }],
         committedEvents: [{ eventType: "run.terminal", envelope: identity }] }),
       matchesExecution: saved => saved.binding.runId === fixture.scope.runId,
-      loadCheckpoint: () => checkpoint, canReuseProcess: () => true,
+      loadCheckpoint: () => checkpoint, canReuseProcess: () => true, ...overrides,
     });
     const recordOwner = (owner: Partial<typeof nativeRunFinalizations.$inferInsert>) => db.update(nativeRunFinalizations)
       .set(owner).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
-    return { fixture, runId, current, identity, inspect, recordOwner };
+    return { fixture, runId, current, identity, checkpoint, inspect, recordOwner };
   }
+
+  it.each([
+    { kind: "pi_rpc", model: "example/model", conversationMode: true },
+    { kind: "pi_rpc", model: "example/model" },
+    { kind: "codex", model: null },
+  ] as const)("requires a finalized Pi conversation to adopt a completed turn without a Runner terminal: %j", async provider => {
+    const { fixture, identity, checkpoint, inspect, recordOwner } = await seedWarmFollowUpOnOldServer(provider);
+    await recordOwner({ controllerPid: 2147483647, controllerHostHash: currentProcessSpaceHash(),
+      controllerProcessStartedAt: new Date(Date.now() - 600_000) });
+    const event = (eventType: string) => ({ eventType, envelope: { ...identity, payload: {
+      schema: "paperclip.prp.event.v1", eventType, runId: identity.runId, normalizedSessionId: identity.normalizedSessionId,
+      sourceInstanceId: identity.runnerInstanceId, sourceKind: "runner", payload: {},
+    } } });
+    const completed = event("turn.completed");
+    const control = { identity, commands: [{ type: "turn.start", status: "completed" }], committedEvents: [completed] };
+    const readControlState = () => control;
+    const authorized = provider.kind === "pi_rpc" && "conversationMode" in provider;
+    await expect(inspect()).resolves.not.toBeNull();
+    if (!authorized) {
+      await expect(inspect({ readControlState })).rejects.toThrow("warm_recovery_refused=journal_unsettled");
+      return;
+    }
+    const recovered = await inspect({ readControlState });
+    expect(recovered?.identity).toEqual(identity);
+    expect(recovered?.checkpoint).toBe(checkpoint);
+    expect(recovered?.reuseProcess).toBe(true);
+    for (const unsettled of [
+      { ...control, commands: [{ type: "turn.start", status: "pending" }] },
+      { ...control, committedEvents: [completed, event("turn.started")] },
+      { ...control, identity: { ...identity, runnerInstanceId: "other" } },
+      { ...control, committedEvents: [{ ...completed, envelope: { ...completed.envelope, turnId: "other" } }] },
+    ]) await expect(inspect({ readControlState: () => unsettled })).rejects.toThrow("warm_recovery_refused=journal_unsettled");
+    for (const unsettled of [
+      { ...checkpoint, activeTurnId: identity.turnId },
+      { ...checkpoint, pendingRuntimeRequests: [{ requestId: "pending", requestKind: "user_input" as const, method: "input",
+        turnId: identity.turnId, itemId: identity.itemId, status: "pending" as const, prompt: "Continue?", details: {} }] },
+    ]) await expect(inspect({ readControlState, loadCheckpoint: () => unsettled })).rejects.toThrow("warm_recovery_refused=checkpoint_unsettled");
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, fixture.scope.runId));
+    await expect(inspect({ readControlState })).rejects.toThrow("warm_recovery_refused=owner_unsettled");
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, fixture.scope.runId));
+    await recordOwner({ resultId: null });
+    await expect(inspect({ readControlState })).rejects.toThrow("warm_recovery_refused=owner_unsettled");
+  });
+
+  it.each([
+    { conversationMode: true, completed: true, settled: true },
+    { conversationMode: true, completed: false, settled: false },
+    { conversationMode: false, completed: true, settled: false },
+  ])("settles a held turn after an earlier Runner terminal only for a completed Pi conversation: %j", async row => {
+    const { identity, checkpoint, inspect, recordOwner } = await seedWarmFollowUpOnOldServer({
+      kind: "pi_rpc", model: "example/model", ...(row.conversationMode ? { conversationMode: true } : {}),
+    });
+    await recordOwner({ controllerPid: 2147483647, controllerHostHash: currentProcessSpaceHash(),
+      controllerProcessStartedAt: new Date(Date.now() - 600_000) });
+    const event = (eventType: string) => ({ eventType, envelope: { ...identity, payload: {
+      schema: "paperclip.prp.event.v1", eventType, runId: identity.runId, normalizedSessionId: identity.normalizedSessionId,
+      sourceInstanceId: identity.runnerInstanceId, sourceKind: "runner", payload: {},
+    } } });
+    const committedEvents = [event("run.terminal"), event("turn.started"),
+      ...(row.completed ? [event("turn.completed")] : [])];
+    const readControlState = () => ({ identity, commands: [{ type: "turn.start", status: "completed" }], committedEvents });
+    if (!row.settled) {
+      await expect(inspect({ readControlState })).rejects.toThrow("warm_recovery_refused=journal_unsettled");
+      return;
+    }
+    const recovered = await inspect({ readControlState });
+    expect(recovered?.identity).toEqual(identity);
+    expect(recovered?.checkpoint).toBe(checkpoint);
+    expect(recovered?.reuseProcess).toBe(true);
+  });
 
   it("waits while the outgoing server that ran the finished turn still holds its warm session, then takes it over once that server exits", async () => {
     const oldServer = spawn(process.execPath, ["-e", "setInterval(() => {}, 60_000)"], { stdio: "ignore" });

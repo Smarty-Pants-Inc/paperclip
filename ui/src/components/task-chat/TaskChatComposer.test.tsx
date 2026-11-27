@@ -71,11 +71,13 @@ vi.mock("@mdxeditor/editor", async () => {
       onChange,
       readOnly,
       contentEditableClassName,
+      placeholder,
     }: {
       markdown: string;
       onChange?: (value: string) => void;
       readOnly?: boolean;
       contentEditableClassName?: string;
+      placeholder?: string;
     },
     forwardedRef: React.ForwardedRef<MockHandle | null>,
   ) {
@@ -119,6 +121,7 @@ vi.mock("@mdxeditor/editor", async () => {
         ref={editableRef}
         data-testid="mdx-editor"
         data-content-class-name={contentEditableClassName}
+        data-placeholder={placeholder}
         contentEditable={!readOnly}
         suppressContentEditableWarning
         onInput={(e) => {
@@ -310,6 +313,123 @@ function autocompleteOption(matchText: string) {
 function renderComposer(props: ComponentProps<typeof TaskChatComposer>) {
   render(<TaskChatComposer {...props} />);
 }
+
+describe("phone composer row", () => {
+  beforeEach(() => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+    vi.spyOn(agentsApi, "adapterModels").mockResolvedValue([{ id: "gpt-6-astra", label: "GPT-6 Astra" }]);
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  function paint(props: Partial<ComponentProps<typeof TaskChatComposer>> = {}) {
+    const agent = { id: "phone-agent", name: "Mira", adapterType: "codex_local", adapterConfig: { model: "gpt-6-astra" } } as unknown as Agent;
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(queryKeys.instance.experimentalSettings, { enableLegacyComposerSubmit: false });
+    render(<QueryClientProvider client={client}><TaskChatComposer onAdd={vi.fn()} onWorkModeChange={vi.fn()} workMode="standard" mobile
+      companyId="phone-company" enableReassign currentAssigneeValue="agent:phone-agent"
+      modelAgents={new Map([[agent.id, agent]])}
+      reassignOptions={[{ id: "agent:phone-agent", label: "Mira" }]} {...props} /></QueryClientProvider>);
+  }
+
+  function row() { return container.querySelector('[data-testid="task-chat-composer-row"]')!; }
+
+  it("puts add, field, picker and send in DOM order in one phone row", () => {
+    paint();
+    expect(row()).not.toBeNull();
+    expect(row().closest("[data-composer-layout]")?.getAttribute("data-composer-layout")).toBe("phone-row");
+    const controls = ["add", "input", "selection", "send"].map(name =>
+      row().querySelector(`[data-testid="task-chat-composer-${name}"]`)!);
+    controls.forEach(control => expect(control).not.toBeNull());
+    controls.slice(1).forEach((control, index) =>
+      expect(controls[index].compareDocumentPosition(control) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy());
+    expect(editable().dataset.placeholder).toBe("Message…");
+    expect(container.querySelectorAll('[data-testid="task-chat-composer-input"]')).toHaveLength(1);
+  });
+
+  it("moves forward Tab from the phone field to the picker without changing the draft", async () => {
+    paint();
+    await flushAsync();
+    typeText("Keep this text");
+    editable().focus();
+    pressKey("Tab");
+    expect(document.activeElement).toBe(row().querySelector('[data-testid="task-chat-composer-selection"] button'));
+    expect(editable().textContent).toBe("Keep this text");
+  });
+
+  it("leaves Tab to autocomplete and keeps desktop editor bindings", async () => {
+    paint();
+    await flushAsync();
+    const menu = document.createElement("div");
+    menu.dataset.testid = "mention-autocomplete-menu";
+    document.body.append(menu);
+    try {
+      editable().focus();
+      const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+      act(() => editable().dispatchEvent(tab));
+      expect(tab.defaultPrevented).toBe(false);
+      expect(document.activeElement).toBe(editable());
+    } finally { menu.remove(); }
+    paint({ mobile: false });
+    editable().focus();
+    const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    act(() => editable().dispatchEvent(tab));
+    expect(tab.defaultPrevented).toBe(false);
+  });
+
+  it("replaces send with Stop in the same trailing slot and keeps stop errors", async () => {
+    const onStop = vi.fn().mockRejectedValue(new Error("Try stop again"));
+    paint({ onStop });
+    const stop = row().querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-stop"]')!;
+    expect(stop.parentElement?.lastElementChild).toBe(stop);
+    expect(sendButton()).toBeNull();
+    expect(stop.title).toBe("Stop response");
+    await act(async () => stop.click());
+    expect(onStop).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("Try stop again");
+  });
+
+  it("keeps uploaded files above the row, inside the card", async () => {
+    paint({ onAttachImage: vi.fn().mockResolvedValue({ id: "phone-file", contentPath: "/api/attachments/phone-file/content" }) });
+    pasteFiles([new File(["notes"], "notes.txt", { type: "text/plain" })]);
+    await flushAsync();
+    const attachment = container.querySelector('[data-testid="task-chat-composer-attachments"]')!;
+    expect(attachment.textContent).toContain("notes.txt");
+    expect(attachment.closest("[data-composer-layout]")).toBe(row().closest("[data-composer-layout]"));
+    expect(attachment.compareDocumentPosition(row()) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it.each(["planning", "ask"] as const)("keeps the %s mode chip beside add and the existing placeholder", (workMode) => {
+    paint({ workMode, onWorkModeChange: vi.fn() });
+    const add = row().querySelector('[data-testid="task-chat-composer-add"]')!;
+    const mode = row().querySelector('[data-testid="task-chat-composer-mode"]')!;
+    expect(add.parentElement).toBe(mode.parentElement);
+    expect(editable().dataset.placeholder).toBe(workMode === "planning" ? "Plan with Mira…" : "Ask Mira…");
+  });
+
+  it("keeps keyboard submit, mode shortcuts, and disabled titles in the phone row", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    paint({ onAdd, onWorkModeChange: vi.fn(), companyId: undefined, enableReassign: false });
+    typeText("Send from phone");
+    pressKey("Tab", { shiftKey: true });
+    expect(row().querySelector('[data-testid="task-chat-composer-mode"]')?.textContent).toContain("Plan");
+    pressKey("Enter");
+    await flushAsync();
+    expect(onAdd.mock.calls[0]?.[0], container.textContent ?? "").toBe("Send from phone");
+    expect(sendButton().disabled).toBe(true);
+    expect(sendButton().title).toBe("Send (Enter)");
+  });
+
+  it.each(["desktop", "creation", "queuedEdit"] as const)("leaves %s on the existing stacked layout", (variant) => {
+    paint(variant === "desktop" ? { mobile: false } : variant === "queuedEdit"
+      ? { queuedEdit: { commentId: "queued-phone", body: "Queued draft" } }
+      : { creation: { value: "", onChange: vi.fn(), onSubmit: vi.fn(), submitLabel: "Create task", onSelectFiles: vi.fn(), runSettings: null, onRunSettingsChange: vi.fn() } });
+    expect(row()).toBeNull();
+    expect(container.querySelector('[data-composer-layout="phone-row"]')).toBeNull();
+    const input = container.querySelector('[data-testid="task-chat-composer-input"]')!;
+    expect(input.parentElement?.classList).toContain("paperclip-task-chat-composer");
+    expect(editable().dataset.contentClassName).toContain("min-h-(--sz-48px)");
+  });
+});
 
 describe("TaskChatComposer", () => {
   describe("plain HTTP without randomUUID", () => {
@@ -1128,7 +1248,7 @@ describe("TaskChatComposer", () => {
   it("uses a compact mobile editor that can grow with the message", () => {
     render(<TaskChatComposer onAdd={vi.fn()} workMode="standard" mobile />);
 
-    expect(editable().dataset.contentClassName).toContain("min-h-(--sz-48px)");
+    expect(editable().dataset.contentClassName).toContain("task-chat-phone-editor");
     expect(editable().dataset.contentClassName).toContain("max-h-(--tc-composer-editor-max-height)");
   });
 
@@ -1492,9 +1612,10 @@ describe("TaskChatComposer", () => {
       currentAssigneeValue="agent:codex" />);
 
     const actions = container.querySelector<HTMLElement>('[data-testid="task-chat-composer-actions"]')!;
-    expect(actions.lastElementChild?.lastElementChild).toBe(sendButton());
-    expect(actions.firstElementChild?.contains(sendButton())).toBe(false);
-    expect(actions.lastElementChild?.querySelector('[data-testid="task-chat-composer-assignee"]')).not.toBeNull();
+    const row = actions.querySelector('[data-testid="task-chat-composer-row"]')!;
+    expect(row.lastElementChild?.lastElementChild).toBe(sendButton());
+    expect(row.firstElementChild?.contains(sendButton())).toBe(false);
+    expect(row.lastElementChild?.querySelector('[data-testid="task-chat-composer-assignee"]')).not.toBeNull();
     expect(actions.querySelector('[data-testid="task-chat-composer-assignee"] [data-slot="agent-avatar"] img')).not.toBeNull();
 
     flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-add"]')!.click());
@@ -2356,8 +2477,10 @@ describe("TaskChatComposer", () => {
           workMode: "standard",
           draftKey: draftKey,
         });
+        // Mount may flush an empty draft; typing must not write until debounce.
+        const beforeTyping = localStorage.getItem(draftKey);
         typeText("work in progress");
-        expect(localStorage.getItem(draftKey)).toBeNull();
+        expect(localStorage.getItem(draftKey)).toBe(beforeTyping);
 
         vi.advanceTimersByTime(DRAFT_DEBOUNCE_MS);
         expect(localStorage.getItem(draftKey)).toBe("work in progress");

@@ -17,17 +17,104 @@ function draftStorage(draftKey: string): Storage {
   return draftKey.startsWith("paperclip:agent-chat-draft:") ? sessionStorage : localStorage;
 }
 
+// A restored message (a Pi Stop hands back what the agent hadn't taken) must outlive a tab-scoped chat draft.
+const restoredKey = (draftKey: string) => `${draftKey}:restored:v1`;
+export function saveRestoredDraft(draftKey: string, value: string) {
+  try { if (draftStorage(draftKey) !== localStorage) localStorage.setItem(restoredKey(draftKey), value); } catch { /* storage unavailable */ }
+}
+
+export interface RestoredCommentDraft {
+  id: string;
+  body: string;
+}
+
+// Custody is per message: a stale tab's whole-draft save/clear cannot touch it.
+const stoppedPrefix = (draftKey: string) => `${draftKey}:stopped-comment:v1:`;
+const stoppedKey = (draftKey: string, id: string) => `${stoppedPrefix(draftKey)}${encodeURIComponent(id)}`;
+const includedKey = (draftKey: string) => `${draftKey}:included-stopped:v1`;
+const includedComments = new Map<string, string[]>();
+
+function saveIncludedComments(draftKey: string, body: string, ids = includedComments.get(draftKey) ?? []) {
+  draftStorage(draftKey).setItem(includedKey(draftKey), JSON.stringify({ body, ids }));
+}
+
+/** Only an explicit discard or a confirmed send can release these IDs. */
+export function discardStoppedCommentDrafts(draftKey: string, ids = includedComments.get(draftKey) ?? []) {
+  for (const id of ids) {
+    try { localStorage.removeItem(stoppedKey(draftKey, id)); } catch { /* Retain on failure. */ }
+  }
+  includedComments.set(draftKey, (includedComments.get(draftKey) ?? []).filter(id => !ids.includes(id)));
+}
+
+/** Only this positive receipt permits a returned comment to leave the server. */
+export function restoreStoppedCommentDrafts(
+  draftKey: string,
+  body: string,
+  comments: readonly RestoredCommentDraft[],
+): { body: string; commentIds: string[] } | null {
+  try {
+    // Do not replace a send whose delivery is still uncertain. Read directly so
+    // unavailable storage cannot masquerade as an absent submission fence.
+    if (draftStorage(draftKey).getItem(`${draftKey}:submission:v1`) !== null) return null;
+    if (comments.some(comment => !comment.id || !comment.body)) return null;
+    const included = new Set(includedComments.get(draftKey) ?? []);
+    for (const comment of comments) {
+      const key = stoppedKey(draftKey, comment.id);
+      const value = JSON.stringify({ id: comment.id, body: comment.body });
+      const previous = localStorage.getItem(key);
+      if (previous !== null && previous !== value) return null;
+      localStorage.setItem(key, value);
+      if (localStorage.getItem(key) !== value) return null;
+      if (!included.has(comment.id)) body = body ? `${body}\n\n${comment.body}` : comment.body;
+      included.add(comment.id);
+    }
+    draftStorage(draftKey).setItem(draftKey, body);
+    saveIncludedComments(draftKey, body, [...included]);
+    includedComments.set(draftKey, [...included]);
+    return { body, commentIds: comments.map((comment) => comment.id) };
+  } catch {
+    // No acknowledgment on ANY storage failure. The source stays in the thread.
+    return null;
+  }
+}
+
 export function loadDraft(draftKey: string): string {
   return loadDraftIfAvailable(draftKey) ?? "";
 }
 
 /** Distinguish an empty stored draft from unavailable browser storage. */
 export function loadDraftIfAvailable(draftKey: string): string | null {
-  try {
-    return draftStorage(draftKey).getItem(draftKey) ?? "";
-  } catch {
-    return null;
+  let body: string | null = null;
+  try { body = draftStorage(draftKey).getItem(draftKey); } catch { /* Try durable recovery independently. */ }
+  if (body === null) {
+    try { body = localStorage.getItem(restoredKey(draftKey)) ?? ""; } catch { /* Do not mask a usable session draft. */ }
   }
+  let ids: string[] = [];
+  try {
+    const snapshot = JSON.parse(draftStorage(draftKey).getItem(includedKey(draftKey)) ?? "null");
+    if (snapshot?.body === body && Array.isArray(snapshot.ids) && snapshot.ids.every((id: unknown) => typeof id === "string")) ids = snapshot.ids;
+  } catch { /* Missing identity hints may duplicate, never discard text. */ }
+  try {
+    const prefix = stoppedPrefix(draftKey);
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(prefix)) continue;
+      const comment = JSON.parse(localStorage.getItem(key) ?? "null");
+      if (typeof comment?.id !== "string" || typeof comment.body !== "string" || key !== stoppedKey(draftKey, comment.id)) continue;
+      if (!ids.includes(comment.id)) {
+        body = body ? `${body}\n\n${comment.body}` : comment.body;
+        ids.push(comment.id);
+      }
+    }
+  } catch { /* Receipt failure must not block the ordinary draft. */ }
+  includedComments.set(draftKey, ids);
+  if (body !== null) {
+    try {
+      draftStorage(draftKey).setItem(draftKey, body);
+      saveIncludedComments(draftKey, body);
+    } catch { /* The per-message copies remain recoverable. */ }
+  }
+  return body;
 }
 
 /** A conflicting tab keeps its own recoverable buffer without replacing the
@@ -72,8 +159,12 @@ export function saveDraft(draftKey: string, value: string, attemptId?: string) {
     if (!mayWriteDraft(draftKey, attemptId)) return;
     if (value.trim()) {
       draftStorage(draftKey).setItem(draftKey, value);
+      saveIncludedComments(draftKey, value);
+      if (localStorage.getItem(restoredKey(draftKey)) !== null) localStorage.setItem(restoredKey(draftKey), value);
     } else {
       draftStorage(draftKey).removeItem(draftKey);
+      localStorage.removeItem(restoredKey(draftKey));
+      draftStorage(draftKey).removeItem(includedKey(draftKey));
     }
     syncDraftRecoveryMarker(draftKey);
   } catch {
@@ -87,6 +178,8 @@ export function clearDraft(draftKey: string, attemptId?: string) {
     draftStorage(draftKey).removeItem(draftKey);
     draftStorage(draftKey).removeItem(`${draftKey}:attachments:v1`);
     draftStorage(draftKey).removeItem(`${draftKey}:submission:v1`);
+    localStorage.removeItem(restoredKey(draftKey));
+    draftStorage(draftKey).removeItem(includedKey(draftKey));
     syncDraftRecoveryMarker(draftKey);
   } catch {
     // Ignore browser storage failures.
@@ -114,6 +207,8 @@ export interface ComposerDraftSubmission {
   /** Start of text typed after the submitted body in a restored uncertain draft. */
   nextDraftOffset?: number;
   submittedAttachmentIds?: string[];
+  /** Returned copies included in this send, never another tab's later Stop. */
+  stoppedCommentIds?: string[];
   /** Present when the send can be replayed; older records have none. */
   request?: ComposerSendRequest;
   /** The account that made `request`; only that account may replay it (see `useDraftOwner`). */
@@ -171,17 +266,19 @@ export function loadDraftSubmission(
     const record = JSON.parse(raw);
     return record?.version === 1 &&
       record.draftKey === draftKey &&
-      Object.keys(record).every((key) => ["version", "draftKey", "attemptId", "reviewed", "nextDraftOffset", "submittedAttachmentIds", "request", "requestOwner"].includes(key)) &&
+      Object.keys(record).every((key) => ["version", "draftKey", "attemptId", "reviewed", "nextDraftOffset", "submittedAttachmentIds", "stoppedCommentIds", "request", "requestOwner"].includes(key)) &&
       typeof record.attemptId === "string" &&
       /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(record.attemptId) &&
       typeof record.reviewed === "boolean" &&
       (record.nextDraftOffset === undefined || (Number.isSafeInteger(record.nextDraftOffset) && record.nextDraftOffset >= 0)) &&
       (record.submittedAttachmentIds === undefined || (Array.isArray(record.submittedAttachmentIds) && record.submittedAttachmentIds.length <= 256 && record.submittedAttachmentIds.every((id: unknown) => typeof id === "string" && id.length <= 128))) &&
+      (record.stoppedCommentIds === undefined || (Array.isArray(record.stoppedCommentIds) && record.stoppedCommentIds.every((id: unknown) => typeof id === "string"))) &&
       (record.request === undefined || isComposerSendRequest(record.request)) &&
       (record.requestOwner === undefined || (typeof record.requestOwner === "string" && record.requestOwner.length <= 256))
       ? { attemptId: record.attemptId, reviewed: record.reviewed,
           ...(record.nextDraftOffset !== undefined ? { nextDraftOffset: record.nextDraftOffset } : {}),
           ...(record.submittedAttachmentIds !== undefined ? { submittedAttachmentIds: record.submittedAttachmentIds } : {}),
+          ...(record.stoppedCommentIds !== undefined ? { stoppedCommentIds: record.stoppedCommentIds } : {}),
           ...(record.request !== undefined ? { request: record.request } : {}),
           ...(record.requestOwner !== undefined ? { requestOwner: record.requestOwner } : {}),
         }
@@ -201,7 +298,9 @@ export function saveDraftSubmission(
     if (!mayWriteDraft(draftKey, submission.attemptId)) return;
     draftStorage(draftKey).setItem(
       `${draftKey}:submission:v1`,
-      JSON.stringify({ version: 1, draftKey, ...submission }),
+      JSON.stringify({ version: 1, draftKey, ...submission,
+        stoppedCommentIds: submission.stoppedCommentIds ?? loadDraftSubmission(draftKey)?.stoppedCommentIds ?? includedComments.get(draftKey) ?? [],
+      }),
     );
     syncDraftRecoveryMarker(draftKey);
   } catch {
@@ -228,6 +327,7 @@ export function settleDraftSubmission(draftKey: string, attemptId: string, nextD
     ? "" : loadDraft(draftKey).slice(submission.nextDraftOffset);
   const nextAttachments = submission.submittedAttachmentIds === undefined ? []
     : loadDraftAttachments(draftKey).filter(item => !submission.submittedAttachmentIds!.includes(item.attachmentId));
+  discardStoppedCommentDrafts(draftKey, submission.stoppedCommentIds ?? []);
   clearDraft(draftKey, attemptId);
   if (nextDraft) saveDraft(draftKey, nextDraft);
   if (nextAttachments.length) saveDraftAttachments(draftKey, nextAttachments);

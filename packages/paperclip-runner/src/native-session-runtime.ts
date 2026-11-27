@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION } from "./contracts/runtime-context-prompts.js";
 import { nativeSystemInstructions } from "./backends/runtime-context.js";
 
 import type {
@@ -13,6 +14,7 @@ import type {
 import { readProviderFailure } from "./contracts/provider-failure.generated.js";
 import {
   buildNativeModelEnvelope,
+  isNativePiConversation,
   parseNativeExecutionInput,
 } from "./contracts/native-execution.js";
 import type {
@@ -22,6 +24,7 @@ import type {
 import type { NativeSessionRecoveryResult, PersistedNativeSession } from "./contracts/native-session-backend.js";
 import {
   PROVIDER_ATTACH_REFUSED,
+  NativeRunnerClosedBeforeAttachmentError,
   PROVIDER_SIDE_EFFECT_PENDING,
   PROVIDER_STATE_INCOMPATIBLE,
   type HarnessThreadGoal,
@@ -394,6 +397,8 @@ export interface ExecuteNativeSessionOptions {
   /** Observes why a retained session was removed from warm reuse. */
   onSessionQuarantined?: (reason: string) => Promise<void> | void;
   existingSession?: NativeSession;
+  /** This run's rebuilt catalog, forwarded when attaching to an existing session. */
+  dynamicTools?: readonly Readonly<Record<string, unknown>>[];
   persistedSession?: PersistedNativeSession | null;
   keepSessionOpen?: boolean;
   /** Apply a structured session-goal control instead of starting an ordinary turn. */
@@ -1210,6 +1215,35 @@ async function retryQuarantinedSessionCleanups(
     );
   }
 }
+// A preview-only final from an older runner still fences held-input replay.
+function isProviderOutput(event: PrpEvent): boolean {
+  const payload = event.payload;
+  // Canonical tool rows can be the only evidence of an executed command or
+  // file edit. Even an empty output is not an effect-free turn to replay.
+  return event.eventType === "tool.execution.completed"
+    || event.eventType === "tool.execution.progressed"
+    || (event.eventType === "item.completed" && payload.kind === "fileChange")
+    || (event.eventType === "item.delta" && typeof payload.text === "string" && payload.text.length > 0)
+    || (event.eventType === "item.completed" && !["usage", "thread_lineage", "model", "goal", "goal_cleared", "interrupt_acknowledgement"].includes(String(payload.kind))
+      && (payload.truncated === true || payload.transcriptOverflow === true
+        || typeof payload.text === "string" && payload.text.length > 0));
+}
+
+function providerOutputWithoutResult(): Error {
+  return new Error("native_provider_output_without_result: The provider produced output but no complete answer could be saved. This question remains unanswered. Automatic retries are stopped; nothing was re-sent.");
+}
+
+async function replayHasProviderOutput(controlPlane: ControlPlanePort, runId: string, sourceInstanceId: string): Promise<boolean> {
+  let afterSourceSeq = 0;
+  while (true) {
+    const page = await controlPlane.replayEvents({ runId, sourceInstanceId, afterSourceSeq, limit: 1_000 });
+    if (page.events.some(isProviderOutput)) return true;
+    const next = page.events.at(-1)?.sourceSeq;
+    if (next === undefined || next <= afterSourceSeq) return false;
+    afterSourceSeq = next;
+  }
+}
+
 async function consumeTurn(
   session: NativeSession,
   controlPlane: ControlPlanePort,
@@ -1512,6 +1546,10 @@ async function consumeTurn(
           highestContiguousSourceSeq,
           receipt.highestContiguousSourceSeq,
         );
+      }
+      if (payload.transcriptOverflow === true) {
+        await settlePendingDeltas();
+        throw providerOutputWithoutResult();
       }
       if (providerTurnWait.endedBy(event)) {
         const ended = await endProviderTurnWait(providerTurnWait.awaitedTerminal!);
@@ -2666,6 +2704,7 @@ export async function executeNativeSession(
       const attach = async (signal?: AbortSignal) => {
         signal?.throwIfAborted();
         await options.existingSession!.attachRun!({ identity,
+        ...(options.dynamicTools !== undefined ? { dynamicTools: options.dynamicTools } : {}),
         completionContract: {
           revision: input.completionContract.contract.revision,
           criterionIds: input.completionContract.contract.criteria.map((criterion) => criterion.id),
@@ -2685,6 +2724,10 @@ export async function executeNativeSession(
       });
       else await attach();
     } catch (error) {
+      // This typed refusal proves no attachment command ran. Leave eviction and
+      // its single checkpoint retry to the host; quarantining would try to
+      // suspend the already-dead process and discard the cached owner first.
+      if (error instanceof NativeRunnerClosedBeforeAttachmentError) throw error;
       // attachRun has no transactional guarantee: a provider may bind the new
       // run before reporting a later failure. Conservatively quarantine the
       // session so neither the old nor partially attached run can reuse it.
@@ -3004,7 +3047,7 @@ export async function executeNativeSession(
           "Reconcile any unfinished tool or command before proceeding: check the workspace for the outputs or artifacts it should have produced. If the expected output is present, use it. If the expected output is missing, re-run the command.",
           "Do not repeat completed work. Before you repeat an action with external effects, such as a push, a message or a deployment, check whether it already took effect. If you cannot determine that, report the specific blocker.",
           "Finish in this turn. Nothing resumes this conversation after the turn ends, so do not end it to wait for a background command or a notification; wait for or check that work first.",
-          "Then invoke exactly one paperclip_finish or paperclip_block with the accurate disposition.",
+          isNativePiConversation(input) ? PAPERCLIP_CONVERSATION_REPLY_INSTRUCTION : "Then invoke exactly one paperclip_finish or paperclip_block with the accurate disposition.",
           ...(attachmentPrompt ? ["", attachmentPrompt] : []),
         ].join("\n"),
         ...(steeredMessages.length > 0 ? { steeredMessages: steeredMessages.map(message => message.text) } : {}),
@@ -3071,7 +3114,7 @@ export async function executeNativeSession(
       return continuationSetup;
     };
     const requestContinuationDisposition = async (event: PrpEvent, signal: AbortSignal) => {
-      if (continuationDispositionRequested || event.eventType !== "turn.completed") return false;
+      if (isNativePiConversation(input) || continuationDispositionRequested || event.eventType !== "turn.completed") return false;
       await continuationSetup?.catch(() => undefined);
       signal.throwIfAborted();
       if (borrowedContinuationTurnId === null || event.turnId !== borrowedContinuationTurnId) return false;
@@ -3255,8 +3298,38 @@ export async function executeNativeSession(
           : null;
       const checkpointedDispositionTerminal =
         replayedDisposition !== null || dispositionFallback !== null;
+      // A completed turn from this run is not a new conversation input. Its
+      // final may predate this controller's cursor (a held Pi turn can cross a
+      // restart), so settle through durable replay rather than startTurn.
+      const conversationTurnId = recovered && persistedSession &&
+        (isNativePiConversation(input) || options.resolveMissingResult) &&
+        !recoveredActiveTurnId && !adoptedProviderTerminal && !governedWait &&
+        !checkpointedDispositionTerminal && !recoveredSnapshot.goal && recoveredSnapshot.awaitingProviderTurn !== true &&
+        !recoveredSnapshot.pendingRuntimeRequests?.length && !options.sessionCompaction &&
+        !options.sessionGoalControl && !options.resumeSessionGoalHeartbeat
+        ? persistedSession.terminalTurns?.at(-1)?.turnId ?? null : null;
+      const replayedConversationTerminal = conversationTurnId
+        ? (await replayCheckpointedTurnTerminal({ controlPlane: options.controlPlane,
+            runId: input.binding.runId, sourceInstanceId: options.runnerInstanceId,
+            priorTerminalTurnIds: [], expectedTurnId: conversationTurnId }))?.terminal ?? null : null;
+      if (conversationTurnId && !replayedConversationTerminal && isNativePiConversation(input)) {
+        throw new Error("native_finalization_missing: checkpointed conversation turn has no durable terminal");
+      }
+      if (replayedConversationTerminal && (replayedConversationTerminal.runId !== input.binding.runId ||
+          replayedConversationTerminal.normalizedSessionId !== normalizedSessionId)) {
+        throw new NativeSessionProtocolIntegrityError("source_event_replay_conflict");
+      }
+      // Restore a valid saved answer before the saved-output/no-resubmit fence.
+      // A resultless or empty task turn must retain its ordinary recovery path.
+      const savedConversationResult = !isNativePiConversation(input) &&
+          replayedConversationTerminal?.eventType === "turn.completed" && options.resolveMissingResult
+        ? await options.resolveMissingResult({ turnId: replayedConversationTerminal.turnId ?? null,
+            terminalEvent: replayedConversationTerminal }) : null;
+      const conversationTerminal = replayedConversationTerminal?.eventType === "turn.completed" &&
+          (isNativePiConversation(input) || savedConversationResult !== null)
+        ? replayedConversationTerminal : null;
       const recoveryTerminal =
-        replayedDisposition?.terminal ?? dispositionFallback;
+        replayedDisposition?.terminal ?? dispositionFallback ?? conversationTerminal;
       const awaitedTurnId = persistedSession?.terminalTurns?.at(-1)?.turnId ?? null;
       const awaitedTerminal = recovered && recoveredSnapshot.awaitingProviderTurn === true && !recoveredActiveTurnId &&
           !recoveredSnapshot.semanticResult && !governedWait && !checkpointedDispositionTerminal && awaitedTurnId !== null
@@ -3318,7 +3391,7 @@ export async function executeNativeSession(
               // A restarted compaction run adopts its completed compaction turn.
               governedResult: options.sessionCompaction && recoveryTerminal.eventType === "turn.completed"
                 ? sessionCompactionResult(input, options.sessionCompaction.requestId)
-                : null,
+                : savedConversationResult,
             });
       // Event consumption must begin before startTurn so an eager provider cannot
       // outrun us. Observe its rejection immediately, though: if startTurn or
@@ -3332,8 +3405,24 @@ export async function executeNativeSession(
           (!recoveredActiveTurnId &&
             !adoptedProviderTerminal &&
             !checkpointedDispositionTerminal &&
+            !conversationTerminal &&
             !dispositionRecoveryStillOwned &&
             !resumedProviderTurnWait));
+        const dispositionOnlyRecovery = Boolean(
+          !isNativePiConversation(input) && recovered &&
+          !recoveredSnapshot.semanticResult &&
+          (persistedSession?.terminalTurns?.length ?? 0) > 0 &&
+          !recoveredActiveTurnId,
+        );
+        // Every continuous Pi run can re-submit the original input after a
+        // crash without a checkpointed terminal, including task chats. Omitted
+        // continuity is continuous; paperclip-policy Pi and non-Pi providers
+        // retain stock recovery. Durable same-run finals above still settle.
+        if (input.provider.kind === "pi_rpc" && input.provider.sessionContinuity !== "paperclip"
+          && recovered && shouldStartFreshTurn && !options.sessionCompaction && !dispositionOnlyRecovery
+          && await replayHasProviderOutput(options.controlPlane, input.binding.runId, options.runnerInstanceId)) {
+          throw providerOutputWithoutResult();
+        }
         if (options.sessionCompaction) {
           // Compaction summarizes existing provider context. A new session or
           // one that is still running a turn has nothing safe to compact.
@@ -3383,12 +3472,6 @@ export async function executeNativeSession(
             const handoff = await options.getFreshSessionHandoff();
             if (handoff) modelEnvelope.task.prompt = `${handoff}\n\n${modelEnvelope.task.prompt}`;
           }
-          const dispositionOnlyRecovery = Boolean(
-            recovered &&
-            !recoveredSnapshot.semanticResult &&
-            (persistedSession?.terminalTurns?.length ?? 0) > 0 &&
-            !recoveredActiveTurnId,
-          );
           const effectFreeInitialAcpxTurn =
             dispositionOnlyRecovery && persistedSession
               ? await replayProvesEffectFreeInitialAcpxTurn({
@@ -3432,6 +3515,10 @@ export async function executeNativeSession(
           if (recovered) await checkpoint();
           const startedTaskTurn = await session.startTurn({
             message: { role: "user", text: JSON.stringify(modelEnvelope) },
+            // Prepared sessions stay reusable. Bind the durable one-shot marker
+            // to this recovery submission, not to recovery of the session itself.
+            ...(dispositionOnlyRecovery && !effectFreeInitialAcpxTurn && input.provider.kind === "pi_rpc"
+              && input.provider.sessionContinuity !== "paperclip" ? { dispositionOnlyRecovery: true as const } : {}),
             ...(recovered && modelEnvelope.schema === "paperclip.native-continuation.v1"
               ? { continuation: true as const } : {}),
             requestedCollaborationMode:

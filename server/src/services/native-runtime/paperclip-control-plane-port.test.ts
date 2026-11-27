@@ -1,4 +1,10 @@
+import { issueService } from "../issues.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
+import { prepareHeartbeatSession, type HeartbeatSessionPreparationInput } from "../heartbeat/session-preparation.js";
+import { instanceSettingsService } from "../instance-settings.js";
+import { getAdapterSessionCodec } from "../heartbeat/run-state.js";
+import { attachPaperclipSessionMetadataToSessionParams } from "../heartbeat/workspaces.js";
+import * as issueCommentWrites from "../issue-comment-writes.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { plugins } from "@paperclipai/db";
 import { readTaskPanelActivations } from "../plugin-task-panels.js";
@@ -14,12 +20,15 @@ import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import { readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse, selectHeartbeatRunFinalAgentMessage } from "../heartbeat-run-summary.js";
 import {
   activityLog,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   assets,
   authUsers,
   companies,
   companyMemberships,
+  chatCompletionDeliveries,
+  chatTaskHandoffs,
   completionContracts,
   createDb,
   heartbeatRunEvents,
@@ -32,8 +41,11 @@ import {
   issues,
   nativeRunFinalizations,
   nativeRunResults,
+  routineRuns,
+  routines,
   statusDecisionEffects,
   statusDecisions,
+  userCompanyPreferences,
   workAssessments,
 } from "@paperclipai/db";
 import {
@@ -65,6 +77,10 @@ import { claimQueuedNativeReviewRun } from "./native-review-dispatch.js";
 import { stageNativeRunnerWakeAttachments } from "./native-runner-file-handoff.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
+import { buildNativeContinuationPrompt } from "./native-continuation.js";
+import { buildPaperclipWakePayload } from "../heartbeat/run-preparation.js";
+import { buildNativeExecutionInput } from "./native-execution-input.js";
+import { buildNativeModelEnvelope } from "../../vendor/paperclip-runner/index.js";
 import { ensureNativeCompletionContract, nativeCompletionSource } from "./completion-contracts.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "./status-arbiter.js";
@@ -112,6 +128,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       temporary = await startRecoveryPostgres("paperclip-native-port-");
       db = createDb(temporary.connectionString);
     }
+    await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: true });
     const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     await db.insert(companies).values({ id: identity.companyId, name: "Phase 6", issuePrefix: "P6C" });
     await db.insert(agents).values({
@@ -316,8 +333,11 @@ describe("PaperclipControlPlanePort conformance", () => {
       await db.delete(issueWorkProducts);
       await db.delete(issueRelations);
       await db.delete(heartbeatRunEvents);
+      await db.delete(agentTaskSessions);
       await db.delete(heartbeatRuns);
       await db.delete(completionContracts);
+      await db.delete(routineRuns);
+      await db.delete(routines);
       await db.delete(issues);
       await db.delete(assets);
       await db.delete(agents);
@@ -457,6 +477,236 @@ describe("PaperclipControlPlanePort conformance", () => {
         status: "pending", result: null, effectiveResolverPolicy: "human_only", continuationPolicy: "none", sourceRunId: identity.runId,
       });
     } finally { releaseObserver(); await outcome; if (terminalWasRecorded) await observerDone; }
+  });
+
+  it.each((["no wake", "wake", "clamp"] as const).flatMap(mode =>
+    [false, true].map(taskRecovery => ({ mode, taskRecovery }))))(
+    "marks a fresh start after a prior session once, but never a resume: $mode (automatic task recovery=$taskRecovery)", async ({ mode, taskRecovery }) => {
+    const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const issueId = randomUUID(), fixtureContractId = randomUUID();
+    const workspaceContinuity = mode === "clamp"
+      ? { mode: "fresh_isolated_workspace", sourceRunId: randomUUID(), contentOrigin: "configured_source" }
+      : mode === "wake" ? { mode: "reuse_current_workspace", sourceRunId: null, contentOrigin: "existing_workspace" }
+        : { mode: "unknown", sourceRunId: null, contentOrigin: "unknown" };
+    const continuityContext = mode === "no wake" ? {} : { workspaceContinuity };
+    const firstRunAt = new Date("2026-01-01T00:00:00.000Z");
+    const wakeAt = new Date("2026-01-01T00:00:19.000Z");
+    const previousReplyAt = mode === "clamp" ? wakeAt : new Date("2026-01-01T00:00:10.000Z");
+    const markers = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+      sql`${issueComments.presentation}->>'kind' = 'system_notice'`));
+    await db.insert(issues).values({ id: issueId, companyId, title: "Fresh-session disclosure",
+      assigneeAgentId: agentId, ...(!taskRecovery ? {
+        conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active",
+      } : {}) });
+    const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, contractId));
+    await db.insert(completionContracts).values({ ...contract!, id: fixtureContractId, issueId });
+    let replayFirst: () => Promise<unknown> = async () => {};
+    let previousSessionId: string | null = null;
+    let recoveryInput: HeartbeatSessionPreparationInput | undefined;
+    for (const [index, eventType] of (["session.started", "session.started", "session.resumed", "session.started"] as const).entries()) {
+      const runId = randomUUID(), sessionId = randomUUID(), runnerId = randomUUID();
+      const identity = { companyId, agentId, issueId, runId, sessionId };
+      const runAt = new Date(firstRunAt.getTime() + index * 20_000);
+      let wakeCommentId: string | undefined;
+      if (index === 1 && mode !== "no wake") {
+        const [wake] = await db.insert(issueComments).values({ companyId, issueId, body: "Start the next session",
+          authorType: "user", authorUserId: "board", createdAt: wakeAt }).returning();
+        wakeCommentId = wake!.id;
+      }
+      const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
+        nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runnerId,
+        completionContractId: fixtureContractId, completionContractSha256: contractSha, createdAt: runAt,
+        contextSnapshot: { issueId, conversationSessionGeneration: 0, ...continuityContext, ...(wakeCommentId ? { wakeCommentId } : {}),
+          ...(taskRecovery && index === 3 ? { explicitFreshSession: true } : {}) } }).returning();
+      if (taskRecovery && index === 1) {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+        const runtimeConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+        const context = { issueId, forceFreshSession: true, source: "execution.reconciled", conversationSessionGeneration: 0, ...continuityContext };
+        recoveryInput = {
+          run, agent: { ...agent, adapterType: "paperclip_runner", adapterConfig: runtimeConfig },
+          task: { context, issueRef: { id: issueId }, issueContext: null, taskProjectContext: null, workspaceProjectContext: null,
+            wakeCommentId: null, acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null },
+          session: { taskSession: null, taskSessionDecodedParams: { sessionId: previousSessionId }, explicitResumeSessionParams: null,
+            explicitResumeSessionDisplayId: null, sessionCodec: getAdapterSessionCodec("paperclip_runner") },
+          config: { runtimeConfig, agentIdentity: undefined, issueAssigneeOverrides: null, originalAiIssueOverrides: null,
+            managedAiRuntime: undefined, aiBinding: undefined, requestedAiBinding: undefined, secretManifest: [],
+            runtimeSkillEntries: [], routineEnvContext: { env: null } },
+          workspace: { requestedExecutionWorkspaceMode: "shared_workspace", effectiveExecutionWorkspaceMode: "shared_workspace",
+            projectExecutionWorkspacePolicy: null, issueExecutionWorkspaceSettings: null, executionPolicy: {} as never,
+            requestedReusableExecutionWorkspaceConfig: null, reusableExistingExecutionWorkspace: null },
+          environment: { environmentResolution: { environmentId: null, source: "default" }, selectedEnvironmentId: null,
+            selectedEnvironmentForConfig: null },
+          getLatestAgentConfigRevision: async () => ({ id: agent.id, changedKeys: [], createdAt: run.createdAt }),
+        };
+        const prepared = await prepareHeartbeatSession(db, recoveryInput);
+        expect(prepared.resetTaskSession).toBe(true);
+        expect(prepared.taskResumeSessionId).toBeNull();
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].contextSnapshot)
+          .toMatchObject({ warmRecoveryFreshSession: { runId } });
+      }
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: fixtureContractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: "marker-control" });
+      await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+      const event: PrpEvent = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:1`,
+        sourceInstanceId: runnerId, sourceSeq: 1, sourceKind: "runner", runId, normalizedSessionId: sessionId,
+        eventType, priority: 0, emittedAt: new Date(runAt.getTime() + 5_000).toISOString(), payload: {} };
+      if (index === 3) {
+        const markerWrite = vi.spyOn(issueCommentWrites, "insertIssueComment").mockRejectedValueOnce(new Error("marker write failed"));
+        try { await expect(port.appendEvent(event)).resolves.toMatchObject({ disposition: "committed" }); }
+        finally { markerWrite.mockRestore(); }
+        expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(1);
+      } else await port.appendEvent(event);
+      // CHPORT: consume the REAL port-written session.started receipt, not a
+      // hand-shaped DB event. The explicit fresh request starts S2 after the
+      // automatic S1 incident, and preparation must anchor its next incident on S2.
+      if (taskRecovery && index === 3) {
+        expect(recoveryInput).toBeDefined();
+        const baseline = await prepareHeartbeatSession(db, { ...recoveryInput!,
+          task: { ...recoveryInput!.task, context: {} } });
+        const [boundary] = await db.update(heartbeatRuns).set({ status: "failed", error: "ordinary provider failure" })
+          .where(eq(heartbeatRuns.id, runId)).returning();
+        const [current] = await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issueId,
+          status: "queued", createdAt: new Date(boundary.createdAt.getTime() + 1), contextSnapshot: { issueId },
+        }).returning();
+        // C34A8-PORT: S2 really started, but publication still points at S1.
+        const [incident] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, recoveryInput!.run.id));
+        const s1 = incident.nativeSessionId!;
+        const [lagging] = await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: issueId,
+          lastRunId: recoveryInput!.run.id, sessionDisplayId: s1,
+          sessionParamsJson: attachPaperclipSessionMetadataToSessionParams({ sessionId: s1 }, baseline.configuredModel, baseline.sessionConfigMetadata),
+        }).returning();
+        const nextInput = { ...recoveryInput!, run: current,
+          task: { ...recoveryInput!.task, context: { forceFreshSession: true, source: "execution.reconciled" } },
+          session: { ...recoveryInput!.session, taskSession: lagging, taskSessionDecodedParams: { sessionId: s1 } },
+        };
+        await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: false });
+        const ordinary = await prepareHeartbeatSession(db, nextInput);
+        await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: true });
+        process.stdout.write(`C34A8-PORT ${JSON.stringify({ s1, s2: sessionId, boundaryRunId: runId,
+          nextRunId: current.id, resumes: ordinary.taskResumeSessionId, pin: ordinary.warmRecoveryRetainSessionId,
+          reset: ordinary.resetTaskSession })}\n`);
+        expect(ordinary.resetTaskSession).toBe(false);
+        expect(ordinary.warmRecoveryRetainSessionId).toBeNull();
+        expect(ordinary.taskResumeSessionId).toBe(sessionId);
+        // Preserve CHPORT's existing refusal/new-incident check too.
+        await db.update(heartbeatRuns).set({ error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" }).where(eq(heartbeatRuns.id, runId));
+        const next = await prepareHeartbeatSession(db, nextInput);
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, current.id));
+        expect(next.resetTaskSession).toBe(true);
+        expect(next.warmRecoveryRetainSessionId).toBeNull();
+        expect(saved.contextSnapshot).toMatchObject({ warmRecoveryFreshSession: { runId: current.id, retainedSessionId: sessionId } });
+        const [receipt] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        expect(receipt.payload).toMatchObject({ prpEvent: { normalizedSessionId: sessionId } });
+        process.stdout.write(`CHPORT ${JSON.stringify({ boundaryRunId: runId, sessionId, eventType: receipt.eventType,
+          nextRunId: current.id, nextIncident: saved.contextSnapshot?.warmRecoveryFreshSession })}\n`);
+      }
+      if (index === 0) {
+        replayFirst = () => port.appendEvent(event);
+        previousSessionId = sessionId;
+        await db.insert(issueComments).values({ companyId, issueId, body: "Previous session reply", authorType: "agent",
+          authorAgentId: agentId, createdByRunId: runId, createdAt: previousReplyAt });
+        if (taskRecovery) await db.update(heartbeatRuns).set({ status: "failed",
+          error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" })
+          .where(eq(heartbeatRuns.id, runId));
+      }
+      const comments = await markers();
+      expect(comments).toHaveLength(index === 0 ? 0 : 1);
+      if (index === 1) {
+        expect(comments[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null,
+          body: "New session · Earlier messages and files are still available.",
+          createdByRunId: null, conversationSessionGeneration: 0, metadata: { sourceRunId: runId, workspaceContinuity },
+          presentation: { kind: "system_notice", tone: "neutral" } });
+        // Marker time orders the input, not the later session.started receipt.
+        const expectedAt = mode === "no wake" ? run!.createdAt
+          : new Date(Math.max(wakeAt.getTime() - 1, previousReplyAt.getTime() + 1));
+        expect(comments[0]!.createdAt).toEqual(expectedAt);
+        const [receipt] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        const [startedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        if (taskRecovery) {
+          expect(startedRun.contextSnapshot).toMatchObject({ warmRecoveryFreshSession: { runId } });
+          expect(receipt).toMatchObject({ runId, eventType: "session.started" });
+          expect(comments[0]!.metadata).toMatchObject({ sourceRunId: receipt!.runId });
+          process.stdout.write(`RECOVERY_RESET_START_MARKER ${JSON.stringify({ runId,
+            reset: startedRun.contextSnapshot?.warmRecoveryFreshSession, sessionId: startedRun.nativeSessionId,
+            event: { runId: receipt!.runId, eventType: receipt!.eventType },
+            comment: { id: comments[0]!.id, body: comments[0]!.body, metadata: comments[0]!.metadata } })}\n`);
+        }
+        // Without a wake, preserve the original recovery marker's run-creation assertion.
+        if (mode === "no wake") expect(comments[0]!.createdAt).toEqual(startedRun.createdAt);
+        expect(comments[0]!.createdAt.getTime()).toBeLessThanOrEqual(receipt!.createdAt.getTime());
+        await db.update(issueComments).set({ deletedAt: new Date(runAt.getTime() + 10_000) }).where(eq(issueComments.id, comments[0]!.id));
+        await port.appendEvent(event);
+        await port.appendEvent({ ...event, sourceEventId: `${runnerId}:2`, sourceSeq: 2 });
+        expect(await markers()).toHaveLength(1);
+      }
+    }
+    await replayFirst(); // A later session must not turn the original first start into a marker on replay.
+    expect(await markers()).toHaveLength(1);
+    const activities = await db.select().from(activityLog).where(and(eq(activityLog.entityId, issueId),
+      eq(activityLog.action, "issue.conversation_session_started")));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]!.details).toMatchObject({ automatic: true, generation: 0, workspaceContinuity });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ conversationSessionGeneration: 0, conversationBoundaryCommentId: null });
+    expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`))).toHaveLength(0);
+  }, 30_000);
+
+  it.each(["single", "batch", "clamp", "no wake", "foreign wake"] as const)("orders the fresh-session marker against its first input: %s", async mode => {
+    const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const issueId = randomUUID(), fixtureContractId = randomUUID();
+    const runAt = new Date("2026-01-01T00:00:10.000Z"), wakeAt = new Date(runAt.getTime() - 1_000);
+    await db.insert(issues).values({ id: issueId, companyId, title: "Marker ordering", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active" });
+    const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, contractId));
+    await db.insert(completionContracts).values({ ...contract!, id: fixtureContractId, issueId });
+    const priorRunId = randomUUID(), runId = randomUUID(), sharedSessionId = randomUUID();
+    const previousAt = new Date(mode === "clamp" ? wakeAt.getTime() : wakeAt.getTime() - 2_000);
+    let markerRun!: typeof heartbeatRuns.$inferSelect;
+    for (const [index, id] of [priorRunId, runId].entries()) {
+      const sessionId = mode === "clamp" ? sharedSessionId : randomUUID(), runnerId = randomUUID();
+      const identity = { companyId, agentId, issueId, runId: id, sessionId };
+      let context: Record<string, unknown> = { issueId, conversationSessionGeneration: 0 };
+      if (index === 1 && mode !== "no wake") {
+        const [wake] = await db.insert(issueComments).values({ companyId,
+          issueId: mode === "foreign wake" ? CONTROL_PLANE_CONFORMANCE_OPEN.identity.issueId : issueId,
+          body: "First new-session input", authorType: "user", authorUserId: "board", createdAt: wakeAt }).returning();
+        context.wakeCommentId = wake!.id;
+        if (mode === "batch") {
+          const [later] = await db.insert(issueComments).values({ companyId, issueId, body: "Later input",
+            authorType: "user", authorUserId: "board", createdAt: new Date(wakeAt.getTime() + 500) }).returning();
+          context = { ...context, wakeCommentId: later!.id, wakeCommentIds: [later!.id, wake!.id] };
+        }
+      }
+      const [run] = await db.insert(heartbeatRuns).values({ id, companyId, agentId, status: "running", runtimeMode: "native",
+        nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runnerId,
+        completionContractId: fixtureContractId, completionContractSha256: contractSha, contextSnapshot: context,
+        createdAt: index === 0 ? new Date(previousAt.getTime() - 1_000) : runAt }).returning();
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: fixtureContractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: "order-control" });
+      await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+      await port.appendEvent({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:1`,
+        sourceInstanceId: runnerId, sourceSeq: 1, sourceKind: "runner", runId: id, normalizedSessionId: sessionId,
+        eventType: "session.started", priority: 0, emittedAt: runAt.toISOString(), payload: {} });
+      if (index === 0) await db.insert(issueComments).values({ companyId, issueId, body: "Previous session answer",
+        authorType: "agent", authorAgentId: agentId, createdByRunId: id, createdAt: previousAt });
+      else markerRun = run!;
+    }
+    const thread = await issueService(db).listComments(issueId, { companyId, order: "asc" });
+    const [storedMarker] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+      sql`${issueComments.metadata}->>'sourceRunId' = ${runId}`));
+    const marker = thread.find(comment => comment.id === storedMarker?.id)!;
+    expect(marker).toBeDefined();
+    expect(storedMarker).toMatchObject({ conversationSessionGeneration: 0, presentation: { kind: "system_notice" },
+      metadata: { version: 1, sourceRunId: runId, sections: [] } });
+    const expected = mode === "no wake" || mode === "foreign wake" ? markerRun.createdAt
+      : new Date(Math.max(previousAt.getTime() + 1, wakeAt.getTime() - 1));
+    expect(marker.createdAt).toEqual(expected);
+    expect(thread.findIndex(comment => comment.body === "Previous session answer")).toBeLessThan(thread.indexOf(marker));
+    if (mode === "single" || mode === "batch") {
+      expect(marker.createdAt.getTime()).toBeLessThan(wakeAt.getTime());
+      expect(thread.indexOf(marker)).toBeLessThan(thread.findIndex(comment => comment.body === "First new-session input"));
+    }
   });
 
   async function terminalObserverFixture(options: {
@@ -2752,6 +3002,381 @@ describe("PaperclipControlPlanePort conformance", () => {
       evidence: [], verification: [{ commandOrCheck: "Check the current task state", status: "passed" }], attentionRequests: [] };
     return { companyId, agentId, issueId, runId, port, result };
   }
+
+  // Regression: the runner's successful turn fallback is not a filed task claim.
+  async function unclaimedTask(options: { provider?: string; ownerAgent?: boolean; selfCreated?: boolean; routine?: boolean } = {}) {
+    const f = await prepareFirstTaskCompletion("ordinary task");
+    const provider = options.provider ?? "pi_rpc";
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider } }).where(eq(agents.id, f.agentId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const ownerAgentId = options.ownerAgent ? options.selfCreated ? f.agentId : randomUUID() : null;
+    if (ownerAgentId && ownerAgentId !== f.agentId) await db.insert(agents).values({ id: ownerAgentId, companyId: f.companyId,
+      name: "Delegating owner", adapterType: "paperclip_runner", status: "idle" });
+    await db.update(issues).set({ createdByAgentId: ownerAgentId }).where(eq(issues.id, f.issueId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    if (options.routine) {
+      const [routine] = await db.insert(routines).values({ companyId: f.companyId, title: "Daily summary",
+        assigneeAgentId: f.agentId, responsibleUserId: issue!.responsibleUserId }).returning();
+      const [invocation] = await db.insert(routineRuns).values({ companyId: f.companyId, routineId: routine.id,
+        linkedIssueId: f.issueId, source: "schedule", status: "issue_created", responsibleUserId: issue!.responsibleUserId }).returning();
+      await db.update(issues).set({ originKind: "routine_execution", originId: routine.id, originRunId: invocation.id })
+        .where(eq(issues.id, f.issueId));
+    }
+    const startedAt = new Date(Date.now() - 10_000);
+    await db.update(heartbeatRuns).set({ startedAt,
+      contextSnapshot: { ...run!.contextSnapshot, executionContinuation: { version: 1, messages: [] } } }).where(eq(heartbeatRuns.id, f.runId));
+    const ref = `provider:${provider}:agent-message`;
+    const synthetic: PrpStructuredRunResult = { ...f.result, summary: "Next I will hire the workers and do the task.",
+      completionClaim: { ...f.result.completionClaim!, criteria: [{ criterionId: "objective", status: "satisfied", evidenceRefs: [ref] }] },
+      evidence: [{ ref }], verification: [], attentionRequests: [], artifacts: [] };
+    return { ...f, synthetic, ownerAgentId, userId: issue!.responsibleUserId!, run: run!, startedAt };
+  }
+
+  async function settleUnclaimed(f: Awaited<ReturnType<typeof unclaimedTask>>, report = f.synthetic) {
+    await f.port.completeRun({ result: report, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      callerResultId: `${f.run.runnerInstanceId}:${f.runId}:result` });
+    for (let replay = 0; replay < 2; replay++) await finalizeNativeRun({ db, runId: f.runId,
+      workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.id, issue!.lastStatusDecisionId!));
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    const interactions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId));
+    return { issue, decision, wakes, interactions };
+  }
+
+  async function continueUnclaimedTask(options: Parameters<typeof unclaimedTask>[0] = {}) {
+    const first = await unclaimedTask(options);
+    const settled = await settleUnclaimed(first);
+    const wake = settled.wakes.find(row => row.payload?.continuationIdempotencyKey === "native-pi-unclaimed");
+    expect(wake, "the first turn must leave exactly one durable repair").toBeDefined();
+    const runId = randomUUID(), runnerInstanceId = randomUUID(), startedAt = new Date();
+    const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId: first.companyId, agentId: first.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: first.issueId, nativeSessionId: first.run.nativeSessionId,
+      runnerInstanceId, completionContractId: first.run.completionContractId, completionContractSha256: first.run.completionContractSha256,
+      startedAt, wakeupRequestId: wake!.id, contextSnapshot: { ...wake!.payload?._paperclipWakeContext as object,
+        issueId: first.issueId, nativeStatusWakeIntentId: wake!.id } }).returning();
+    await db.update(agentWakeupRequests).set({ status: "completed", runId }).where(eq(agentWakeupRequests.id, wake!.id));
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, first.issueId));
+    const port = new PaperclipControlPlanePort(db, { companyId: first.companyId, issueId: first.issueId, agentId: first.agentId,
+      runId, sessionId: run.nativeSessionId!, completionContractId: run.completionContractId!,
+      completionContractSha256: run.completionContractSha256!, sourceInstanceId: runnerInstanceId,
+      controlPlaneSourceInstanceId: "unclaimed-continuation-control" });
+    await port.openRun({ identity: { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, companyId: first.companyId,
+      issueId: first.issueId, agentId: first.agentId, runId, sessionId: run.nativeSessionId! }, backendKind: "mock", sourceInstanceId: runnerInstanceId });
+    return { ...first, run, runId, port, startedAt };
+  }
+
+  it("false-done R1: Pi provider-only task gets one compact same-agent repair and no completion notice", async () => {
+    const f = await unclaimedTask();
+    const parentId = randomUUID();
+    await db.insert(issues).values({ id: parentId, companyId: f.companyId, title: "Parent waiting for hires",
+      status: "in_progress", assigneeAgentId: f.agentId, conversationAgentId: f.agentId,
+      conversationUserId: f.userId, conversationState: "active" });
+    await db.insert(chatTaskHandoffs).values({ taskId: f.issueId, companyId: f.companyId, conversationId: parentId,
+      agentId: f.agentId, sessionGeneration: 0 });
+    await db.update(issues).set({ parentId }).where(eq(issues.id, f.issueId));
+    const { issue, decision, wakes, interactions } = await settleUnclaimed(f);
+    expect(issue!.status).toBe("in_progress");
+    expect(decision).toMatchObject({ reasonCode: "completion_evidence_incomplete", toStatus: "in_progress" });
+    expect(interactions).toEqual([]);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({ agentId: f.agentId, reason: "issue_continuation_needed",
+      payload: { continuationIdempotencyKey: "native-pi-unclaimed" } });
+    const context = { ...wakes[0].payload!._paperclipWakeContext as Record<string, unknown>, previousRunId: f.runId };
+    const executionContinuation = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, context, previousContextRunId: f.runId, summary: null, exposeLowTrustRaw: false });
+    const wakePayload = await buildPaperclipWakePayload({ db, companyId: f.companyId, agentId: f.agentId,
+      contextSnapshot: { ...context, executionContinuation } });
+    expect(wakePayload).toMatchObject({ nativeTaskUnclaimed: true });
+    const prompt = buildNativeContinuationPrompt({ previousRunId: f.runId, issue: issue!, previousIssue: issue!, wakePayload });
+    expect(prompt).toContain("without an accepted completion report");
+    expect(prompt).toContain("continuing the same conversation");
+    expect(prompt).toContain("Do NOT repeat commands, scripts, or other work already done");
+    expect(prompt).toContain("Otherwise finish only what remains, then file your result.");
+    expect(prompt!.length).toBeLessThan(600);
+    const inputArgs: Parameters<typeof buildNativeExecutionInput>[0] = { companyId: f.companyId, agentId: f.agentId,
+      runId: randomUUID(), issue: issue!, taskPrompt: "Original assignment which must not be repeated", provider: "pi_rpc",
+      resumedSession: true, normalizedSessionId: f.run.nativeSessionId!, wakePayload,
+      previousTurn: { runId: f.runId, task: issue! },
+      workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      completionContract: { id: f.run.completionContractId!, sha256: f.run.completionContractSha256!,
+        schemaVersion: "paperclip.completion-contract.v1", contract: { revision: "first-task-native-finish-v1",
+          objective: "Finish the task", criteria: [{ id: "objective", requirement: "Finish the task" }] } },
+      runtimeContext: nativeRuntimeContextFixture() };
+    const prepared = buildNativeExecutionInput(inputArgs);
+    const delivered = buildNativeModelEnvelope(prepared, { resumedSession: true });
+    expect(delivered).toMatchObject({ events: prompt });
+    expect(JSON.stringify(delivered)).not.toContain(inputArgs.taskPrompt);
+    expect(wakes.some(wake => wake.reason === "chat_task_completed" || wake.reason === "issue_children_completed")).toBe(false);
+    expect(await db.select().from(chatCompletionDeliveries).where(eq(chatCompletionDeliveries.taskId, f.issueId))).toEqual([]);
+    console.info("false-done R1 proof", JSON.stringify({ issueId: f.issueId, runId: f.runId, decisionId: decision.id,
+      status: issue!.status, wakeId: wakes[0].id, sessionId: f.run.nativeSessionId, delivered }));
+  });
+
+  it.each([
+    { owner: "executor's lead before creating agent and primary", creator: true, lead: "idle", primary: "other", expected: "lead" },
+    { owner: "executor's lead without creating agent", lead: "idle", expected: "lead" },
+    { owner: "creating agent without lead, before primary", creator: true, primary: "other", expected: "creator" },
+    { owner: "responsible person's primary agent", primary: "other", expected: "primary" },
+    { owner: "responsible person without primary agent", expected: "person" },
+    { owner: "executor created task", creator: true, selfCreated: true, expected: "person" },
+    { owner: "routine responsible person", routine: true, expected: "person" },
+    { owner: "routine executor's lead, not responsible person", routine: true, lead: "idle", expected: "lead" },
+    { owner: "creating agent after self-reporting lead skipped", creator: true, lead: "self", expected: "creator" },
+    { owner: "creating agent after paused lead skipped", creator: true, lead: "paused", expected: "creator" },
+    { owner: "creating agent after terminated lead skipped", creator: true, lead: "terminated", expected: "creator" },
+    { owner: "creating agent after unapproved lead skipped", creator: true, lead: "pending_approval", expected: "creator" },
+    { owner: "primary after paused creating agent skipped, without lead", creator: true, creatorStatus: "paused", primary: "other", expected: "primary" },
+    { owner: "person after paused creator and terminated primary skipped", creator: true, creatorStatus: "paused", primary: "other", primaryStatus: "terminated", expected: "person" },
+    { owner: "primary after terminated creating agent skipped", creator: true, creatorStatus: "terminated", primary: "other", expected: "primary" },
+    { owner: "primary after unapproved creating agent skipped", creator: true, creatorStatus: "pending_approval", primary: "other", expected: "primary" },
+    { owner: "primary after creating agent's reporting cycle skipped", creator: true, creatorStatus: "cycle", primary: "other", expected: "primary" },
+    { owner: "person after paused primary skipped", primary: "other", primaryStatus: "paused", expected: "person" },
+    { owner: "person after unapproved primary skipped", primary: "other", primaryStatus: "pending_approval", expected: "person" },
+    { owner: "person after primary's reporting cycle skipped", primary: "other", primaryStatus: "cycle", expected: "person" },
+    { owner: "responsible person after executor primary skipped", primary: "executor", expected: "person" },
+    { owner: "responsible person after foreign-company primary skipped", primary: "foreign", expected: "person" },
+  ] as const)("false-done R2: second unclaimed stop requests the $owner, never a third executor repair", async (row) => {
+    const { owner } = row;
+    const options = row as { creator?: boolean; creatorStatus?: string; selfCreated?: boolean; routine?: boolean;
+      lead?: string; primary?: string; primaryStatus?: string };
+    const f = await continueUnclaimedTask({ ownerAgent: options.creator, selfCreated: options.selfCreated, routine: options.routine });
+    if (f.ownerAgentId && options.creatorStatus) await db.update(agents).set(options.creatorStatus === "cycle"
+      ? { reportsTo: f.ownerAgentId } : { status: options.creatorStatus }).where(eq(agents.id, f.ownerAgentId));
+    const leadId = options.lead === "self" ? f.agentId : options.lead ? randomUUID() : null;
+    if (leadId && leadId !== f.agentId) await db.insert(agents).values({ id: leadId, companyId: f.companyId,
+      name: "Executor's lead", adapterType: "paperclip_runner", status: options.lead! });
+    if (leadId) await db.update(agents).set({ reportsTo: leadId }).where(eq(agents.id, f.agentId));
+    const primaryId = options.primary === "executor" ? f.agentId : options.primary ? randomUUID() : null;
+    if (primaryId && primaryId !== f.agentId) {
+      const companyId = options.primary === "foreign" ? randomUUID() : f.companyId;
+      if (companyId !== f.companyId) await db.insert(companies).values({ id: companyId, name: "Other company", issuePrefix: `X${companyId.slice(0, 6)}` });
+      await db.insert(agents).values({ id: primaryId, companyId, name: "Responsible person's primary", adapterType: "paperclip_runner",
+        status: options.primaryStatus === "cycle" ? "idle" : options.primaryStatus ?? "idle",
+        reportsTo: options.primaryStatus === "cycle" ? primaryId : null });
+    }
+    if (primaryId) await db.insert(userCompanyPreferences).values({ companyId: f.companyId, userId: f.userId,
+      primaryAgentId: primaryId, primaryAgentInitialized: true });
+    const expectedAgentId = row.expected === "lead" ? leadId : row.expected === "creator" ? f.ownerAgentId
+      : row.expected === "primary" ? primaryId : null;
+    const { issue, decision, wakes, interactions } = await settleUnclaimed(f);
+    expect(issue!.status).toBe("in_review");
+    expect(decision).toMatchObject({ reasonCode: "actionable_attention_pending", toStatus: "in_review" });
+    expect(interactions).toHaveLength(1);
+    const agentOwner = expectedAgentId !== null;
+    if (options.routine) {
+      expect(issue).toMatchObject({ originKind: "routine_execution", createdByAgentId: null, responsibleUserId: f.userId });
+      expect((await db.select().from(routineRuns).where(eq(routineRuns.id, issue!.originRunId!)))[0])
+        .toMatchObject({ linkedIssueId: f.issueId, status: "issue_created", completedAt: null });
+    }
+    expect(interactions[0]).toMatchObject({ kind: "request_confirmation", status: "pending",
+      addresseeAgentId: expectedAgentId, addresseeUserId: agentOwner ? null : f.userId });
+    expect(interactions[0].addresseeAgentId).not.toBe(f.agentId);
+    expect(wakes.filter(wake => wake.status === "queued" && wake.agentId === f.agentId)).toEqual([]);
+    const ownerWakes = wakes.filter(wake => wake.status === "queued");
+    expect(ownerWakes).toHaveLength(agentOwner ? 1 : 0);
+    if (agentOwner) expect(ownerWakes[0]).toMatchObject({ agentId: expectedAgentId, reason: "native_completion_review",
+      payload: { _paperclipWakeContext: { nativeReviewInteractionId: interactions[0].id } } });
+    const effects = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, decision.id));
+    expect(effects.map(effect => effect.effectKind)).toContain("bind_reviewer");
+    if (agentOwner) {
+      expect(effects.map(effect => effect.effectKind)).toContain("notify_owner");
+      expect(effects.find(effect => effect.effectKind === "notify_owner")!.targetId).toBe(ownerWakes[0].id);
+      const [ownerRun] = await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: f.companyId,
+        agentId: expectedAgentId!, status: "queued", runtimeMode: "native", nativeIssueId: f.issueId,
+        wakeupRequestId: ownerWakes[0].id, contextSnapshot: ownerWakes[0].payload!._paperclipWakeContext as Record<string, unknown> }).returning();
+      await db.update(agentWakeupRequests).set({ runId: ownerRun.id }).where(eq(agentWakeupRequests.id, ownerWakes[0].id));
+      await expect(claimQueuedNativeReviewRun(db, { run: ownerRun, agentNameKey: "delegating-owner", claimedAt: new Date(), claimValues: {} }))
+        .resolves.toMatchObject({ id: ownerRun.id, status: "running", agentId: expectedAgentId });
+      console.info("false-done R2 owner started", JSON.stringify({ issueId: f.issueId, executorRunId: f.runId,
+        ownerRunId: ownerRun.id, ownerAgentId: expectedAgentId, interactionId: interactions[0].id, wakeId: ownerWakes[0].id }));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, ownerRun.id));
+    }
+    console.info("false-done R2 proof", JSON.stringify({ owner, executorAgentId: f.agentId, leadId,
+      creatingAgentId: f.ownerAgentId, creatorStatus: options.creatorStatus ?? "idle", primaryId,
+      primaryStatus: options.primaryStatus ?? "idle", expectedAgentId, issueId: f.issueId, runId: f.runId,
+      decisionId: decision.id, status: issue!.status, interactionId: interactions[0].id,
+      addresseeAgentId: interactions[0].addresseeAgentId, addresseeUserId: interactions[0].addresseeUserId,
+      effects: effects.map(effect => ({ kind: effect.effectKind, targetId: effect.targetId })) }));
+  });
+
+  it("false-done human-only review cap commits the existing owner notification when no scoped review wake exists", async () => {
+    const f = await continueUnclaimedTask({ ownerAgent: true });
+    await db.update(companies).set({ interactionResolverGovernance: { request_confirmation: { cap: "human_only" } } })
+      .where(eq(companies.id, f.companyId));
+    const { issue, decision, wakes, interactions } = await settleUnclaimed(f);
+    expect(issue!.status).toBe("in_review");
+    expect(interactions).toEqual([expect.objectContaining({ kind: "request_confirmation", status: "pending",
+      addresseeAgentId: f.ownerAgentId, effectiveResolverPolicy: "human_only" })]);
+    expect(wakes.filter(wake => wake.reason === "native_completion_review")).toEqual([]);
+    const ownerWakes = wakes.filter(wake => wake.status === "queued");
+    expect(ownerWakes).toEqual([expect.objectContaining({ agentId: f.ownerAgentId, reason: "issue_status_changed",
+      idempotencyKey: `native-status:${decision.id}:notify-owner`,
+      payload: expect.objectContaining({ notificationReason: "server_unclaimed_task" }) })]);
+    expect(ownerWakes[0].payload).not.toHaveProperty("nativeReviewDecisionId");
+    expect(ownerWakes[0].payload?._paperclipWakeContext).not.toHaveProperty("nativeReviewInteractionId");
+    const effects = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId, decision.id));
+    expect(effects).toContainEqual(expect.objectContaining({ effectKind: "notify_owner", targetId: ownerWakes[0].id, deliveryState: "delivered" }));
+    expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0])
+      .toMatchObject({ phase: "committed", attempt: 1, failureCode: null, nextAttemptAt: null });
+    console.info("false-done missing-scoped-wake proof", JSON.stringify({ issueId: f.issueId, runId: f.runId,
+      decisionId: decision.id, interactionId: interactions[0].id, effectiveResolverPolicy: interactions[0].effectiveResolverPolicy,
+      ownerWakeId: ownerWakes[0].id, ownerWakeReason: ownerWakes[0].reason, effects }));
+  });
+
+  it.each([false, true])("false-done owner chain falls back to the task's creating person (primary: %s)", async (withPrimary) => {
+    const f = await continueUnclaimedTask({ ownerAgent: true, selfCreated: true });
+    await db.update(issues).set({ responsibleUserId: null, createdByUserId: f.userId }).where(eq(issues.id, f.issueId));
+    const primaryId = withPrimary ? randomUUID() : null;
+    if (primaryId) {
+      await db.insert(agents).values({ id: primaryId, companyId: f.companyId, name: "Creating person's primary",
+        adapterType: "paperclip_runner", status: "idle" });
+      await db.insert(userCompanyPreferences).values({ companyId: f.companyId, userId: f.userId,
+        primaryAgentId: primaryId, primaryAgentInitialized: true });
+    }
+    const { issue, interactions, wakes } = await settleUnclaimed(f);
+    expect(issue!.status).toBe("in_review");
+    expect(interactions).toEqual([expect.objectContaining({ addresseeAgentId: primaryId, addresseeUserId: primaryId ? null : f.userId })]);
+    expect(wakes.filter(wake => wake.status === "queued")).toEqual(primaryId
+      ? [expect.objectContaining({ agentId: primaryId, reason: "native_completion_review" })] : []);
+    console.info("false-done creating-person fallback proof", JSON.stringify({ issueId: f.issueId, runId: f.runId,
+      primaryId, interactionId: interactions[0].id, addresseeAgentId: interactions[0].addresseeAgentId,
+      addresseeUserId: interactions[0].addresseeUserId }));
+  });
+
+  it.each(["no creator", "executor-created", "paused creator"] as const)("false-done missing named owner commits blocked with one board recovery and system warning, no third repair (%s)", async (creator) => {
+    const f = await continueUnclaimedTask({ ownerAgent: creator !== "no creator", selfCreated: creator === "executor-created" });
+    if (creator === "paused creator") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.ownerAgentId!));
+    await db.update(issues).set({ responsibleUserId: null, createdByUserId: null }).where(eq(issues.id, f.issueId));
+    await f.port.completeRun({ result: f.synthetic, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL });
+    let decisionId: string | null = null;
+    for (let replay = 0; replay < 3; replay++) {
+      const finalized = await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      expect(finalized).toMatchObject({ phase: "committed", failureCode: null, nextAttemptAt: null });
+      if (decisionId) expect(finalized.decisionId).toBe(decisionId);
+      decisionId = finalized.decisionId;
+    }
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(issue).toMatchObject({ status: "blocked", executionRunId: null, checkoutRunId: null,
+      unblockDescriptor: { owner: "board", action: "This task stopped twice without filing its result and has no owner to confirm it. Assign an owner or reply here to continue." } });
+    expect(run).toMatchObject({ status: "succeeded", nativePhase: "committed", errorCode: null,
+      resultJson: { finalizationPhase: "committed", failureCode: null, nextAttemptAt: null } });
+    expect(coordinator).toMatchObject({ phase: "committed", attempt: 1, leaseOwner: null, nextAttemptAt: null, failureCode: null });
+    expect(coordinator!.decisionId).toBe(decisionId);
+    expect(comments).toEqual([expect.objectContaining({ authorType: "system", authorAgentId: null, authorUserId: null,
+      createdByRunId: null, clientRequestId: `native-unclaimed-task-owner-missing:${f.runId}`,
+      presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false },
+      body: "This task stopped twice without filing its result and has no owner to confirm it. Assign an owner or reply here to continue." })]);
+    // TaskChatThread hides system-owned recovery metadata. This warning must
+    // remain a visible thread notice, not a hidden recovery diagnostic.
+    expect(comments[0].metadata).toBeNull();
+    expect(comments[0].metadata ?? {}).not.toHaveProperty("recoveryResponsibility");
+    expect(comments[0].metadata ?? {}).not.toHaveProperty("sourceRunId");
+    expect(comments[0].metadata ?? {}).not.toHaveProperty("attachmentPreparation");
+    expect(comments[0].metadata ?? {}).not.toHaveProperty("recovery");
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, f.issueId))).toEqual([]);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(wakes).toEqual([expect.objectContaining({ status: "completed", runId: f.runId,
+      payload: expect.objectContaining({ continuationIdempotencyKey: "native-pi-unclaimed" }) })]);
+    const recovery = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(recovery).toEqual([expect.objectContaining({ kind: "active_run_watchdog", status: "active",
+      ownerType: "board", ownerAgentId: null, ownerUserId: null, cause: "native_unclaimed_task_owner_missing",
+      nextAction: "This task stopped twice without filing its result and has no owner to confirm it. Assign an owner or reply here to continue.",
+      wakePolicy: null, evidence: { runId: f.runId, decisionId } })]);
+    expect((await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId))))
+      .toEqual([expect.objectContaining({ id: decisionId, reasonCode: "native_unclaimed_task_owner_missing", toStatus: "blocked" })]);
+    expect(await db.select().from(statusDecisionEffects).where(and(eq(statusDecisionEffects.decisionId, decisionId!),
+      eq(statusDecisionEffects.effectKind, "record_recovery"))))
+      .toEqual([expect.objectContaining({ targetId: recovery[0].id, deliveryState: "delivered" })]);
+    console.info("false-done missing-owner AFTER row", JSON.stringify({ creator, creatingAgentId: f.ownerAgentId, issueId: f.issueId, runId: f.runId,
+      status: issue!.status, executionRunId: issue!.executionRunId, runStatus: run!.status,
+      coordinator, comments, recovery, wakes: wakes.map(wake => ({ id: wake.id, status: wake.status, runId: wake.runId })) }));
+  });
+
+  it.each([false, true].flatMap(second => ["new queued comment", "older queued comment", "new comment before its wake"]
+    .map(input => ({ second, input }))))("false-done person input wins ($input; repair already used: $second)", async ({ second, input }) => {
+    const f = second ? await continueUnclaimedTask({ ownerAgent: true }) : await unclaimedTask({ ownerAgent: true });
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: f.userId, body: "Actually, do this instead.",
+      createdAt: new Date(f.startedAt.getTime() + (input === "older queued comment" ? -1_000 : 1_000)) }).returning();
+    const personWakes = input === "new comment before its wake" ? [] : await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: f.userId,
+      payload: { issueId: f.issueId, _paperclipWakeContext: { wakeReason: "issue_commented", wakeCommentIds: [comment.id] } } }).returning();
+    const { issue, wakes, interactions } = await settleUnclaimed(f);
+    expect(issue!.status).toBe("in_progress");
+    expect(interactions).toEqual([]);
+    expect(wakes.filter(wake => wake.status !== "completed")).toEqual(personWakes);
+  });
+
+  it.each([false, true])("false-done person's Stop wins (repair already used: %s)", async (second) => {
+    const f = second ? await continueUnclaimedTask({ ownerAgent: true }) : await unclaimedTask({ ownerAgent: true });
+    await db.update(heartbeatRuns).set({ resultJson: { personStop: { requestedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, f.runId));
+    const { issue, wakes, interactions } = await settleUnclaimed(f);
+    expect(issue!.status).toBe("in_progress");
+    expect(interactions).toEqual([]);
+    expect(wakes.filter(wake => wake.status === "queued")).toEqual([]);
+  });
+
+  it.each([false, true].flatMap(second => ["Stop", "comment"].flatMap(person =>
+    (second ? [false, true] : [false]).map(ownerless => ({ second, person, ownerless })))))(
+    "false-done person $person between assessment and commit wins (repair already used: $second; ownerless: $ownerless)", async ({ second, person, ownerless }) => {
+    const f = second ? await continueUnclaimedTask({ ownerAgent: !ownerless }) : await unclaimedTask({ ownerAgent: true });
+    if (ownerless) await db.update(issues).set({ responsibleUserId: null, createdByUserId: null }).where(eq(issues.id, f.issueId));
+    const trigger = `unclaimed_person_${randomUUID().replaceAll("-", "")}`;
+    // PostgreSQL injects the real write after arbitration, before the actual
+    // status transaction. No mocked finalizer/committer or timing sleep.
+    const mutation = person === "Stop"
+      ? `update heartbeat_runs set result_json = coalesce(result_json, '{}'::jsonb) ||
+          jsonb_build_object('personStop', jsonb_build_object('requestedAt', current_timestamp::text)) where id = '${f.runId}';`
+      : `insert into issue_comments (company_id, issue_id, author_type, author_user_id, body, created_at)
+          values ('${f.companyId}', '${f.issueId}', 'user', '${f.userId}', 'A person changed the request.', now() + interval '1 second');`;
+    await db.execute(sql.raw(`create function ${trigger}() returns trigger language plpgsql as $$
+      begin ${mutation} return NEW; end $$`));
+    await db.execute(sql.raw(`create trigger ${trigger} after update on native_run_finalizations for each row
+      when (NEW.run_id = '${f.runId}' and NEW.phase = 'arbitrating' and OLD.phase <> NEW.phase) execute function ${trigger}()`));
+    try {
+      const { issue, wakes, interactions } = await settleUnclaimed(f);
+      expect(issue!.status).toBe("in_progress");
+      expect(interactions).toEqual([]);
+      expect(wakes.filter(wake => wake.status === "queued")).toEqual([]);
+      if (ownerless) {
+        expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+          eq(issueComments.authorType, "system")))).toEqual([]);
+        expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toEqual([]);
+      }
+    } finally {
+      await db.execute(sql.raw(`drop trigger ${trigger} on native_run_finalizations`));
+      await db.execute(sql.raw(`drop function ${trigger}()`));
+    }
+  });
+
+  it("false-done unrelated incomplete-report repair is not a previous unclaimed stop", async () => {
+    const f = await unclaimedTask();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_status_changed", status: "completed", runId: f.runId,
+      payload: { issueId: f.issueId, continuationIdempotencyKey: "native-completion-incomplete" } }).returning();
+    await db.update(heartbeatRuns).set({ wakeupRequestId: wake.id }).where(eq(heartbeatRuns.id, f.runId));
+    const { issue, wakes, interactions } = await settleUnclaimed(f);
+    expect(issue!.status).toBe("in_progress");
+    expect(interactions).toEqual([]);
+    expect(wakes.filter(row => row.status === "queued")).toEqual([expect.objectContaining({
+      reason: "issue_continuation_needed", payload: expect.objectContaining({ continuationIdempotencyKey: "native-pi-unclaimed" }),
+    })]);
+  });
+
+  it.each(["honest Pi claim", "conversation", "codex synthetic"] as const)("false-done control: %s is unchanged", async (control) => {
+    const f = await unclaimedTask({ provider: control === "codex synthetic" ? "codex" : "pi_rpc" });
+    if (control === "conversation") await db.update(issues).set({ conversationAgentId: f.agentId,
+      conversationUserId: f.userId, conversationState: "active" }).where(eq(issues.id, f.issueId));
+    const { issue, wakes, interactions } = await settleUnclaimed(f, control === "honest Pi claim" ? f.result : f.synthetic);
+    expect(issue!.status).toBe(control === "conversation" ? "in_progress" : "done");
+    expect(interactions).toEqual([]);
+    expect(wakes.filter(wake => wake.reason === "issue_continuation_needed")).toEqual([]);
+  });
 
   it("keeps synthetic provider completion open until the requested task document is published", async () => {
     const { companyId, agentId, issueId, runId, port, result } = await prepareFirstTaskCompletion("ordinary task");

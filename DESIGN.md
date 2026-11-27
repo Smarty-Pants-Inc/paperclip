@@ -61,8 +61,10 @@ failed request. A background receipt must not clear or close a later draft.
 
 ## Mobile navigation and text fields
 
-The fixed bottom navigation uses an opaque surface so scrolling content cannot
-show through its labels. On touch devices, editable controls use at least the
+The phone navigation floats above the safe area in a rounded capsule, with
+icons and legible labels. Its token-based translucent surface blurs scrolling
+content where supported; use a solid surface without blur support or when the
+person requests reduced transparency. On touch devices, editable controls use at least the
 16px base typography token to prevent Safari's automatic focus zoom. Larger
 title sizes remain larger.
 
@@ -72,8 +74,8 @@ motion tokens. Keep page padding stable while the navigation moves, and honor
 reduced-motion preferences.
 
 Mobile task conversations size their shell to the visible viewport, with one
-message scroller and a normal flex footer for the composer. Navigation stays at
-the layout viewport bottom, behind the keyboard.
+message scroller and a normal flex footer for the composer. Navigation hides
+while the keyboard is open, including from keyboard focus and screen readers.
 
 Cold task opens reveal the instruction and recent conversation independently of
 recovery, related metadata, and historical run activity. Saved document cards,

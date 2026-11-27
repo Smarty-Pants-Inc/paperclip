@@ -23,6 +23,7 @@ import {
   prepareSandboxManagedRuntime,
   REFERENCED_SOURCE_IGNORE_FAILURE_REASONS,
   resolveReferencedSourceIgnore,
+  sandboxSyncMinimumTimeoutMs,
   type PreparedSandboxManagedRuntime,
   type ReferencedSourceIgnoreResolution,
   type SandboxManagedRuntimeAsset,
@@ -2024,6 +2025,15 @@ describe("sandbox managed runtime", () => {
     const captured: SandboxSyncOperation[] = [];
     attachNativeRecordingSyncIn(client, captured);
 
+    expect(sandboxSyncMinimumTimeoutMs(0)).toBe(60_000);
+    await writeFile(path.join(localWorkspaceDir, "upload.bin"), randomBytes(2 * 1024 ** 2 + 1));
+    const syncIn = client.syncIn!;
+    client.syncIn = async (operations, options) => {
+      const bytes = (await Promise.all(operations.flatMap(op => op.files.map(async file => (await stat(file.sourcePath)).size)))).reduce((sum, size) => sum + size, 0);
+      expect(bytes).toBeGreaterThan(2 * 1024 ** 2);
+      expect(options).toEqual({ minimumTimeoutMs: 60_000 + Math.ceil(bytes / 1024 ** 2) * 1_000 });
+      return syncIn(operations, options);
+    };
     const prepared = await prepareSandboxManagedRuntime(sandboxRuntimeInput(sandboxSpec("sandbox-1", remoteWorkspaceDir), "test-adapter", client, localWorkspaceDir));
 
     // Delegated entirely to syncIn.

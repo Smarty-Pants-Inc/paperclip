@@ -20,7 +20,7 @@ import { workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { readTaskDrain } from "./task-admission.js";
 import { getStartupRecoveryState, startupQueuedRunPassOutstanding } from "../startup-recovery-state.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
-import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
+import { isAgentAwaitingSetup, lifecycleSetupFailure } from "../modules/agent-lifecycle/index.js";
 import { NATIVE_RESPONSE_WAKE_WAITING_REASON } from "./native-runtime/status-arbiter.js";
 import { agentQueueLinesForRuns } from "./heartbeat/queued-run-line.js";
 import { isAcknowledgedLegacyUserStop, runStopPresentationJson } from "./run-cancellation.js";
@@ -57,6 +57,10 @@ const executionRunColumns = {
     'finalizationReasonCode', ${heartbeatRuns.resultJson}->'finalizationReasonCode')`,
 };
 type Run = Pick<typeof heartbeatRuns.$inferSelect, keyof typeof executionRunColumns>;
+type SetupExecutionProjection = ExecutionProjection & {
+  /** Only failed setup of queued, never-started work; bounded public copy. */
+  setupFailure?: Pick<ReturnType<typeof lifecycleSetupFailure>, "code" | "title">;
+};
 type Coordinator = typeof nativeRunFinalizations.$inferSelect;
 type WaitingExternalProvider = "muse" | "openai_dot";
 type Recovery = Pick<
@@ -75,7 +79,7 @@ export async function executionProjectionsForRuns(
   now = new Date(),
   options: { retryDatabaseReads?: boolean } = {},
 ) {
-  const projections = new Map<string, ExecutionProjection>();
+  const projections = new Map<string, SetupExecutionProjection>();
   if (!runIds.length) return projections;
   // Opt in only with a pooled Db outside a transaction. Issue enrichment also
   // calls this helper with a transaction, whose failed reads must not replay.
@@ -203,7 +207,8 @@ export async function executionProjectionsForRuns(
   const setupAgents = setupAgentIds.length ? await read(async () => db
     .select({ id: agents.id, lifecycleState: agents.lifecycleState,
       lifecycleHolds: agents.lifecycleHolds,
-      retryRequired: sql<boolean>`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') = 'true'` })
+      retryRequired: sql<boolean>`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') = 'true'`,
+      failureCode: sql<string | null>`${agents.lifecycleOperation}->>'failureCode'` })
     .from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, setupAgentIds)))) : [];
   const setupByAgent = new Map(setupAgents.map(agent => [agent.id, agent]));
   // Only never-started runs wait on the agent's limit; their place in line is
@@ -324,7 +329,7 @@ export async function executionProjectionForRun(
   companyId: string,
   runId: string,
   now = new Date(),
-): Promise<ExecutionProjection | null> {
+): Promise<SetupExecutionProjection | null> {
   return (
     (await executionProjectionsForRuns(db, companyId, [runId], now)).get(
       runId,
@@ -339,15 +344,15 @@ export function projectExecution(
   now = new Date(),
   waitingForProvider?: WaitingExternalProvider,
   waitingForPredecessor = false,
-  setupAgent?: { lifecycleState: string; lifecycleHolds: readonly string[]; retryRequired?: boolean },
+  setupAgent?: { lifecycleState: string; lifecycleHolds: readonly string[]; retryRequired?: boolean; failureCode?: string | null },
   responseWaitCurrent = false,
   agentQueue?: ExecutionProjection["agentQueue"],
   /** The open task of the same routine that holds the routine's one execution. */
   routineHolder?: string,
-): ExecutionProjection {
+): SetupExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
-  const projection: ExecutionProjection = {
+  const projection: SetupExecutionProjection = {
     // A live run is always stoppable by the board (POST /heartbeat-runs/:id/cancel);
     // a failed native run is stoppable only while its retry is still pending.
     canStop: run.status === "running" || run.status === "queued" || (
@@ -572,9 +577,11 @@ export function projectExecution(
     && isAgentAwaitingSetup(setupAgent)) {
     const needsRepair = setupAgent.retryRequired === true;
     projection.cause = needsRepair ? "agent_setup_failed" : "agent_setup_pending";
-    projection.nextAction = needsRepair
-      ? "Open the agent's Harness / Runtime settings to repair its configuration, then retry verification."
-      : "This turn starts automatically after the agent finishes setup and verification.";
+    if (needsRepair) {
+      const { code, title, nextAction } = lifecycleSetupFailure(setupAgent.failureCode);
+      projection.setupFailure = { code, title };
+      projection.nextAction = nextAction;
+    } else projection.nextAction = "This turn starts automatically after the agent finishes setup and verification.";
     return set("queued", needsRepair ? "Agent setup needs attention" : "Waiting for agent setup");
   }
   if (run.status === "queued" && !run.startedAt && readTaskDrain(now)) {

@@ -21,6 +21,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
+  issueComments,
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
@@ -41,6 +42,7 @@ import { projectTaskInterruption } from "../../../services/task-interruption-pre
 import { reserveRunBudget } from "../../../services/budget-reservations.js";
 import { budgetService, flushBudgetEvaluationWork, recheckAdmittedRunBudgetReadOnly } from "../../../services/budgets.js";
 import { costService } from "../../../services/costs.js";
+import { readExecutionConfigurationRows, assertExecutionConfigurationCurrent } from "../../../services/heartbeat/execution-configuration-fence.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -82,6 +84,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await db.delete(documents);
     await db.delete(issueTreeHolds);
     await db.delete(issueRelations);
+    await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -445,6 +448,116 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       })).toMatchObject({ state: "resolved", canRetry: false });
     }
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("in_progress");
+  });
+
+  async function prepareConfigurationFence(companyId: string, agentId: string, issueId: string) {
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const snapshot = await readExecutionConfigurationRows(db, { companyId, environmentId: null, projectId: null,
+      plainSources: { agentId, agentEnv: null, agentDefaultEnvironmentId: agent.defaultEnvironmentId, issue, liveRoutine: null } });
+    return (transaction: unknown, ownershipIssueId: string | null, lockIssue: () => Promise<void>) =>
+      assertExecutionConfigurationCurrent(transaction as typeof db, snapshot, [], 0, ownershipIssueId, lockIssue);
+  }
+
+  it("v10 a fence cannot silently omit issue validation by ignoring a returned check", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    const fence = await prepareConfigurationFence(companyId, agentId, issueId);
+    await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: { env: { NOTE: "new" } } } }).where(eq(issues.id, issueId));
+    // No returned callback is consumed: the fence itself must reject.
+    await expect(db.transaction(tx => fence(tx, null, async () => {}))).rejects.toThrow("Configuration changed before launch");
+  });
+
+  it("v10 dispatch rejects a configuration fence that skips the issue-lock continuation", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const dispatch = vi.fn(async () => "must not start");
+    await expect(createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+      reservationId: reservation.id, expectedStatus: "running", now: new Date(), enforceContinuationOwnership: false,
+      configurationFence: async () => {}, dispatch })).rejects.toThrow("configuration fence skipped issue validation/locks");
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("v8 paired ownership-turnover dispatch suppresses the predecessor and hands off the successor once without 40P01", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    const predecessorId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    const successorId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    await db.update(issues).set({ executionRunId: predecessorId }).where(eq(issues.id, issueId));
+    const oldReservation = await reserveRunBudget(db, companyId, predecessorId, null);
+    const nextReservation = await reserveRunBudget(db, companyId, successorId, null);
+    const configurationFence = await prepareConfigurationFence(companyId, agentId, issueId);
+    let predecessorReady!: () => void, successorReady!: () => void, release!: () => void;
+    const oldReady = new Promise<void>(resolve => { predecessorReady = resolve; });
+    const nextReady = new Promise<void>(resolve => { successorReady = resolve; });
+    const proceed = new Promise<void>(resolve => { release = resolve; });
+    const oldDispatch = vi.fn(async () => "must not hand off");
+    const nextDispatch = vi.fn(async () => "successor response");
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const predecessor = adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: predecessorId, reservationId: oldReservation.id,
+      expectedStatus: "running", now: new Date(), enforceContinuationOwnership: true,
+      configurationFence: async (...args) => { predecessorReady(); await proceed; return configurationFence(...args); }, dispatch: oldDispatch });
+    void predecessor.catch(() => {});
+    let successor: ReturnType<typeof adapter.dispatchResolvedInteractionIfCurrent<string>> | undefined;
+    try {
+      await Promise.race([oldReady, predecessor]);
+      await db.update(issues).set({ executionRunId: successorId }).where(eq(issues.id, issueId));
+      successor = adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: successorId, reservationId: nextReservation.id,
+        expectedStatus: "running", now: new Date(), enforceContinuationOwnership: true,
+        configurationFence: async (...args) => { successorReady(); await proceed; return configurationFence(...args); }, dispatch: nextDispatch });
+      void successor.catch(() => {});
+      await Promise.race([nextReady, successor]);
+      release();
+      const [oldGate, nextGate] = await Promise.all([predecessor, successor]);
+      expect(oldGate).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_execution_lock_changed" } });
+      expect(nextGate.dispatched).toBe(true);
+      if (nextGate.dispatched) expect(await nextGate.resultPromise).toBe("successor response");
+      expect(oldDispatch).not.toHaveBeenCalled();
+      expect(nextDispatch).toHaveBeenCalledOnce();
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(successorId);
+    } finally { release(); await Promise.allSettled([predecessor, ...(successor ? [successor] : [])]); }
+  });
+
+  it("v8 a person's comment insert commits during an ordinary dispatch's synchronous handoff", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const configurationFence = await prepareConfigurationFence(companyId, agentId, issueId);
+    const transaction = db.transaction.bind(db);
+    let phase = 0, handoff!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { handoff = resolve; });
+    const proceed = new Promise<void>(resolve => { release = resolve; });
+    const holdCommit = vi.spyOn(db, "transaction").mockImplementation((callback, config) => {
+      const current = ++phase;
+      return transaction(async tx => {
+        const value = await callback(tx);
+        if (current === 2) { handoff(); await proceed; }
+        return value;
+      }, config);
+    });
+    const admission = createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+      reservationId: reservation.id, expectedStatus: "running", now: new Date(), enforceContinuationOwnership: false,
+      configurationFence, dispatch: async () => "provider response" });
+    void admission.catch(() => {});
+    try {
+      await Promise.race([entered, admission]);
+      // Independent connection: the FK's KEY SHARE must not wait on an ordinary
+      // launch's issue SHARE. A v7 UPDATE fence makes this real INSERT time out.
+      await transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '1000ms'`);
+        await tx.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "responsible-user", body: "A person's next instruction" });
+      });
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(1);
+      release();
+      const gate = await admission;
+      expect(gate.dispatched).toBe(true);
+      if (gate.dispatched) expect(await gate.resultPromise).toBe("provider response");
+    } finally { release(); await admission.catch(() => {}); holdCommit.mockRestore(); }
   });
 
   it("commits the handoff without awaiting a recovered provider that fails before spawning", async () => {
@@ -966,6 +1079,43 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       allowFinalization();
       await Promise.allSettled([finalization, recovery]);
     }
+  });
+
+  it.each([false, true, undefined])("v9 a fenced recovery dispatch keeps coordinator then issue then run without inversion (ownership=%s)", async enforceContinuationOwnership => {
+    const f = await seedRecoveryAdmission();
+    const fence = await prepareConfigurationFence(f.companyId, f.agentId, f.issueId);
+    let coordinatorLocked!: () => void, allowFinalization!: () => void;
+    const locked = new Promise<void>(resolve => { coordinatorLocked = resolve; });
+    const proceed = new Promise<void>(resolve => { allowFinalization = resolve; });
+    let finalization: Promise<void> | undefined;
+    const dispatch = vi.fn(async () => "recovered response");
+    const admission = createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId, runId: f.runId,
+      reservationId: f.reservation.id, recoveryLeaseOwner: f.owner, expectedStatus: "running", now: new Date(), enforceContinuationOwnership,
+      configurationFence: async (...args) => {
+        // Accounting has committed; exercise the OWNERSHIP phase's real fence.
+        finalization = db.transaction(async tx => {
+          await tx.execute(sql`set local lock_timeout = '2000ms'`);
+          await tx.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+            .where(eq(nativeRunFinalizations.runId, f.runId)).for("update");
+          coordinatorLocked(); await proceed;
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+          await tx.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+        });
+        void finalization.catch(() => {});
+        await Promise.race([locked, finalization]);
+        return fence(...args);
+      }, dispatch });
+    void admission.catch(() => {});
+    try {
+      await Promise.race([locked, admission]);
+      expect(await waitForBlockedForUpdate("native_run_finalizations")).toBe(true);
+      allowFinalization();
+      await finalization;
+      const gate = await admission;
+      expect(gate.dispatched).toBe(true);
+      if (gate.dispatched) expect(await gate.resultPromise).toBe("recovered response");
+      expect(dispatch).toHaveBeenCalledOnce();
+    } finally { allowFinalization(); await Promise.allSettled([admission, ...(finalization ? [finalization] : [])]); }
   });
 
   it.each(["expired", "replaced"] as const)("does not admit recovery under an %s coordinator owner", async ownership => {

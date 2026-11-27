@@ -92,13 +92,13 @@ it.each(["download", "upload"] as const)("preserves a valid large archive when %
 }, 30_000);
 
 it.each([
-  { byteSize: 1024, timeoutMs: undefined },
+  { byteSize: 1024, timeoutMs: 61_000 },
   { byteSize: 64 * 1024 ** 3, timeoutMs: 30 * 60_000 },
-])("keeps the archive deadline bounded for $byteSize bytes", async ({ byteSize, timeoutMs }) => {
+])("bounds plugin archive transfers without a configured timeout for $byteSize bytes", async ({ byteSize, timeoutMs }) => {
   const transfer = vi.fn<NonNullable<CommandManagedRuntimeRunner["syncOut"]>>(async () => {
     throw new Error("Transfer stopped at the budget probe");
   });
-  const remote: RemoteWorkspaceTarget = { kind: "remote", transport: "sandbox", remoteCwd: "/work",
+  const remote: RemoteWorkspaceTarget = { kind: "remote", transport: "sandbox", providerKey: "plugin:fixture", remoteCwd: "/work",
     runner: {
       execute: async () => ({ stdout: JSON.stringify({ layout: "captured", manifestDigest: "a".repeat(64),
         sha256: "b".repeat(64), byteSize, entries: 1 }), stderr: "", exitCode: 0, timedOut: false,
@@ -108,5 +108,4 @@ it.each([
   await expect(captureRemoteWorkspaceArchive({ target: remote, remoteCwd: "/work", operationId: randomUUID() })).rejects.toThrow();
   expect(transfer).toHaveBeenCalledOnce();
   expect(transfer.mock.calls[0]?.[1]?.minimumTimeoutMs).toBe(timeoutMs);
-  if (timeoutMs === undefined) expect(transfer.mock.calls[0]).toHaveLength(1);
 });

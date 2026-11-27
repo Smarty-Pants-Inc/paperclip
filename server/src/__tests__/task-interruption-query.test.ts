@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, approvals, chatActions, chatEndpoints, companies, createDb, applyPendingMigrations, environmentLeases, heartbeatRuns, issueRecoveryActions,
+import { agents, agentWakeupRequests, approvals, chatActions, chatEndpoints, companies, createDb, applyPendingMigrations, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions,
   issueApprovals, issueComments, issueRelations, issues, issueThreadInteractions,
   toolApplications, toolConnections,
   nativeRunFinalizations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
@@ -12,6 +12,8 @@ import { readNativeSessionResumptionAgent } from "../services/native-runtime/nat
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { captureInterruptionQuery, seedInterruptionFixture } from "./helpers/task-interruption-fixture.js";
+import { conversationOwedInputs, hasCommittedIssueDeliveryOwner } from "../services/conversation-owed-input.js";
+import { buildStrandedRecoveryEscalationNotice } from "../services/recovery/stranded-notice.js";
 
 const externalDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_TASK_INTERRUPTION_TEST_DATABASE_URL");
 const support = externalDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -31,6 +33,175 @@ describe.skipIf(!support.supported)("task interruption latest run query", () => 
   // The shared fixture's failures are historical; reporting tests need a current failure.
   const markFailuresFresh = (companyId: string) => db.update(heartbeatRuns).set({ finishedAt: new Date() })
     .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "failed")));
+
+  it("hands an unanswered chat back to Retry after resource-only settlement, but not while delivery is owned", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Owed input", issuePrefix: `O${companyId.slice(0, 7)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Pi", adapterType: "paperclip_runner", status: "error" });
+    const [issue] = await db.insert(issues).values({ companyId, title: "Saved unanswered person message", status: "blocked",
+      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: "person", conversationState: "active",
+      conversationSessionGeneration: 3 }).returning();
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorUserId: "person",
+      authorType: "user", body: "Please continue my saved work", createdAt: new Date(Date.now() - 60_000) }).returning();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issue.id, runtimeMode: "native",
+      scopeKind: "issue", status: "failed", errorCode: "native_predecessor_retirement_unproven", finishedAt: new Date(),
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 3, wakeCommentId: message.id },
+      resultJson: { failureCause: "native_predecessor_retirement_unproven" } });
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issue.id,
+      kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system", returnOwnerAgentId: agentId,
+      cause: "native_session_interrupted", fingerprint: randomUUID(), nextAction: "Saved work recovered.",
+      resolutionNote: "workspace_recovered_by_sibling_action", evidence: { runId,
+        freshContinuationSettlement: {}, freshContinuation: { schema: "paperclip.fresh-continuation.v1" },
+        continuationDelivery: "not_requested" } }).returning();
+    const project = () => taskInterruptionPresentation(db, issue);
+    expect(await project()).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: message.id });
+    const notice = async () => buildStrandedRecoveryEscalationNotice({ recoveryActionId: action.id,
+      recoveryOwner: null, retryOffered: true, continuesAutomatically: await hasCommittedIssueDeliveryOwner(db, companyId, issue.id),
+      sourceRun: { id: runId, status: "failed", errorCode: "reusable_sandbox_resume_failed" } });
+    expect((await notice()).body).toContain("Press Retry to start it again.");
+    expect((await notice()).body).not.toContain("Paperclip tries again automatically.");
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      triggerDetail: "system", reason: "issue_comment", status: "deferred_issue_execution",
+      payload: { issueId: issue.id, queuedCommentIds: [message.id] } }).returning();
+    expect(await project()).toMatchObject({ state: "working", canRetry: false });
+    expect((await project())?.unansweredCommentId).toBeUndefined();
+    expect((await notice()).body).toContain("Paperclip tries again automatically.");
+    await db.update(agentWakeupRequests).set({ status: "failed" }).where(eq(agentWakeupRequests.id, wake.id));
+    expect(await project()).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: message.id });
+    // An operator-waiting ACTIVE resource action with no deadline is not a
+    // delivery owner and must not hide Retry for the saved unanswered input.
+    await db.update(issueRecoveryActions).set({ status: "active", outcome: null, ownerType: "board",
+      nextAction: "Waiting for operator", monitorPolicy: null, wakePolicy: null,
+      evidence: { runId, continuationDelivery: "not_requested" } }).where(eq(issueRecoveryActions.id, action.id));
+    expect(await hasCommittedIssueDeliveryOwner(db, companyId, issue.id)).toBe(false);
+    expect(await project()).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: message.id });
+    // A passive pre-dispatch receipt preserves input, not an automatic start.
+    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", payload: {
+      issueId: issue.id, preDispatchInputOnly: true, _paperclipWakeContext: { wakeCommentIds: [message.id] },
+    } }).where(eq(agentWakeupRequests.id, wake.id));
+    expect(await hasCommittedIssueDeliveryOwner(db, companyId, issue.id)).toBe(false);
+    expect(await project()).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: message.id });
+    await db.update(agentWakeupRequests).set({ status: "failed" }).where(eq(agentWakeupRequests.id, wake.id));
+    await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "restored", ownerType: "system" })
+      .where(eq(issueRecoveryActions.id, action.id));
+    // A valid pending continuation owns delivery even though resource recovery is resolved.
+    await db.update(issueRecoveryActions).set({ evidence: { runId, continuationDelivery: "pending",
+      executionReconciliation: { runId }, freshContinuationSettlement: {} } }).where(eq(issueRecoveryActions.id, action.id));
+    expect(await project()).toMatchObject({ state: "working", canRetry: false });
+    await db.update(issueRecoveryActions).set({ evidence: { runId, continuationDelivery: "delivered" } })
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(await project()).toMatchObject({ state: "failed", canRetry: true });
+    // A successful attempt without a published answer is not an answer receipt.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    expect(await project()).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: message.id });
+    const [answer] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorAgentId: agentId,
+      authorType: "agent", createdByRunId: runId, body: "Here is the answer", createdAt: new Date() }).returning();
+    expect((await conversationOwedInputs(db, companyId, [issue.id])).has(issue.id)).toBe(false);
+    // A late answer to another input does not settle this exact question.
+    await db.update(heartbeatRuns).set({ resultJson: { continuousReplies: {
+      earlier: { questionCommentIds: [randomUUID()], commentId: answer.id } } } }).where(eq(heartbeatRuns.id, runId));
+    expect((await conversationOwedInputs(db, companyId, [issue.id])).has(issue.id)).toBe(true);
+    await db.update(heartbeatRuns).set({ resultJson: { continuousReplies: {
+      exact: { questionCommentIds: [message.id], commentId: answer.id } } } }).where(eq(heartbeatRuns.id, runId));
+    expect((await conversationOwedInputs(db, companyId, [issue.id])).has(issue.id)).toBe(false);
+    // A progress comment is never an answer, even with a succeeded run.
+    await db.update(heartbeatRuns).set({ resultJson: { semanticToolReceipts: {
+      progress: { operationId: "report_progress", result: { commentId: answer.id } } } } }).where(eq(heartbeatRuns.id, runId));
+    expect(await project()).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: message.id });
+    await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, answer.id));
+    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: { cancelledByActorType: "user",
+      cancelledByUserId: "person", nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId,
+        issueId: issue.id, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+        dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack" } } }).where(eq(heartbeatRuns.id, runId));
+    expect(await project()).toMatchObject({ state: "resolved", canRetry: false });
+    // /new boundaries and returned Stop inputs explicitly retire the old obligation.
+    await db.update(issues).set({ conversationBoundaryCommentId: message.id, conversationSessionGeneration: 4 })
+      .where(eq(issues.id, issue.id));
+    expect((await conversationOwedInputs(db, companyId, [issue.id])).has(issue.id)).toBe(false);
+    await db.update(issues).set({ conversationBoundaryCommentId: null, conversationSessionGeneration: 3 })
+      .where(eq(issues.id, issue.id));
+    await db.update(heartbeatRuns).set({ resultJson: { personStop: { returned: [message.id] } } }).where(eq(heartbeatRuns.id, runId));
+    expect((await conversationOwedInputs(db, companyId, [issue.id])).has(issue.id)).toBe(false);
+  });
+
+  it.each(["answered", "returned"] as const)("does not revive an older unmapped input when the newest person comment is %s", async retirement => {
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Newest chat input", issuePrefix: `N${companyId.slice(0, 7)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Pi", adapterType: "paperclip_runner" });
+    const [issue] = await db.insert(issues).values({ companyId, title: "Newest input already settled", status: "in_progress",
+      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: "person", conversationState: "active",
+      conversationSessionGeneration: 3 }).returning();
+    const [older, newest] = await db.insert(issueComments).values([
+      { companyId, issueId: issue.id, authorUserId: "person", authorType: "user", body: "Older unmapped request",
+        createdAt: new Date(Date.now() - 60_000) },
+      { companyId, issueId: issue.id, authorUserId: "person", authorType: "user", body: "Newest request",
+        createdAt: new Date(Date.now() - 30_000) },
+    ]).returning();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issue.id, runtimeMode: "native",
+      scopeKind: "issue", status: "succeeded", finishedAt: new Date(),
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 3, wakeCommentId: newest.id } });
+    expect((await conversationOwedInputs(db, companyId, [issue.id])).get(issue.id)?.commentId).toBe(newest.id);
+    if (retirement === "answered") {
+      const [reply] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorAgentId: agentId,
+        authorType: "agent", createdByRunId: runId, body: "Newest request answered", createdAt: new Date() }).returning();
+      await db.update(heartbeatRuns).set({ resultJson: { continuousReplies: {
+        newest: { questionCommentIds: [newest.id], commentId: reply.id },
+      } } }).where(eq(heartbeatRuns.id, runId));
+    } else {
+      await db.update(heartbeatRuns).set({ resultJson: { personStop: { returned: [newest.id] } } })
+        .where(eq(heartbeatRuns.id, runId));
+    }
+    expect(older.id).not.toBe(newest.id);
+    expect((await conversationOwedInputs(db, companyId, [issue.id])).has(issue.id)).toBe(false);
+    const presentation = await taskInterruptionPresentation(db, issue);
+    expect(presentation?.canRetry ?? false).toBe(false);
+    expect(presentation?.unansweredCommentId).toBeUndefined();
+  });
+
+  it("reads classified stages from the latest failed attempt at the current unanswered input", async () => {
+    const companyId = randomUUID(), agentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Failed input stages", issuePrefix: `F${companyId.slice(0, 7)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Pi", adapterType: "paperclip_runner" });
+    const [issue] = await db.insert(issues).values({ companyId, title: "Unanswered message", status: "blocked",
+      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: "person", conversationState: "active",
+      conversationSessionGeneration: 4 }).returning();
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user",
+      authorUserId: "person", body: "Please do this", createdAt: new Date(Date.now() - 60_000) }).returning();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issue.id,
+      scopeKind: "issue", status: "failed", runtimeMode: "native", errorCode: "native_session_interrupted",
+      error: "Boat returned an invalid private preview URL. https://private.example/secret", finishedAt: new Date(),
+      createdAt: new Date(message.createdAt.getTime() + 1000),
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 4, wakeCommentId: message.id } });
+    let seq = 0;
+    for (const [span, code] of [["runner.ingress.acquire", "agent_machine_unreachable"],
+      ["runner.transport.connect", "agent_machine_unreachable"], ["environment.acquire", "agent_machine_unavailable"],
+      ["environment.resume", "agent_machine_unavailable"]]) {
+      await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: ++seq, eventType: "run.performance.span",
+        payload: { schema: "paperclip.run-performance-span.v1", span, outcome: "failed" } });
+      const projection = await taskInterruptionPresentation(db, issue);
+      expect(projection).toMatchObject({ state: "failed", canRetry: true, unansweredCommentId: message.id, failure: { code } });
+      expect(JSON.stringify(projection)).not.toMatch(/Boat|private\.example/);
+    }
+    await db.update(heartbeatRuns).set({ error: "The previous run's session on this sandbox could not be retired (private id)." })
+      .where(eq(heartbeatRuns.id, runId));
+    expect((await taskInterruptionPresentation(db, issue))?.failure?.code).toBe("previous_session_unconfirmed");
+    await db.update(heartbeatRuns).set({ errorCode: "unmapped_error" }).where(eq(heartbeatRuns.id, runId));
+    expect((await taskInterruptionPresentation(db, issue))?.failure).toEqual({ code: "unmapped_error",
+      title: "The agent's run failed", detail: "This attempt did not finish. Your message is saved." });
+    // A later resource-only success is not an answer, and must not erase the latest failed attempt's cause.
+    await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issue.id, scopeKind: "issue", status: "succeeded",
+      runtimeMode: "native", createdAt: new Date(message.createdAt.getTime() + 2000), finishedAt: new Date(),
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 4 } });
+    expect((await taskInterruptionPresentation(db, issue))?.failure?.code).toBe("unmapped_error");
+    // Newer failures from another session or predating this input do not explain this message.
+    await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issue.id, scopeKind: "issue", status: "failed",
+      runtimeMode: "native", errorCode: "provider_quota", createdAt: new Date(), finishedAt: new Date(),
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 3 } });
+    expect((await taskInterruptionPresentation(db, issue))?.failure?.code).toBe("unmapped_error");
+    await db.update(heartbeatRuns).set({ createdAt: new Date(message.createdAt.getTime() - 1000) }).where(eq(heartbeatRuns.id, runId));
+    expect((await taskInterruptionPresentation(db, issue))?.failure).toBeUndefined();
+  });
 
   it("shows an unresolved question over an older provider failure, until the question resolves", async () => {
     const companyId = randomUUID(), agentId = randomUUID();
@@ -210,7 +381,7 @@ describe.skipIf(!support.supported)("task interruption latest run query", () => 
       payload: { issueId: task.id, taskRetry: { sourceRunId: oldRunId } } }).returning();
     for (const presentation of [await taskInterruptionPresentation(db, task),
       (await taskInterruptionPresentations(db, companyId, [task])).get(task.id)]) {
-      expect(presentation).toMatchObject({ state: "resolved", canRetry: false, intentId: null, observedRunId: newRunId });
+      expect(presentation).toBeNull();
     }
     // Reads do not acknowledge input or retire execution authority.
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, retry.id)))[0]?.status)
@@ -648,7 +819,8 @@ describe.skipIf(!support.supported)("task interruption latest run query", () => 
     }
     expect(result.get(input[2]!.id)?.state).toBe("working");
     expect(result.get(input[3]!.id)?.state).toBe("retry_scheduled");
-    for (const n of [4, 5]) expect(result.get(input[n]!.id)?.state).toBe("resolved");
+    expect(result.get(input[4]!.id)).toBeNull(); // successful work is no interruption
+    expect(result.get(input[5]!.id)?.state).toBe("resolved"); // preserve terminal task/Stop semantics
     for (const n of [6, 8]) expect(result.get(input[n]!.id)?.responsibility).toBe("user");
   });
 

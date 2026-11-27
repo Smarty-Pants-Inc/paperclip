@@ -4,6 +4,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
+import { UNRECOVERED_FILES_NOTICE_KIND } from "@paperclipai/shared";
 import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import type { TaskChatMessageItem } from "./task-chat-model";
 
@@ -123,6 +124,43 @@ describe("TaskChatSystemNotice (PAP-443)", () => {
     flushSync(() => toggleButton().click());
 
     expect(container.querySelector('a[href="/agents/agent-1/runs/run-1"]')).not.toBeNull();
+  });
+
+  it("keeps the unrecovered-files notice visible without a disclosure, even when detailsDefaultOpen is false", () => {
+    const text = "Paperclip could not recover the unsaved files from the previous run: the saved files are no longer available. Files that run did not save or push are not included.";
+    renderNotice({ text, presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false } });
+    expect(container.querySelector('[data-testid="task-chat-system-notice-details"]')?.textContent).toContain(text);
+    expect(toggleButton()).toBeNull();
+  });
+
+  it.each(["files_unrecovered", "recovery_notice", "future_notice", UNRECOVERED_FILES_NOTICE_KIND])(
+    "keeps matching files-not-recovered text open for wire kind %s", kind => {
+      const text = "Paperclip could not recover the unsaved files from the previous run: the saved files are no longer available.";
+      // A newer server can send a kind outside this page's presentation union.
+      renderNotice({ text, presentation: { kind, tone: "warning", detailsDefaultOpen: false } as TaskChatMessageItem["presentation"] });
+      expect(container.querySelector('[data-testid="task-chat-system-notice-details"]')?.textContent).toContain(text);
+      expect(toggleButton()).toBeNull();
+    },
+  );
+
+  it("uses the exported recovery kind even when the server changes the wording", () => {
+    const text = "Some work files could not be brought into the fresh workspace.";
+    renderNotice({ text, presentation: { kind: UNRECOVERED_FILES_NOTICE_KIND, tone: "warning", detailsDefaultOpen: false } as unknown as TaskChatMessageItem["presentation"] });
+    expect(container.querySelector('[data-testid="task-chat-system-notice-details"]')?.textContent).toContain(text);
+    expect(toggleButton()).toBeNull();
+  });
+
+  it("keeps a known message kind's normal disclosure even when its body matches", () => {
+    const text = "Paperclip could not recover the unsaved files from the previous run: quoted text.";
+    renderNotice({ text, presentation: { kind: "message", tone: "neutral", detailsDefaultOpen: false } });
+    expect(toggleButton().getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector('[data-testid="task-chat-system-notice-details"]')).toBeNull();
+    expect(container.textContent).not.toContain("Some files were not recovered");
+  });
+
+  it("does not classify a person's quotation as a recovery notice", () => {
+    renderNotice({ author: "human", text: "Paperclip could not recover the unsaved files from the previous run: quoted text." });
+    expect(toggleButton().getAttribute("aria-expanded")).toBe("false");
   });
 
   it("respects presentation.detailsDefaultOpen", () => {

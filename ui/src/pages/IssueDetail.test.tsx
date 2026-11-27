@@ -62,6 +62,11 @@ import type { issuesApi } from "../api/issues";
 // persistence have their own hook tests; keep their readiness explicit here.
 const coordinatorPreference = vi.hoisted(() => ({ enabled: false, loaded: true }));
 const inlineEditorFixture = vi.hoisted(() => ({ real: false }));
+const taskLiveConnection = vi.hoisted(() => ({ connected: false }));
+vi.mock("../context/LiveUpdatesProvider", async importOriginal => ({
+  ...await importOriginal<typeof import("../context/LiveUpdatesProvider")>(),
+  useTaskRunLiveUpdates: () => taskLiveConnection.connected,
+}));
 // Reads deferred until the page settles start at once in these tests.
 vi.mock("@/hooks/usePageSettled", () => ({ usePageSettled: () => true, PAGE_SETTLED_MAX_WAIT_MS: 0 }));
 vi.mock("../hooks/useCoordinatorWorkspaceEnabled", () => ({
@@ -447,6 +452,7 @@ vi.mock("../components/TaskChatThread", () => ({
     comments?: Array<{ metadata?: { recovery?: DispositionRecoverySnapshot } | null }>;
     workProducts?: IssueWorkProduct[];
     threadHeader?: ReactNode;
+    composerAccessory?: ReactNode;
     onStopRun?: (runId: string) => Promise<void>;
     stopRunLabel?: string;
     onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
@@ -466,6 +472,7 @@ vi.mock("../components/TaskChatThread", () => ({
     return (
       <div data-testid="task-chat-thread">
         {props.threadHeader}
+        {props.composerAccessory}
         Task chat thread
         {props.comments?.map((comment, index) => comment.metadata?.recovery ? <DispositionRecoveryNotice key={index} snapshot={comment.metadata.recovery} /> : null)}
         {props.workProducts?.map((workProduct) => (
@@ -541,6 +548,13 @@ vi.mock("../components/IssueProperties", () => ({
     mockIssuePropertiesRender(props);
     return <div>Properties</div>;
   },
+}));
+
+vi.mock("../components/chat-composer/ChatComposerAccessoryHost", () => ({
+  ChatComposerAccessoryHost: ({ children }: { children: ReactNode }) => <div data-testid="accessory-host">{children}</div>,
+}));
+vi.mock("../components/coordinator/CoordinatorChatTaskTray", () => ({
+  CoordinatorChatTaskTray: ({ onOpenConversationTasks }: { onOpenConversationTasks: () => void }) => <button onClick={onOpenConversationTasks}>Open conversation tasks</button>,
 }));
 
 vi.mock("../components/task-side-panel", () => ({
@@ -1357,6 +1371,7 @@ describe("IssueDetail", () => {
   beforeEach(() => {
     Object.assign(coordinatorPreference, { enabled: false, loaded: true });
     inlineEditorFixture.real = false;
+    taskLiveConnection.connected = false;
     mockTaskPluginPanels.panels = []; mockTaskPluginPanels.isLoading = false;
     localStorage.clear();
     sessionStorage.clear();
@@ -2000,6 +2015,19 @@ describe("IssueDetail", () => {
     expect(mockIssuesApi.listAll).toHaveBeenCalledWith(issue.companyId, { createdFromIssueId: issue.id, includeRoutineExecutions: true });
   });
 
+  it("C31 dormant plumbing adds no wrapper around an ordinary Classic description", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: false, enableClassicTaskInterface: true });
+    const issue = createIssue({ description: "Ordinary Classic description", interruption: null });
+    mockIssuesApi.getCore.mockResolvedValue(issue);
+    mockIssuesApi.get.mockResolvedValue(issue);
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.textContent).toContain(issue.description));
+    const description = [...container.querySelectorAll("div")].find(element => element.textContent === issue.description && element.children.length === 0);
+    expect(description).toBeDefined();
+    expect(description?.parentElement?.matches('[data-testid="issue-detail-header"]')).toBe(true);
+    expect(container.querySelector('[data-testid="task-description-control"]')).toBeNull();
+  });
+
   it("uses Coordinator task presentation and panel scope without changing the Classic preference", async () => {
     coordinatorPreference.enabled = true;
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
@@ -2085,13 +2113,13 @@ describe("IssueDetail", () => {
     expect(mockNavigate).not.toHaveBeenCalled();
     expect(mockIssuesApi.markRead).not.toHaveBeenCalled();
     const [breadcrumbs] = mockSetBreadcrumbs.mock.calls.at(-1)!;
-    expect(breadcrumbs).toEqual([{ label: "Chat" }]);
+    expect(breadcrumbs).toEqual([{ label: "All chats", href: "/chats" }, { label: agent.name }]);
     const updatedAgent = { ...agent, name: "Updated agent" };
     await act(async () => {
       renderIssueView(<TaskDetailSurface conversation={{ agent: updatedAgent, issue: canonical, ensureIssue: async () => canonical }} />);
     });
     await flushReact();
-    expect(mockSetBreadcrumbs.mock.calls.at(-1)![0]).toEqual([{ label: "Chat" }]);
+    expect(mockSetBreadcrumbs.mock.calls.at(-1)![0]).toEqual([{ label: "All chats", href: "/chats" }, { label: updatedAgent.name }]);
 
   });
 
@@ -3592,6 +3620,41 @@ describe("IssueDetail", () => {
     });
   });
 
+  it.each([false, true])("opens a closed conversation Tasks panel from the composer tray (mobile=%s)", async isMobile => {
+    coordinatorPreference.enabled = true;
+    mockSidebarState.isMobile = isMobile;
+    mockPanelState.panelVisible = false;
+    const chat = createIssue({ conversationAgentId: "agent-1", conversationUserId: "user-1", conversationSessionGeneration: 7 });
+    mockIssuesApi.get.mockResolvedValue(chat);
+    mockAgentsApi.list.mockResolvedValue([createAgent()]);
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.textContent).toContain("Open conversation tasks"));
+    expect(document.querySelector('[data-testid="mobile-task-side-panel"]')).toBeNull();
+    const open = () => Array.from(container.querySelectorAll("button")).find(button => button.textContent === "Open conversation tasks")!;
+    await act(() => open().click());
+    const panelProps = () => (isMobile ? mockTaskSidePanelRender.mock.calls.at(-1)?.[0]
+      : mockOpenPanel.mock.calls.at(-1)?.[0]?.props.children?.props) as {
+        conversationTasksOpenRequestId?: number;
+        onConversationTasksOpened: (id: number) => void;
+      };
+    await waitForAssertion(() => expect(panelProps()?.conversationTasksOpenRequestId).toBe(1));
+    if (isMobile) expect(document.querySelector('[data-testid="mobile-task-side-panel"]')).not.toBeNull();
+    else expect(mockSetPanelVisible).toHaveBeenCalledWith(true);
+    await act(() => panelProps().onConversationTasksOpened(1));
+    await waitForAssertion(() => expect(panelProps().conversationTasksOpenRequestId).toBeUndefined());
+    await act(() => open().click());
+    await waitForAssertion(() => expect(panelProps().conversationTasksOpenRequestId).toBe(2));
+    expect(mockLocation.hash).toBe("");
+  });
+
+  it.each([{ coordinator: false, chat: true }, { coordinator: true, chat: false }])("does not mount the tray outside Coordinator chats ($coordinator/$chat)", async ({ coordinator, chat }) => {
+    coordinatorPreference.enabled = coordinator;
+    mockIssuesApi.get.mockResolvedValue(createIssue({ conversationAgentId: chat ? "agent-1" : null }));
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());
+    expect(container.querySelector('[data-testid="accessory-host"]')).toBeNull();
+  });
+
   it("opens Artifacts for existing output without discarding a document deep link", async () => {
     mockLocation.hash = "#document-agents";
     mockIssuesApi.get.mockResolvedValue(createIssue({
@@ -4048,6 +4111,124 @@ describe("IssueDetail", () => {
     expect(issue.executionBlocker?.workspaceRepairRequired).toBe(true);
     expect(container.textContent).not.toContain("Saved files recovered");
     } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("wires the owed-message Retry to the guarded task endpoint rather than resource settlement", async () => {
+    const interruption: NonNullable<Issue["interruption"]> = { intentId: null, responsibility: "system", state: "failed",
+      nextRetryAt: null, canRetry: true, userAction: null, sourceRunIds: ["owed-run"], observedRunId: "owed-run",
+      unansweredCommentId: "owed-message" };
+    const issue = createIssue({ status: "blocked", assigneeAgentId: "agent-1", conversationAgentId: "agent-1",
+      conversationUserId: "chat-owner", conversationState: "active", interruption });
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "chat-owner" } });
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ userId: "chat-owner", source: "session",
+      isInstanceAdmin: false, companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "operator" }] });
+    mockIssuesApi.retryTask.mockResolvedValue({ requestId: "owed-retry", accepted: true, stale: false, presentation: interruption });
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]?.onTryAgainNoLiveExecutionPath)
+      .toEqual(expect.any(Function)));
+    await act(async () => mockIssueChatThreadRender.mock.calls.at(-1)![0].onTryAgainNoLiveExecutionPath());
+    await waitForAssertion(() => expect(mockIssuesApi.retryTask).toHaveBeenCalledExactlyOnceWith(issue.id, {
+      idempotencyKey: expect.any(String), observedRunId: "owed-run",
+    }));
+    expect(mockIssuesApi.resolveRecoveryAction).not.toHaveBeenCalled();
+    expect(mockIssuesApi.update).not.toHaveBeenCalled();
+  });
+
+  it.each(["repair-blocker", "held-queue", "projected-wait", "plain-stop", "empty-queue"] as const)("shows only an actionable recovery hold after a person's Stop: %s", async mode => {
+    coordinatorPreference.enabled = true;
+    queryClient.setQueryData(["issues", "history-expanded", "PAP-1"], false);
+    const message = "Paperclip is recovering saved work before continuing. Your message is saved.";
+    const interruption: NonNullable<Issue["interruption"]> = { intentId: null, responsibility: "system", state: "failed",
+      nextRetryAt: null, canRetry: true, userAction: null, sourceRunIds: ["stopped-run"], observedRunId: "stopped-run",
+      ...(mode === "projected-wait" ? { retryWait: { reason: "workspace_repair_required", message } } : {}) };
+    const issue = createIssue({ status: "blocked", assigneeAgentId: "agent-1", interruption,
+      executionBlocker: mode === "repair-blocker" ? { runId: "stopped-run", cause: "native_continuation_requires_reconciliation",
+        workspaceRepairRequired: true, canRetry: false, nextAction: message } as Issue["executionBlocker"] : null });
+    const held = mode === "repair-blocker" || mode === "held-queue" || mode === "projected-wait";
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockActivityApi.recentRunsForIssue.mockResolvedValue([{ runId: "stopped-run", runtimeMode: "native", status: "cancelled",
+      agentId: "agent-1", errorCode: "cancelled", resultJson: { personStop: { requestedAt: "2026-11-24T20:00:00Z" } },
+      createdAt: new Date().toISOString() }]);
+    const queue = createQueuedCommentQueue({ targetRunId: null,
+      entries: mode === "held-queue" ? createQueuedCommentQueue().entries : [],
+      executionWait: mode === "held-queue" || mode === "empty-queue" ? { reason: "workspace_repair_required", message } : null });
+    mockIssuesApi.getQueuedComments.mockResolvedValue(queue);
+    queryClient.setQueryData(queryKeys.issues.queuedComments(issue.id), queue);
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "operator" } });
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ userId: "operator", source: "session",
+      isInstanceAdmin: false, companyIds: [issue.companyId],
+      memberships: [{ companyId: issue.companyId, status: "active", membershipRole: "operator" }] });
+    mockIssuesApi.retryTask.mockResolvedValue({ requestId: "repair-retry", accepted: true, stale: false, presentation: interruption });
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(mockActivityApi.recentRunsForIssue).toHaveBeenCalled());
+    await flushReact();
+    const notice = container.querySelector('[aria-label="Task status"]');
+    if (!held) {
+      expect(notice).toBeNull();
+      expect(mockIssuesApi.retryTask).not.toHaveBeenCalled();
+      return;
+    }
+    expect(notice?.textContent).toBe(`${message} Press Retry to continue from your saved work.Retry`);
+    // A persisted generic failure elsewhere in the thread must not dedupe
+    // away the current hold or its task-level recovery control.
+    await act(async () => mockIssueChatThreadRender.mock.calls.at(-1)![0].onFailureNoticeChange("stopped-run"));
+    expect(container.querySelector('[aria-label="Task status"]')?.textContent).toBe(`${message} Press Retry to continue from your saved work.Retry`);
+    const retry = notice!.querySelector<HTMLButtonElement>('[data-testid="task-execution-retry"]')!;
+    await act(async () => retry.click());
+    await waitForAssertion(() => expect(mockIssuesApi.retryTask).toHaveBeenCalledExactlyOnceWith(issue.id, {
+      idempotencyKey: expect.any(String), observedRunId: "stopped-run",
+    }));
+    expect(mockIssuesApi.resolveRecoveryAction).not.toHaveBeenCalled();
+    expect(mockIssuesApi.update).not.toHaveBeenCalled();
+  });
+
+  it.each(["working", "failed"] as const)("shows the saved-message recovery hold after an early Stop and fresh reload (%s projection)", async state => {
+    coordinatorPreference.enabled = true;
+    const interruption: NonNullable<Issue["interruption"]> = { intentId: null, responsibility: "system", state,
+      nextRetryAt: null, canRetry: false, userAction: null, sourceRunIds: ["stopped-run"], observedRunId: "stopped-run" };
+    const issue = createIssue({ status: "blocked", assigneeAgentId: "agent-1", interruption,
+      executionBlocker: { recoveryActionId: "recovery-hold", runId: "stopped-run", agentId: "agent-1",
+        cause: "legacy_execution_requires_reconciliation", runStatus: "cancelled", runError: "Execution stopped",
+        canContinue: false, canRetry: false, savedMessageCount: 2,
+        nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated. Inspect the run before sending a new message to request continuation." } });
+    const comments = [createIssueComment({ id: "saved-1", body: "Please continue with my saved request." }),
+      createIssueComment({ id: "saved-2", body: "Is my message still saved?" })];
+    const noticeComment = createIssueComment({ id: "hold-notice", authorType: "system", authorUserId: null,
+      body: "Couldn't answer your message because execution recovery is still holding this task. Your message is saved; press Retry to continue.",
+      presentation: { kind: "system_notice", tone: "warning", title: "Couldn't answer your message", detailsDefaultOpen: false } });
+    const queue = createQueuedCommentQueue({ targetRunId: null,
+      entries: comments.map((comment, position) => ({ comment, position, canEdit: true, canDiscard: true })) });
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockIssuesApi.recentComments.mockResolvedValue({ comments: [...comments, noticeComment], latestCommentId: noticeComment.id, hasMore: false });
+    mockIssuesApi.listComments.mockResolvedValue([...comments, noticeComment]);
+    mockActivityApi.recentRunsForIssue.mockResolvedValue([{ runId: "stopped-run", runtimeMode: "legacy", status: "cancelled",
+      agentId: "agent-1", errorCode: "cancelled", resultJson: { personStop: { requestedAt: "2026-11-27T10:00:00Z" } },
+      createdAt: "2026-11-27T09:59:59Z" }]);
+    mockIssuesApi.getQueuedComments.mockResolvedValue(queue);
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "operator" } });
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ userId: "operator", source: "session", isInstanceAdmin: false,
+      companyIds: [issue.companyId], memberships: [{ companyId: issue.companyId, status: "active", membershipRole: "operator" }] });
+    for (const reload of [false, true]) {
+      if (reload) {
+        await act(async () => root.unmount());
+        queryClient.clear();
+        queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+        root = createTooltipRoot(container);
+      }
+      queryClient.setQueryData(["issues", "history-expanded", "PAP-1"], false);
+      await act(async () => renderIssueView());
+      await waitForAssertion(() => expect(container.querySelector('[aria-label="Task status"]')?.textContent)
+        .toBe("Your 2 messages are saved. This task is on hold after the Stop and can't continue from here yet."));
+      await act(async () => mockIssueChatThreadRender.mock.calls.at(-1)![0].onFailureNoticeChange("stopped-run"));
+      const notice = container.querySelector('[aria-label="Task status"]');
+      expect(notice?.textContent).toBe("Your 2 messages are saved. This task is on hold after the Stop and can't continue from here yet.");
+      expect(notice?.textContent).not.toMatch(/press Retry|send.*new message|Preparing your reply/i);
+      expect(notice?.querySelector("button")).toBeNull();
+      expect(mockIssuesApi.retryTask).not.toHaveBeenCalled();
+      expect(mockHeartbeatsApi.cancel).not.toHaveBeenCalled();
+    }
   });
 
   it("keeps the existing Retry path for exhausted legacy workspace restoration", async () => {
@@ -5422,6 +5603,55 @@ describe("IssueDetail", () => {
       });
     },
   );
+
+  it.each([
+    { liveRun: false, connected: true, hasEntries: false, interval: false as const },
+    { liveRun: false, connected: false, hasEntries: false, interval: false as const },
+    { liveRun: false, connected: true, hasEntries: true, interval: 1000 },
+    { liveRun: false, connected: false, hasEntries: true, interval: 1000 },
+    { liveRun: true, connected: true, hasEntries: false, interval: 30000 },
+    { liveRun: true, connected: false, hasEntries: false, interval: 1000 },
+    { liveRun: true, connected: true, hasEntries: true, interval: 1000 },
+    { liveRun: true, connected: false, hasEntries: true, interval: 1000 },
+  ])("refreshes the queue at $interval ms (liveRun=$liveRun, connection=$connected, entries=$hasEntries)", async ({ liveRun, connected, hasEntries, interval }) => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      taskLiveConnection.connected = connected;
+      mockIssuesApi.get.mockResolvedValue(createIssue({
+        status: liveRun ? "in_progress" : "todo", assigneeAgentId: "agent-1",
+        executionRunId: liveRun ? "run-active-1" : null,
+      }));
+      mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue(liveRun ? [{
+        id: "run-active-1", status: "running", agentId: "agent-1",
+        adapterType: "paperclip_runner", issueId: "issue-1",
+      }] : []);
+      const initialQueue = createQueuedCommentQueue({
+        entries: hasEntries ? createQueuedCommentQueue().entries : [],
+      });
+      const nextQueue = createQueuedCommentQueue({ revision: "next-queue-revision" });
+      mockIssuesApi.getQueuedComments.mockResolvedValueOnce(initialQueue).mockResolvedValue(nextQueue);
+      const queueKey = queryKeys.issues.queuedComments("issue-1");
+      await act(async () => renderIssueView());
+      await waitForAssertion(() => {
+        expect(queryClient.getQueryData<IssueQueuedCommentQueue>(queueKey)?.revision).toBe(initialQueue.revision);
+        expect(mockIssueChatThreadRender).toHaveBeenCalled();
+      });
+
+      // A connected live run still discovers a queue entry when no event arrives,
+      // but neither it nor an idle empty task should make one-second requests.
+      await act(async () => { await vi.advanceTimersByTimeAsync(interval === false ? 30000 : interval - 1); });
+      expect(queryClient.getQueryData<IssueQueuedCommentQueue>(queueKey)?.revision).toBe(initialQueue.revision);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      await waitForAssertion(() => {
+        const expected = interval === false ? initialQueue : nextQueue;
+        expect(queryClient.getQueryData<IssueQueuedCommentQueue>(queueKey)?.revision).toBe(expected.revision);
+        expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0].queuedCommentQueue?.entries ?? [])
+          .toEqual(expected.entries);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("queues messages against a queued live run and interrupts that exact run", async () => {
     const postedComment = createDeferred<IssueComment>();

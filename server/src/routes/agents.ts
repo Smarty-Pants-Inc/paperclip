@@ -1,4 +1,5 @@
 import { resolveLoginEnvironmentTarget } from "../services/login-environment.js";
+import { issueAttentionVisibilityService } from "../services/issue-attention-visibility.js";
 import { checkAgentProtectedEnvironmentKeys } from "../services/protected-environment-keys.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
@@ -13,6 +14,7 @@ import { completeSetupTokenAiConnection } from "../services/setup-token-ai-conne
 import { connectionManagementService, continuingConnectionManagement } from "../services/connection-management.js";
 import { connectionManagementGuard, connectionRequestContext, connectionRequestUserId, aiLoginUserAction } from "./connection-management-authz.js";
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
+import { claimedAdapterType } from "../services/conversation-continuation.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "../services/native-runtime/completed-turn-cleanup.js";
 import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, normalizeClaudeRunnerOptions, type AgentConfigurationWarning, type AgentRunnerChoice } from "@paperclipai/shared";
 import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
@@ -62,6 +64,7 @@ import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaper
 import { applyMcpReasoningEffort } from "../services/public-mcp/agent-config.js";
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { issueRunPresenceService } from "../services/issue-run-presence.js";
+import { runModelColumn } from "../services/heartbeat/run-model.js";
 import { returnStoppedWaitingTaskToTodo } from "../services/heartbeat/stopped-waiting-task.js";
 import { selectDashboardRunIds } from "../services/dashboard-run-selection.js";
 import { Router, type NextFunction, type Request, type Response } from "express";
@@ -71,8 +74,11 @@ import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
-import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { activityLog, agentWakeupRequests, agents as agentsTable, chatConversations, companies, heartbeatRunEvents, heartbeatRuns, issueComments, issues as issuesTable, nativeRunFinalizations, projects as projectsTable } from "@paperclipai/db";
+import { queuedCommentIdsFromWakePayload, withQueuedCommentIdsInWakePayload } from "../lib/queued-comment-context.js";
+import { readFirstTurnQueuedInputReceipt } from "../services/native-runtime/first-turn-queued-input.js";
+import { settleStartupStop as settlePersonStartupStop, returnWakeComments as returnPersonWakeComments } from "../services/person-stop-before-turn.js";
+import { and, desc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
   agentSkillSyncSchema,
@@ -194,6 +200,8 @@ import { redactCurrentUserValue } from "../log-redaction.js";
 import {
   HarnessRuntimeRequestResolutionError,
   parseHarnessRuntimeRequestResolution,
+  resolveClaudeEffort,
+  resolveGrokEffort,
   type HarnessRuntimeRequestKind,
   type HarnessRuntimeRequestResolution,
 } from "../vendor/paperclip-runner/index.js";
@@ -208,6 +216,8 @@ import {
   type NativeRuntimeRequestResolver,
 } from "../services/native-runtime/runtime-request-resolution-authority.js";
 import {
+  getNativeSessionSteeringState,
+  interruptNativeTurn,
   NativeRuntimeRequestResolutionError,
   resolveNativeRuntimeRequest,
 } from "../services/native-runtime/native-session-executor.js";
@@ -218,6 +228,8 @@ import {
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
+import { claudeLocalReasoningEffortsForModel, DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
+import { grokLocalReasoningEffortsForModel, DEFAULT_GROK_LOCAL_MODEL } from "@paperclipai/adapter-grok-local";
 import { createInviteRateLimiter } from "../services/invite-rate-limit.js";
 import {
   SetupTokenSessionService,
@@ -313,12 +325,15 @@ import {
 } from "../services/heartbeat-run-privacy.js";
 import {
   PaperclipRunnerProviderProfileError,
+  piRpcThinking,
+  resolvePaperclipRunnerNativeProviderInput,
   resolvePaperclipRunnerProviderProfile,
   validatePaperclipRunnerDotConfig,
   validatePaperclipRunnerGrokConfig,
 } from "../services/native-runtime/provider-profile.js";
 import { managedAgentProfileService } from "../services/managed-agent-profiles.js";
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
+import { validatePiGatewayModelSelection, validatePiReasoningSelection } from "../adapters/pi-model-selection.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
 
@@ -526,6 +541,7 @@ async function withHireRunLock<T>(key: string, fn: () => Promise<T>): Promise<T>
   }
 }
 
+const personStopHolds = new Set<string>();
 export function agentRoutes(
   db: Db,
   options: {
@@ -2393,6 +2409,93 @@ export function agentRoutes(
     };
   }
 
+  function applyModelCreateDefaults(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown> = {},
+    requestedConfig: Record<string, unknown> = adapterConfig,
+  ): Record<string, unknown> {
+    const codex = adapterType === "codex_local"
+      || (adapterType === "paperclip_runner" && adapterConfig.provider === "codex");
+    const claude = adapterType === "claude_local";
+    if (!codex && !claude) return adapterConfig;
+    const model = requestedConfig.model;
+    // Preserve named models and let admission reject invalid non-string values.
+    if (model != null && (typeof model !== "string" || model.trim())) return adapterConfig;
+    return {
+      ...adapterConfig,
+      model: codex ? "claude-opus-5-5" : DEFAULT_CLAUDE_LOCAL_MODEL,
+    };
+  }
+
+  function applyReasoningCreateDefaults(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown> = {},
+    requestedConfig: Record<string, unknown> = adapterConfig,
+  ): Record<string, unknown> {
+    const native = adapterType === "paperclip_runner";
+    if (native && adapterConfig.provider === "pi_rpc") {
+      const requested = { ...requestedConfig, provider: "pi_rpc" };
+      for (const key of ["piThinkingLevel", "thinking"]) {
+        const value = requestedConfig[key];
+        validatePiReasoningSelection({ adapterType, adapterConfig: { ...requested, piRpcThinkingLevel: value } });
+      }
+      validatePiReasoningSelection({ adapterType, adapterConfig: requested });
+      const level = ["piRpcThinkingLevel", "piThinkingLevel", "thinking", "modelReasoningEffort", "reasoningEffort", "effort"]
+        .map(key => requestedConfig[key]).find(value => value != null && value !== "" && value !== "auto");
+      const { piThinkingLevel, thinking, ...nativeConfig } = adapterConfig;
+      return {
+        ...nativeConfig,
+        piRpcThinkingLevel: piRpcThinking({ ...requested, piRpcThinkingLevel: level }),
+        model: asNonEmptyString(requestedConfig.model) ? requestedConfig.model : "paperclip/claude-opus-5-5",
+      };
+    }
+    const codex = native ? adapterConfig.provider === "codex" : adapterType === "codex_local";
+    const claude = native
+      ? adapterConfig.provider === "acpx" && adapterConfig.acpxAgent === "claude"
+      : adapterType === "claude_local";
+    const grok = native
+      ? adapterConfig.provider === "acpx" && adapterConfig.acpxAgent === "grok"
+      : adapterType === "grok_local";
+    if (!codex && !claude && !grok) return adapterConfig;
+    const ownKey = grok ? "reasoningEffort" : claude && !native ? "effort" : "modelReasoningEffort";
+    const keys = native ? ["modelReasoningEffort", "reasoningEffort", "effort"]
+      : [ownKey, ...["modelReasoningEffort", "reasoningEffort", "effort"].filter(key => key !== ownKey)];
+    let selected: string | undefined;
+    for (const key of keys) {
+      const value = requestedConfig[key];
+      if (value === undefined || value === null || (typeof value === "string" && !value.trim())) continue;
+      const level = typeof value === "string" ? value.trim() : value;
+      if (level === "auto") continue;
+      try {
+        if (codex) {
+          resolvePaperclipRunnerNativeProviderInput({ backend: "codex_app_server", adapterConfig: {
+            provider: "codex", model: adapterConfig.model, modelReasoningEffort: level,
+          } });
+        } else if (claude) {
+          resolveClaudeEffort("claude", level);
+          if (!native && !claudeLocalReasoningEffortsForModel(asNonEmptyString(adapterConfig.model) ?? DEFAULT_CLAUDE_LOCAL_MODEL).includes(level as string)) {
+            throw new Error("Claude reasoning effort is not supported for this model");
+          }
+        } else {
+          resolveGrokEffort("grok", level);
+          if (!native && !grokLocalReasoningEffortsForModel(asNonEmptyString(adapterConfig.model) ?? DEFAULT_GROK_LOCAL_MODEL).includes(level as string)) {
+            throw new Error("Grok reasoning effort is not supported for this model");
+          }
+        }
+      } catch (error) {
+        throw unprocessable(`Invalid reasoning level ${JSON.stringify(value)} (${key}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+      selected ??= level as string;
+    }
+    if (claude && !native && !claudeLocalReasoningEffortsForModel(asNonEmptyString(adapterConfig.model) ?? DEFAULT_CLAUDE_LOCAL_MODEL).includes(selected ?? "medium")) {
+      throw unprocessable("Claude reasoning effort is not supported for this model");
+    }
+    const next = { ...adapterConfig };
+    for (const key of keys) delete next[key];
+    next[ownKey] = selected ?? "medium";
+    return next;
+  }
+
   function applyCreateDefaultsByAdapterType(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
@@ -2702,6 +2805,13 @@ export function agentRoutes(
   const POOL_AUTH_OVERRIDE_ENV_KEYS = [
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "PAPERCLIP_OPENCODE_PROVIDERS", "OPENCODE_AUTH_JSON",
   ] as const;
+
+  async function inheritCallerEnvironment(req: Request, companyId: string, input: { defaultEnvironmentId?: string | null }) {
+    if (input.defaultEnvironmentId !== undefined || req.actor.type !== "agent" || !req.actor.agentId) return;
+    const caller = await svc.getById(req.actor.agentId);
+    if (!caller || caller.companyId !== companyId) throw forbidden("The caller agent is not in this company");
+    input.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
+  }
 
   async function callerUsesAiConnectionPool(req: Request, companyId: string): Promise<boolean> {
     if (req.actor.type !== "agent" || !req.actor.agentId) return false;
@@ -4260,7 +4370,8 @@ export function agentRoutes(
       status: issue.status,
     })));
 
-    res.json(rows.filter((_, index) => decisions[index]?.allowed));
+    const visibleRows = rows.filter((_, index) => decisions[index]?.allowed);
+    res.json(await issueAttentionVisibilityService(db).redactRows(req.actor, req.actor.companyId, visibleRows));
   });
 
   router.get("/agents/:id/identity", async (req, res) => {
@@ -4592,11 +4703,18 @@ export function agentRoutes(
       }
       hireInput.adapterConfig = inheritNativeRunnerAdapterConfig(caller.adapterConfig);
       hireInput.defaultEnvironmentId = caller.defaultEnvironmentId ?? null;
+    } else {
+      await inheritCallerEnvironment(req, companyId, hireInput);
     }
     if (inheritRuntimeFrom === "caller" && hireRunner !== undefined) throw unprocessable("inheritRuntimeFrom=caller cannot be combined with runner");
     let configurationWarnings: AgentConfigurationWarning[] = [];
+    hireInput.adapterConfig = applyModelCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
+    if (hireInput.adapterType === "paperclip_runner" && hireInput.adapterConfig?.provider === "pi_rpc") {
+      hireInput.adapterConfig = applyReasoningCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
+    }
     Object.assign(hireInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...hireInput, runner: hireRunner,
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
+    hireInput.adapterConfig = applyReasoningCreateDefaults(hireInput.adapterType, hireInput.adapterConfig, requestedHireConfig);
     hireInput.adapterType = await assertSelectableAdapterType(hireInput.adapterType, hireInput.adapterConfig, companyId);
     const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
@@ -4927,8 +5045,14 @@ export function agentRoutes(
     assertNoAgentProcessAdapterMutation(req, createInput.adapterType ?? "process", Object.keys(requestedCreateConfig).length > 0);
     assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: createInput.name, adapterConfig: requestedCreateConfig });
     let configurationWarnings: AgentConfigurationWarning[] = [];
+    createInput.adapterConfig = applyModelCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
+    if (createInput.adapterType === "paperclip_runner" && createInput.adapterConfig?.provider === "pi_rpc") {
+      createInput.adapterConfig = applyReasoningCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
+    }
+    await inheritCallerEnvironment(req, companyId, createInput);
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner, setupOnly: Boolean(setupId),
       onConfigurationWarnings: warnings => { configurationWarnings = warnings; } }));
+    createInput.adapterConfig = applyReasoningCreateDefaults(createInput.adapterType, createInput.adapterConfig, requestedCreateConfig);
     createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType, createInput.adapterConfig, companyId);
     const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
@@ -5759,6 +5883,10 @@ export function agentRoutes(
           rawEffectiveAdapterConfig,
         );
       }
+      validatePiReasoningSelection({ adapterType: requestedAdapterType, adapterConfig: rawEffectiveAdapterConfig });
+      await validatePiGatewayModelSelection(db, { ...existing, adapterType: requestedAdapterType,
+        adapterConfig: rawEffectiveAdapterConfig, runtimeConfig: requestedRuntimeConfig ?? existing.runtimeConfig,
+      }, responsibleUserForAiRequest(req));
       const existingRunnerProvider =
         existing.adapterType === "paperclip_runner"
           ? existingAdapterConfig.provider
@@ -6448,6 +6576,7 @@ export function agentRoutes(
         responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,
         actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
         forceFreshSession: req.body.forceFreshSession === true,
+        explicitFreshSession: req.body.forceFreshSession === true,
         ...(req.body.reason === "rerun_with_provider_trace" &&
         req.body.debug?.providerTrace === "raw"
           ? { resumeIntent: true }
@@ -6556,6 +6685,7 @@ export function agentRoutes(
     };
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;
+      contextSnapshot.explicitFreshSession = true;
     }
     if (providerTraceRequested) {
       contextSnapshot.debug = { providerTrace: "raw" };
@@ -7176,15 +7306,24 @@ export function agentRoutes(
   });
 
   router.get("/companies/:companyId/provider-traces", async (req, res) => {
-    assertInstanceAdmin(req);
+    if (req.actor.type !== "agent") assertInstanceAdmin(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (req.actor.type === "agent" && !(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
     const runIds = String(req.query.runIds ?? "")
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean)
       .slice(0, 100);
-    const traces = await providerTraces.listMetadataForRuns(companyId, runIds);
+    let readableRunIds = runIds;
+    if (req.actor.type === "agent") {
+      const decisions = await Promise.all(runIds.map(async (runId) => {
+        const run = await heartbeat.getRunReadAccess(runId);
+        return run?.companyId === companyId && await actorCanReadRun(req, run);
+      }));
+      readableRunIds = runIds.filter((_, index) => decisions[index]);
+    }
+    const traces = await providerTraces.listMetadataForRuns(companyId, readableRunIds);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
@@ -7232,6 +7371,7 @@ export function agentRoutes(
     const columns = {
       id: heartbeatRuns.id,
       runtimeMode: heartbeatRuns.runtimeMode,
+      runModel: runModelColumn,
       companyId: heartbeatRuns.companyId,
       status: heartbeatRuns.status,
       invocationSource: heartbeatRuns.invocationSource,
@@ -7368,7 +7508,110 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
     if (!(await assertRunReadAllowed(req, res, existing))) return;
+    if (personStopHolds.has(runId)) { res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId)); return; }
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
+    const PERSON_STOP_TURN_WAIT_MS = 60_000, stopDeadline = Date.now() + PERSON_STOP_TURN_WAIT_MS, pressedAt = new Date().toISOString();
+    // A person's Stop on a live Pi turn ends that turn only (seam 0233). The run then
+    // finishes through the ordinary door and keeps its session, runner and machine.
+    const provider = asRecord(asRecord(asRecord(existing.runnerProfileJson)?.nativeExecutionInput)?.provider);
+    const preparing = existing.status === "running" && existing.runtimeMode === "legacy" && !existing.runtimeModeResolvedAt && existing.executionStage === "preparing" && claimedAdapterType(existing) === "paperclip_runner" && asRecord(existing.runnerProfileJson)?.nativeExecutionInput == null;
+    const agent = preparing ? await svc.getById(existing.agentId) : null;
+    // Setup may have failed before this request even read the run. Stop still
+    // owns its undelivered input, not its already-recorded terminal status.
+    if (!["running", "queued"].includes(existing.status)) {
+      const settled = await settleStartupStop();
+      if (settled) { res.json(await runRedactions.redactForRun(settled.companyId, runId, settled, getActorInfo(req).actorId)); return; }
+    }
+    if ((existing.status === "running" && existing.runtimeMode === "native" && provider?.kind === "pi_rpc") || (preparing && agent?.adapterType === "paperclip_runner" && agent.adapterConfig?.provider === "pi_rpc")) {
+      // Record before interrupt/dispatch can race Stop; retain it while pre-turn settlement is pending.
+      const mark = (on: boolean) => db.update(heartbeatRuns).set({ resultJson: on
+        ? sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('personStop',
+            ${JSON.stringify({ requestedAt: pressedAt, userId: req.actor.userId ?? null })}::jsonb || coalesce(${heartbeatRuns.resultJson}->'personStop', '{}'::jsonb))`
+        : sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'personStop'` })
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"),
+          ...(on ? [] : [sql`${heartbeatRuns.resultJson}->'startupCancellation' is null`,
+            sql`${heartbeatRuns.resultJson}#>'{personStop,returned}' is null`])));
+      // Seam 0247: his messages still QUEUED behind this run (never delivered) go back to him with the Stop, beside 0237's.
+      const returnQueued = async () => { const issueId = existing.nativeIssueId ?? asRecord(existing.contextSnapshot)?.issueId;
+        if (typeof issueId !== "string" || !req.actor.userId) return;
+        await db.transaction(async (tx) => {
+          await tx.select({ id: issuesTable.id }).from(issuesTable)
+            .where(and(eq(issuesTable.id, issueId), eq(issuesTable.companyId, existing.companyId))).for("no key update");
+          const [run] = await tx.select({ result: heartbeatRuns.resultJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
+          const wakes = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, existing.companyId),
+          eq(agentWakeupRequests.agentId, existing.agentId), inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+          isNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).orderBy(agentWakeupRequests.id).for("update", { skipLocked: true });
+          // A message this run already received (an acknowledged steer) stays in the thread (product rule). One sent after the press is a new message, not returned.
+          const received = Object.keys(asRecord(asRecord(run?.result)?.queuedSteeringAcknowledgements) ?? {}) // stock's first-turn receipt: sealed into its first prompt
+            .concat(readFirstTurnQueuedInputReceipt({ id: runId, contextSnapshot: run?.context })?.commentIds ?? []);
+          const ids = wakes.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)).filter(id => !received.includes(id)), mine = ids.length ? (await tx.select({ id: issueComments.id }).from(issueComments)
+            .where(and(inArray(issueComments.id, ids), eq(issueComments.authorUserId, req.actor.userId!), isNull(issueComments.deletedAt),
+              sql`${issueComments.createdAt} <= coalesce(${asRecord(run?.result?.personStop)?.requestedAt ?? null}, ${pressedAt})::timestamptz`))).map(row => row.id) : [];
+          if (!mine.length) return;
+          for (const wake of wakes) { if (!queuedCommentIdsFromWakePayload(wake.payload).some(id => mine.includes(id))) continue;
+            const left = queuedCommentIdsFromWakePayload(wake.payload).filter(id => !mine.includes(id)), now = new Date();
+            await tx.update(agentWakeupRequests).set(left.length ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, left), updatedAt: now }
+              : { status: "cancelled", finishedAt: now, updatedAt: now }).where(eq(agentWakeupRequests.id, wake.id)); }
+          await tx.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{personStop,returned}', coalesce(${heartbeatRuns.resultJson}->'personStop'->'returned', '[]'::jsonb) || ${JSON.stringify(mine)}::jsonb)` }).where(eq(heartbeatRuns.id, runId)); }); };
+      await mark(true);
+      const outcome = preparing ? "no_turn" : await interruptNativeTurn({ runId, reason: "person_stop" }).catch(() => null);
+      // Attached with no live turn and a result already accepted: the run is finishing, so Stop is a no-op.
+      const [finishing] = outcome === "no_turn" ? await db.select({ resultId: nativeRunFinalizations.resultId })
+        .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)).limit(1) : [];
+      const landed = outcome !== null && outcome !== "no_turn";
+      if (landed) await returnQueued().catch(error => logger.warn({ error, runId }, "person Stop could not return queued messages"));
+      const hasTurn = async () => (await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]))).limit(1)).length > 0;
+      if (outcome === "no_turn" && !finishing?.resultId && !await hasTurn()) {
+        // Before the first provider turn, Stop returns the prompt instead of delivering it.
+        const stoppedBeforeTurn = await settleStartupStop();
+        if (stoppedBeforeTurn) {
+          await returnQueued().catch(error => logger.warn({ error, runId }, "person Stop could not return queued messages"));
+          if (stoppedBeforeTurn.status === "running") await cancelStoppedRun();
+          else {
+            const settled = (await heartbeat.getRun(runId)) ?? stoppedBeforeTurn;
+            res.json(await runRedactions.redactForRun(settled.companyId, runId, settled, getActorInfo(req).actorId));
+          }
+          return;
+        }
+        await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('personStopHeld', coalesce(${heartbeatRuns.resultJson} -> 'personStopHeld', ${JSON.stringify({ pressedAt, userId: req.actor.userId ?? null })}::jsonb))` })
+          .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")));
+        res.status(202).json(await runRedactions.redactForRun(existing.companyId, runId, existing, getActorInfo(req).actorId));
+        if (personStopHolds.has(runId)) return; personStopHolds.add(runId); let why: "turn" | "terminal" | "non_pi" = "turn";
+        void (async () => { for (;;) {
+            const current = await heartbeat.getRun(runId); if (current?.status !== "running") { why = "terminal"; return; }
+            if (current.runtimeMode === "native" && asRecord(asRecord(asRecord(current.runnerProfileJson)?.nativeExecutionInput)?.provider)?.kind !== "pi_rpc") { why = "non_pi"; await cancelStoppedRun(); return; }
+            const state = await getNativeSessionSteeringState(runId);
+            if (state.activeTurnId) { await mark(true);
+              const sent = await interruptNativeTurn({ runId, reason: "person_stop", timeoutMs: 10_000 }).catch(() => null);
+              if (sent && sent !== "no_turn") { await returnQueued().catch(() => undefined); return; }
+              await mark(false);
+            }
+            if (await hasTurn()) return;
+            await new Promise(resolve => setTimeout(resolve, Date.now() >= stopDeadline ? 1_000 : 250));
+        } })().catch(error => logger.warn({ error, runId }, "person Stop turn wait failed")).finally(() => { personStopHolds.delete(runId); logger.info({ runId, why }, "person Stop hold ended"); });
+        return;
+      }
+      if (landed || finishing?.resultId || outcome === "no_turn") {
+        if (!landed) await mark(false); // No pending settlement: an already-finished turn is a no-op.
+        const stopped = (await heartbeat.getRun(runId)) ?? existing;
+        res.json(await runRedactions.redactForRun(stopped.companyId, stopped.id, stopped, getActorInfo(req).actorId));
+        return;
+      }
+    }
+    // Seam 0254: a Stop on a run still waiting in line returns the messages that woke it (never received), like 0247.
+    if (existing.status === "queued") await returnWakeComments(db, existing);
+    await cancelStoppedRun();
+    async function settleStartupStop() {
+      return settlePersonStartupStop(db, existing!, { pressedAt, userId: req.actor.userId ?? null });
+    }
+    async function returnWakeComments(target: Db, run: typeof heartbeatRuns.$inferSelect) {
+      return returnPersonWakeComments(target, run, { pressedAt, userId: req.actor.userId ?? null });
+    }
+    async function cancelStoppedRun() { if (!existing) return;
+    // Re-read under the same ownership locks if setup/runtime selection changed
+    // while Stop was interrupting or waiting. Never cancel first, then try a
+    // receipt write guarded on the old running status.
+    if (existing.status !== "queued") await settleStartupStop();
     // Stamp the cancellation as operator-initiated (this route is board-only).
     // Recovery reads this to stand down instead of classifying the cancelled
     // run as agent stranding and re-waking the agent the operator just stopped.
@@ -7380,7 +7623,7 @@ export function agentRoutes(
       },
     });
 
-    if (run) {
+    if (run && (run.status === "cancelled" || run.resultJson?.executionCancellation)) {
       await logActivity(db, {
         companyId: run.companyId,
         actorType: "user",
@@ -7397,8 +7640,9 @@ export function agentRoutes(
       }
     }
 
-    res.json(run ? await runRedactions.redactForRun(run.companyId, run.id, run,
+    if (!res.headersSent) res.json(run ? await runRedactions.redactForRun(run.companyId, run.id, run,
       getActorInfo(req).actorId) : null);
+    }
   });
 
   router.post(
@@ -7646,7 +7890,7 @@ export function agentRoutes(
   });
 
   router.get("/heartbeat-runs/:runId/provider-trace", async (req, res) => {
-    assertInstanceAdmin(req);
+    if (req.actor.type !== "agent") assertInstanceAdmin(req);
     const runId = readHeartbeatRunId(req);
     const run = await getAccessibleResource(
       req,
@@ -7655,11 +7899,16 @@ export function agentRoutes(
       "Heartbeat run not found",
     );
     if (!run) return;
+    if (req.actor.type === "agent") {
+      if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+      if (!(await assertRunReadAllowed(req, res, run))) return;
+    }
     const inspection = await providerTraces.inspect(run.id, run.companyId);
     await logActivity(db, {
       companyId: run.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "local-admin",
+      actorType: req.actor.type === "agent" ? "agent" : "user",
+      actorId: req.actor.type === "agent" ? getActorInfo(req).actorId : req.actor.userId ?? "local-admin",
+      ...(req.actor.type === "agent" ? { agentId: req.actor.agentId } : {}),
       action: "provider_trace.redacted_viewed",
       entityType: "heartbeat_run",
       entityId: run.id,

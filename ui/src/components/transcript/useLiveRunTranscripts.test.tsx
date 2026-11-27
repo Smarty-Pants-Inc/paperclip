@@ -95,6 +95,119 @@ describe("useLiveRunTranscripts", () => {
     vi.useRealTimers();
   });
 
+  it("re-reads a missing warm-held log on terminal transition and replaces a cancelled read", async () => {
+    vi.useFakeTimers();
+    logMock.mockRejectedValueOnce(new ApiError("Run log not found", 404, { error: "Run log not found" }));
+    let cancelledSignal: AbortSignal | undefined;
+    logMock.mockImplementationOnce((_id, _offset, _limit, { signal }) => {
+      cancelledSignal = signal;
+      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError"))));
+    });
+    logMock.mockResolvedValue({ runId: "run-1", store: "memory", logRef: "log-1", content: "", nextOffset: 217_299 });
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    function Harness({ status, bytes }: { status: string; bytes?: number }) {
+      latest = useLiveRunTranscripts({
+        runs: [{ id: "run-1", status, adapterType: "paperclip_runner", logBytes: bytes }],
+        enableRealtimeUpdates: false,
+        logPollIntervalMs: 0,
+      });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness status="running" />));
+      expect(logMock).toHaveBeenCalledTimes(1);
+      expect(latest.hydratedRunIds.has("run-1")).toBe(true);
+      expect(latest.errorsByRun.size).toBe(0);
+      await act(async () => vi.advanceTimersByTimeAsync(600_000));
+      expect(logMock).toHaveBeenCalledTimes(1);
+      await act(async () => root.render(<Harness status="succeeded" bytes={217_299} />));
+      expect(logMock).toHaveBeenCalledTimes(2);
+      expect(latest.hydratedRunIds.has("run-1")).toBe(true);
+      await act(async () => root.render(<Harness status="succeeded" bytes={217_300} />));
+      expect(cancelledSignal?.aborted).toBe(true);
+      expect(logMock).toHaveBeenCalledTimes(3);
+      expect(latest.hydratedRunIds.has("run-1")).toBe(true);
+      expect(latest.isInitialHydrating).toBe(false);
+      expect(latest.errorsByRun.size).toBe(0);
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it.each([404, 403, 500])("reports a real HTTP %s on a terminal run with saved log bytes", async status => {
+    const error = new ApiError("Saved history unavailable", status, {});
+    logMock.mockRejectedValue(error);
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    function Harness() {
+      latest = useLiveRunTranscripts({ companyId: "company-1", runs: [
+        { id: "run-1", status: "succeeded", adapterType: "paperclip_runner", logBytes: 100_000 },
+      ], logReadLimitBytes: 32_000 });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness />));
+      expect(latest.errorsByRun.get("run-1")).toBe(error);
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it("reports a missing recorded log once its live run becomes terminal", async () => {
+    const error = new ApiError("Run log not found", 404, {});
+    logMock.mockRejectedValue(error);
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    function Harness({ status }: { status: string }) {
+      latest = useLiveRunTranscripts({ companyId: "company-1", runs: [
+        { id: "run-1", status, adapterType: "paperclip_runner", hasStoredOutput: true, logBytes: 100_000 },
+      ], logReadLimitBytes: 32_000 });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness status="running" />));
+      expect(latest.errorsByRun.size).toBe(0);
+      await act(async () => root.render(<Harness status="succeeded" />));
+      expect(latest.errorsByRun.get("run-1")).toBe(error);
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it.each([403, 500])("does not hide HTTP %s on a live run", async status => {
+    const error = new ApiError("History read failed", status, {});
+    logMock.mockRejectedValue(error);
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    function Harness() {
+      latest = useLiveRunTranscripts({ companyId: "company-1", runs: [
+        { id: "run-1", status: "running", adapterType: "paperclip_runner", hasStoredOutput: true },
+      ] });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness />));
+      expect(latest.errorsByRun.get("run-1")).toBe(error);
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it("does not turn a page-cancelled history read into an error", async () => {
+    let latest!: ReturnType<typeof useLiveRunTranscripts>;
+    let signal!: AbortSignal;
+    logMock.mockImplementationOnce((_id, _offset, _limit, options) => {
+      signal = options.signal;
+      return new Promise(() => {});
+    });
+    function Harness({ enabled }: { enabled: boolean }) {
+      latest = useLiveRunTranscripts({ companyId: "company-1", enabled, runs: [
+        { id: "run-1", status: "running", adapterType: "paperclip_runner" },
+      ] });
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      await act(async () => root.render(<Harness enabled />));
+      await act(async () => root.render(<Harness enabled={false} />));
+      expect(signal.aborted).toBe(true);
+      expect(latest.errorsByRun.size).toBe(0);
+    } finally { await act(async () => root.unmount()); }
+  });
+
   it("pauses hidden-tab reads and resumes at the retained log offset", async () => {
     vi.useFakeTimers();
     const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");

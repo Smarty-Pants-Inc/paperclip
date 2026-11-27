@@ -7,6 +7,7 @@ import {
   EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
+import { answeredContinuousHeldRun } from "./native-runtime/continuous-session-input.js";
 import { logActivity } from "./activity-log.js";
 import { taskHistoryReadsForRun } from "./queued-comment-delivery.js";
 import { undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
@@ -406,6 +407,11 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   if (!UNFINISHED_STATUSES.includes(run.status) || !run.finishedAt) return { kind: "not_applicable", reason: "run_not_unfinished" };
   if (!issue.assigneeAgentId || issue.assigneeAgentId !== run.agentId || issue.assigneeUserId
     || ["done", "cancelled"].includes(issue.status)) return { kind: "not_applicable", reason: "task_changed" };
+
+  // A box crash is not a new question. Recheck saved input under the issue
+  // lock before the sweep can create OR restore a continuation action.
+  if (await answeredContinuousHeldRun(tx, { companyId, issueId: issue.id, runId: run.id }))
+    return { kind: "person_owned", reason: "continuous_held_input_already_answered" };
 
   const holds = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issue.id),

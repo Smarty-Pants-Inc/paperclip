@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { hasUnchangedNativeInputRefusal, isNativeInputSizeRefusal } from "../native-input-refusal.js";
 import { and, desc, eq, gte, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
   activityLog,
@@ -15,9 +16,11 @@ import {
   issueThreadInteractions,
   issues,
   nativeRunFinalizations,
+  statusDecisions,
   type Db,
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
+import { hasCommittedNativeBoardResponseWait } from "../native-runtime/native-board-response-wait.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
@@ -221,7 +224,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             r.finished_at as "finishedAt", r.scheduled_retry_at as "scheduledRetryAt",
             r.controller_boot_id as "controllerBootId", r.controller_lease_expires_at as "controllerLeaseExpiresAt",
             r.controller_process as "controllerProcess",
-            jsonb_build_object('cancelledByActorType', r.result_json->'cancelledByActorType') as "resultJson"
+            jsonb_build_object('cancelledByActorType', r.result_json->'cancelledByActorType', 'personStop', r.result_json->'personStop') as "resultJson"
           from heartbeat_runs r
           where r.company_id = ${companyId} and (r.context_snapshot->>'issueId') = requested.id
           order by r.created_at desc limit 1
@@ -390,6 +393,19 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const childCounts = counts(childRows.map(row => ({ issueId: row.parentId, count: row.count })));
     const onboardingIds = new Set(onboardingRows.map(row => row.id));
     const latestByIssue = new Map(rowsOf<RunRow>(latestRuns).map(row => [row.issueId, row]));
+    const succeededRunIds = rowsOf<RunRow>(latestRuns).filter(run => run.status === "succeeded").map(run => run.id);
+    // Batch only the cheap candidate check; the exact receipt helper remains authoritative.
+    const boardWaitRunIds = new Set((succeededRunIds.length ? await database.select({ runId: nativeRunFinalizations.runId })
+      .from(nativeRunFinalizations).innerJoin(statusDecisions, and(
+        eq(statusDecisions.id, nativeRunFinalizations.decisionId),
+        eq(statusDecisions.assessmentId, nativeRunFinalizations.assessmentId),
+        eq(statusDecisions.companyId, nativeRunFinalizations.companyId),
+        eq(statusDecisions.issueId, nativeRunFinalizations.issueId),
+        eq(statusDecisions.runId, nativeRunFinalizations.runId),
+        eq(statusDecisions.applicationState, "applied"),
+        inArray(statusDecisions.reasonCode, ["board_response_waiting", "board_response_wait_superseded"])))
+      .where(and(eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, succeededRunIds),
+        eq(nativeRunFinalizations.phase, "committed"))) : []).map(row => row.runId));
     const blockActivityByIssue = new Map(rowsOf<{ issueId: string; actorType: string; actorId: string; agentId: string | null; details: unknown }>(blockActivity)
       .map(row => [row.issueId, row]));
 
@@ -435,12 +451,20 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         activeRuns: ownedRuns,
         latestRun: latest ? {
           id: latest.id, status: latest.status, errorCode: latest.errorCode, finishedAt: latestFinishedAt,
+          boardResponseWaiting: boardWaitRunIds.has(latest.id) && issue.status === "in_progress" && latest.status === "succeeded"
+            && latest.agentId === issue.assigneeAgentId && await hasCommittedNativeBoardResponseWait(database, {
+              companyId, issueId: issue.id, runId: latest.id, agentId: latest.agentId,
+            }),
           settlingUntil: latest.runtimeMode === "legacy" && latest.controllerBootId && leaseUntil
             && !NON_TERMINAL_RUN_STATUSES.includes(latest.status) ? leaseUntil : null,
           operatorStopped: latest.agentId === issue.assigneeAgentId && (
             [CHAT_CONTROL_RECOVERY_STOP_CODE, CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE, "operator_interrupted"].includes(latest.errorCode ?? "")
-            || (latest.status === "cancelled" && ["user", "board"].includes(String(json(latest.resultJson).cancelledByActorType)))),
+            || (latest.status === "cancelled" && ["user", "board"].includes(String(json(latest.resultJson).cancelledByActorType)))
+            // Seam 0260: a person's Stop that ended the turn (0233, run succeeded) is the person's move too.
+            || (latest.status === "succeeded" && json(latest.resultJson).personStop != null)),
         } : null,
+        inputChangeRequired: isNativeInputSizeRefusal(latest?.errorCode)
+          && await hasUnchangedNativeInputRefusal(database, { companyId, issueId: issue.id }),
         pendingWakes: (wakeCounts.get(issue.id) ?? 0) + (chatWakeIds.has(issue.id) ? 1 : 0),
         nativeRecoveryPending: nativeIds.has(issue.id),
         pendingHandoff: handoffIds.has(issue.id),
@@ -678,6 +702,13 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       if (claimed.restoredTo && fresh.kind === "exact_recovery_pending") await revertRestoredBlock(issue, claimed);
       await settleContinuationActivity(claimed, claimed.reason, "not_started", { waitingUntil: fresh.retryAt.toISOString() });
       return { verdict: claimed.verdict, outcome: fresh.kind === "backoff" ? "deferred_cap" : "waiting_on_recovery", retryAt: fresh.retryAt };
+    }
+    // The continuation owner checked this under the issue lock. Do not turn
+    // its answered-held verdict into a generic empty-input fallback wake.
+    if (fresh?.kind === "person_owned" && fresh.reason === "continuous_held_input_already_answered") {
+      if (claimed.restoredTo) await revertRestoredBlock(issue, claimed);
+      await settleContinuationActivity(claimed, claimed.reason, "not_started", { waitingFor: fresh.reason });
+      return { verdict: claimed.verdict, outcome: "left_person_work", retryAt: null };
     }
     const slot = facts.latestRun
       ? await reserveAutomaticRunCreation(db, issue.companyId, { issueId: issue.id, sourceRunId: facts.latestRun.id }) : null;

@@ -1090,12 +1090,14 @@ describe("executeNativeSession recovery", () => {
       async *events() {
         yield runnerEvent(1, "turn.failed", { status: "failed", error: failure });
         if (!startTurn.mock.calls.length) return;
+        // Visible progress must not close the stock disposition-only door.
+        yield { ...runnerEvent(2, "item.delta", { kind: "agentMessage", text: "Checking the background command." }), turnId: "turn-continuation" };
         // The agent ends the continuation saying it will wait for a
         // background command, without paperclip_finish.
         continuationDone = true;
-        yield { ...runnerEvent(2, "turn.completed", { status: "completed", error: null }), turnId: "turn-continuation" };
+        yield { ...runnerEvent(3, "turn.completed", { status: "completed", error: null }), turnId: "turn-continuation" };
         if (startTurn.mock.calls.length < 2) return;
-        yield { ...runnerEvent(3, "turn.completed", { status: "completed", error: null }), turnId: "turn-disposition" };
+        yield { ...runnerEvent(4, "turn.completed", { status: "completed", error: null }), turnId: "turn-disposition" };
       },
       startTurn,
       async result() { return startTurn.mock.calls.length >= 2 ? { result, terminal, turnId: "turn-disposition" } : null; },
@@ -6594,6 +6596,7 @@ describe("executeNativeSession recovery", () => {
         commandDigest: qualified.commandDigest,
       } },
     } : input;
+    const dynamicTools = [{ name: "call_api", description: "Current run API.", inputSchema: { type: "object" } }];
     const attachmentFailure = new Error("provider attachment failed");
     const openRun = vi.fn(async () => undefined);
     let retainedIdentity = { ...identity, runId: "run-previous" };
@@ -6664,14 +6667,15 @@ describe("executeNativeSession recovery", () => {
         runnerInstanceId: "runner-recovery",
         controlPlaneInstanceId: "control-recovery",
         existingSession,
+        dynamicTools,
         onSession,
       }),
     ).rejects.toBe(attachmentFailure);
     // The attaching run's own contract travels with the attachment.
     const completionContract = { revision: "1", criterionIds: ["objective"] };
     expect(attachRun).toHaveBeenCalledWith(provider === "copilot"
-      ? { identity, completionContract, currentRunGrant: { runtimeContext: null, instructions: expect.any(String) } }
-      : { identity, completionContract });
+      ? { identity, dynamicTools, completionContract, currentRunGrant: { runtimeContext: null, instructions: expect.any(String) } }
+      : { identity, dynamicTools, completionContract });
     expect(retainedIdentity).toEqual(identity);
     expect(onSession).toHaveBeenCalledOnce();
     expect(onSession).toHaveBeenCalledWith(null);
@@ -8466,6 +8470,62 @@ describe("executeNativeSession recovery", () => {
       replacementDriverSessionId: "driver-replacement",
       replacementProviderSessionId: "provider-replacement",
     });
+  });
+
+  it.each([false, true].flatMap(prepared => [
+    { prepared, name: "held Pi conversation", provider: { kind: "pi_rpc" as const, model: "fixture-model", conversationMode: true as const }, fenced: true },
+    { prepared, name: "continuous Pi task (omitted default)", provider: { kind: "pi_rpc" as const, model: "fixture-model" }, fenced: true },
+    { prepared, name: "continuous Pi task (explicit)", provider: { kind: "pi_rpc" as const, model: "fixture-model", sessionContinuity: "continuous" as const }, fenced: true },
+    { prepared, name: "paperclip Pi task", provider: { kind: "pi_rpc" as const, model: "fixture-model", sessionContinuity: "paperclip" as const }, fenced: false },
+    { prepared, name: "paperclip Pi conversation", provider: { kind: "pi_rpc" as const, model: "fixture-model", conversationMode: true as const, sessionContinuity: "paperclip" as const }, fenced: false },
+    { prepared, name: "stock non-Pi task", provider: prepared ? preparedInput().provider : input.provider, fenced: false },
+  ]))("uses the original-input recovery fence after provider output without a terminal ($name; prepared: $prepared)", async ({ prepared, provider, fenced }) => {
+    const executionInput = structuredClone(prepared ? preparedInput() : input);
+    if (provider.kind === "pi_rpc") {
+      executionInput.provider = provider;
+      executionInput.session.driverKind = "pi_rpc";
+    }
+    const checkpoint: PersistedNativeSession = {
+      backendKind: "mock", driverKind: executionInput.session.driverKind, sessionId: "driver-held", identity,
+      providerSessionId: "provider-held", cursor: "1", activeTurnId: null,
+      terminalTurns: [], pendingRuntimeRequests: [], lineage: [],
+    };
+    const startTurn = vi.fn<NativeSession["startTurn"]>(async () => ({ turnId: "must-not-resubmit" }));
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+      async *events() {},
+      startTurn,
+      async result() { return null; },
+      async snapshot() { return structuredClone(checkpoint); },
+      async close() {},
+    };
+    const output = runnerEvent(1, "item.delta", { kind: "agentMessage", text: "Already answering the held input" });
+    const failure = await executeNativeSession({
+      input: executionInput,
+      backend: {
+        async descriptor() { return { kind: "mock", name: "held-replay-fence", version: "1", runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" }, capabilities: await session.capabilities() }; },
+        async openSession() { throw new Error("must retain the held session"); },
+        async recoverSession() { return { recovered: true, session }; },
+      },
+      controlPlane: {
+        async openRun() {}, async checkpointSession() {}, async completeRun() {},
+        async appendEvent(event: PrpEvent) { return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+        async replayEvents(query) { return { events: query.afterSourceSeq < 1 ? [output] : [], highestContiguousSourceSeq: 1 }; },
+      },
+      persistedSession: checkpoint,
+      runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+    }).then(() => null, (error: unknown) => error);
+    if (fenced) {
+      expect(startTurn).not.toHaveBeenCalled();
+    } else {
+      expect(startTurn).toHaveBeenCalledOnce();
+      const envelope = JSON.parse(startTurn.mock.calls[0]![0].message.text);
+      expect(envelope.task.prompt).toBe(executionInput.task.prompt);
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(fenced
+      ? "native_provider_output_without_result" : "native event stream closed before a turn terminal fact");
   });
 
   it.each([false, true])("only replays the original ACPX envelope for a proven effect-free initial turn (prepared: %s)", async (prepared) => {

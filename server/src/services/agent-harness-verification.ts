@@ -66,7 +66,12 @@ export function assertHarnessTestPassed(result: AdapterEnvironmentTestResult) {
       : has("_hello_probe_timed_out") ? "harness_probe_timed_out"
       : has("_hello_probe_unexpected_output") ? "harness_probe_unexpected_output"
       : "harness_test_failed";
-    throw Object.assign(new Error("The harness test failed"), { code });
+    // Only native Codex checks have already passed through redactNativeProbeMessage.
+    const nativeCheck = result.adapterType === "paperclip_runner"
+      ? result.checks.find(check => check.level === "error" && /^codex_hello_probe_/.test(check.code)) : undefined;
+    const redactedNativeProbeReason = nativeCheck?.message.split(/[\r\n\u2028\u2029]/u, 1)[0];
+    throw Object.assign(new Error("The harness test failed"), { code,
+      ...(redactedNativeProbeReason ? { redactedNativeProbeReason } : {}) });
   }
 }
 

@@ -1,4 +1,9 @@
 import type { Issue } from "@paperclipai/shared";
+import { taskStatusIconProps, type TaskStatusPresentationInput } from "./task-status-presentation";
+
+type TaskStatusEvidence = Pick<Issue, "externalConversationState" | "unblockDescriptor" | "blockedInboxAttention" | "interruption">
+  & Pick<TaskStatusPresentationInput, "actionRequired">;
+type TaskRevision = { updatedAt?: Date | string };
 import { TASK_VIEW_PARAM, normalizeTaskViewKey, taskView } from "./task-views";
 
 type IssueDetailSource = "issues" | "inbox";
@@ -8,7 +13,7 @@ type IssueDetailBreadcrumb = {
   href: string;
 };
 
-export type IssueDetailHeaderSeed = {
+export type IssueDetailHeaderSeed = TaskStatusEvidence & TaskRevision & {
   id: string;
   identifier: string | null;
   title: string;
@@ -22,7 +27,7 @@ export type IssueDetailHeaderSeed = {
   originId?: string | null;
 };
 
-type IssueDetailHeaderSeedSource = Pick<Issue, "id" | "title"> & {
+type IssueDetailHeaderSeedSource = Pick<Issue, "id" | "title"> & TaskStatusEvidence & TaskRevision & {
   identifier?: string | null;
   status: string;
   displayStatus?: Issue["displayStatus"];
@@ -81,7 +86,9 @@ function isIssueDetailHeaderSeed(value: unknown): value is IssueDetailHeaderSeed
 
 function createIssueDetailHeaderSeed(issue: IssueDetailHeaderSeedSource): IssueDetailHeaderSeed {
   return {
+    ...taskStatusIconProps(issue),
     id: issue.id,
+    updatedAt: issue.updatedAt,
     identifier: issue.identifier ?? null,
     title: issue.title,
     status: issue.status,
@@ -93,6 +100,22 @@ function createIssueDetailHeaderSeed(issue: IssueDetailHeaderSeedSource): IssueD
     originKind: issue.originKind,
     originId: issue.originId ?? null,
   };
+}
+
+/** A navigation seed may fill a sparse read only at the same task revision.
+ * Identity/status alone do not prove freshness. Current fields, including null,
+ * always win; missing or changed revisions discard all seeded status evidence. */
+export function resolveIssueDetailStatusSource(
+  issue: (TaskStatusPresentationInput & TaskRevision) | null | undefined,
+  seed: IssueDetailHeaderSeed | null,
+): TaskStatusPresentationInput | null {
+  if (!issue) return seed;
+  const revision = issue.updatedAt == null ? NaN : new Date(issue.updatedAt).getTime();
+  const seedRevision = seed?.updatedAt == null ? NaN : new Date(seed.updatedAt).getTime();
+  return seed && seed.id === issue.id && seed.status === issue.status
+    && Number.isFinite(revision) && revision === seedRevision
+    ? { ...seed, ...issue }
+    : issue;
 }
 
 export function withIssueDetailHeaderSeed(state: unknown, issue: IssueDetailHeaderSeedSource): IssueDetailLocationState {

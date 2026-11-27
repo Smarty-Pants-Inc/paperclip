@@ -344,7 +344,7 @@ describe("IssueLinkQuicklook", () => {
     const card = openCard(renderQuicklook({ status: "in_review" }));
 
     const glyph = card?.querySelector('[role="img"]');
-    expect(glyph?.getAttribute("aria-label")).toBe("In review");
+    expect(glyph?.getAttribute("aria-label")).toBe("In Review");
 
     // The status must reach a screen reader but occupy no visible text. Drop
     // the glyph (whose <title> counts toward textContent) and the word is gone.

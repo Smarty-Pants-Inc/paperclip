@@ -1,21 +1,100 @@
+.composer-run-settings-stacked > button {
+  min-height: calc(var(--spacing) * 11);
+}
+
+.composer-run-settings-stacked-trigger {
+  height: calc(var(--spacing) * 11);
+  width: max-content;
+  min-width: calc(var(--spacing) * 28);
+  max-width: calc(var(--spacing) * 32);
+}
+
+.composer-run-settings-model-label {
+  font-size: var(--text-xs);
+  line-height: calc(var(--spacing) * 4);
+}
+
+.composer-run-settings-level-label {
+  font-size: var(--text-micro);
+  line-height: calc(var(--spacing) * 3.75);
+}
+
+/* Native range geometry: the rail and marks share the thumb's center-to-center
+   travel, not the full input width. The input itself is the 52pt touch target. */
+.composer-run-effort-control {
+  position: relative;
+  height: calc(var(--spacing) * 13);
+}
+
+.composer-run-effort-rail,
+.composer-run-effort-marks {
+  position: absolute;
+  inset-inline: calc(var(--composer-effort-thumb-size) / 2);
+  top: 50%;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.composer-run-effort-rail {
+  height: calc(var(--spacing) * 1.5);
+  border-radius: var(--radius-4xl);
+  background: linear-gradient(to right, var(--foreground) var(--fill), var(--muted) var(--fill));
+}
+
+.composer-run-effort-marks {
+  display: flex;
+  justify-content: space-between;
+}
+
+.composer-run-effort-marks > span {
+  width: var(--spacing);
+  height: var(--spacing);
+  margin-inline: calc(var(--spacing) * -0.5);
+  border-radius: 50%;
+  background: var(--muted-foreground);
+}
+
+/* Invert filled marks against the foreground rail, in either theme. */
+.composer-run-effort-marks > span[data-selected="true"] { background: var(--background); }
+
 .composer-run-effort-range {
+  position: relative;
   display: block;
   appearance: none;
-  height: var(--composer-effort-track-height);
-  border-radius: var(--radius-4xl);
-  background: linear-gradient(to right, var(--tc-mode-ask) var(--fill), var(--muted) var(--fill));
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: transparent;
   cursor: pointer;
-  /* Native input outlines cross the thumb because the input is track-height. */
+  touch-action: none;
+  border-radius: var(--radius-md);
   outline: none;
+}
+
+.composer-run-effort-range::-webkit-slider-runnable-track {
+  height: calc(var(--spacing) * 1.5);
+  background: transparent;
+}
+
+.composer-run-effort-range::-moz-range-track {
+  height: calc(var(--spacing) * 1.5);
+  background: transparent;
+}
+
+.composer-run-effort-range:focus-visible {
+  outline: calc(var(--spacing) * 0.5) solid var(--ring);
+  outline-offset: calc(var(--spacing) * 0.5);
 }
 
 .composer-run-effort-range::-webkit-slider-thumb {
   appearance: none;
+  margin-top: calc((var(--spacing) * 1.5 - var(--composer-effort-thumb-size)) / 2);
   width: var(--composer-effort-thumb-size);
   height: var(--composer-effort-thumb-size);
   border: 0;
   border-radius: 50%;
-  background: var(--tc-mode-ask);
+  background: var(--foreground);
   box-shadow: var(--shadow-sm);
   transition: transform var(--motion-duration-fast) var(--motion-ease-out), box-shadow var(--motion-duration-fast) var(--motion-ease-out);
 }
@@ -25,7 +104,7 @@
   height: var(--composer-effort-thumb-size);
   border: 0;
   border-radius: 50%;
-  background: var(--tc-mode-ask);
+  background: var(--foreground);
   box-shadow: var(--shadow-sm);
   transition: transform var(--motion-duration-fast) var(--motion-ease-out), box-shadow var(--motion-duration-fast) var(--motion-ease-out);
 }

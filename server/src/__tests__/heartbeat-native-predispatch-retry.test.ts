@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { agentRoutes } from "../routes/agents.js";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/index.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
-import { activityLog, agents, authUsers, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns, issueComments,
+import { activityLog, agents, agentWakeupRequests, authUsers, companyMemberships, createDb, environmentLeases, environments, heartbeatRuns, heartbeatRunEvents, nativeRunFinalizations, issueComments,
   issueRecoveryActions, issueRelations, issues } from "@paperclipai/db";
 import { NativePredecessorRetirementUnprovenError } from "../services/native-runtime/predecessor-retirement.js";
 import { NativeProviderArtifactTransferTimeoutError } from "../services/native-runtime/native-provider-artifacts.js";
@@ -14,6 +20,7 @@ import { describe, expect, it, vi } from "vitest";
 import { logger } from "../middleware/logger.js";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { environmentService } from "../services/environments.js";
 import { closeIdleWarmNativeSessionsForRestart, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
 import { nativeRestartFixture, waitForCondition } from "./helpers/native-restart-fixture.js";
 import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.js";
@@ -21,7 +28,8 @@ import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.
 // Budget admission is the last database write before the dispatch gate enters
 // the native executor. Exhausted serialization retries there fail the run with
 // no provider work started.
-const admissionFaults = vi.hoisted(() => ({ remaining: 0 }));
+const admissionFaults = vi.hoisted(() => ({ remaining: 0,
+  beforeReserve: undefined as ((runId: string) => Promise<void>) | undefined }));
 vi.mock("../services/budget-reservations.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/budget-reservations.js")>();
   const { AccountingContentionError } = await import("../services/accounting-transaction.js");
@@ -33,9 +41,19 @@ vi.mock("../services/budget-reservations.js", async importOriginal => {
         throw new AccountingContentionError(Object.assign(new Error("could not serialize access due to concurrent update"),
           { name: "PostgresError", code: "40001" }), 4);
       }
+      await admissionFaults.beforeReserve?.(args[2]);
       return actual.reserveRunBudget(...args);
     },
   };
+});
+
+const firstTurnGate = vi.hoisted(() => ({ afterAdmission: undefined as (() => Promise<void>) | undefined }));
+vi.mock("../services/native-runtime/first-turn-queued-input.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/native-runtime/first-turn-queued-input.js")>();
+  return { ...actual, claimFirstTurnQueuedInput: async (...args: Parameters<typeof actual.claimFirstTurnQueuedInput>) => {
+    await firstTurnGate.afterAdmission?.();
+    return actual.claimFirstTurnQueuedInput(...args);
+  } };
 });
 
 const support = await getRecoveryPostgresSupport({});
@@ -46,20 +64,28 @@ type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environme
 
 function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescriptorOnce?: { failed: boolean };
   unretiredPredecessorOnce?: { failed: boolean; environmentId: string; taskBlocked?: boolean; repeat?: string[] }; turnMessages?: Map<string, string>;
-  admissionFailure?: AdmissionFailure } = {}):
+  admissionFailure?: AdmissionFailure; beforeAttach?: (runId: string) => Promise<void>; turnSubmissions?: string[];
+  liveTurn?: { runId: string; interrupted: boolean; submissions: number; end: ReturnType<typeof Promise.withResolvers<void>> } } = {}):
   NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
   return execution => {
     let identity: NativeRunIdentity;
-    let sourceInstanceId = "";
+    let sourceInstanceId = "", activeTurnId: string | null = null;
     let turn = Promise.withResolvers<string>();
-    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+    const capabilities = { resume: true, typedEvents: true, steering: Boolean(options.liveTurn), interruption: true, structuredResult: true };
     const session: NativeSession = {
       identity: () => identity,
       capabilities: async () => capabilities,
-      attachRun: async input => { identity = input.identity; },
+      attachRun: async input => { identity = input.identity; await options.beforeAttach?.(identity.runId); },
+      steer: async () => {},
+      interrupt: async () => { if (options.liveTurn?.runId === identity.runId) {
+        options.liveTurn.interrupted = true; options.liveTurn.end.resolve();
+      } },
       startTurn: async input => {
+        options.turnSubmissions?.push(identity.runId);
         options.turnMessages?.set(identity.runId, JSON.stringify(input.message));
+        if (options.liveTurn?.runId === identity.runId) options.liveTurn.submissions += 1;
         const turnId = randomUUID();
+        activeTurnId = turnId;
         turn.resolve(turnId);
         return { turnId };
       },
@@ -72,13 +98,23 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
           schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), eventType, payload,
         });
         yield event(1, "turn.started", {});
+        if (options.liveTurn?.runId === identity.runId) {
+          await options.liveTurn.end.promise;
+          activeTurnId = null;
+          // Pi's person interrupt saves its short final and completes the PRP turn.
+          yield event(2, "item.completed", { kind: "agentMessage", channel: "final", text: "Stopped." });
+          turn = Promise.withResolvers<string>();
+          yield event(3, "turn.completed", { status: "completed" });
+          return;
+        }
         yield event(2, "item.completed", { kind: "agentMessage", channel: "final", text: "Done." });
+        activeTurnId = null;
         turn = Promise.withResolvers<string>();
         yield event(3, "turn.completed", { status: "completed" });
       },
       result: async () => null,
       snapshot: async () => ({ backendKind: "mock", sessionId: "predispatch-session", identity,
-        providerSessionId: "predispatch-provider-session", cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }),
+        providerSessionId: "predispatch-provider-session", cursor: null, activeTurnId, pendingRuntimeRequests: [], lineage: [] }),
       close: async () => {},
     };
     const backend: NativeSessionBackend = {
@@ -109,8 +145,8 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
         return { kind: "mock", name: "native-predispatch-retry", version: "1", capabilities,
           runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } };
       },
-      openSession: async input => { identity = input.identity; return session; },
-      recoverSession: async snapshot => { identity = snapshot.identity; return { recovered: true, session }; },
+      openSession: async input => { identity = input.identity; await options.beforeAttach?.(identity.runId); return session; },
+      recoverSession: async snapshot => { identity = snapshot.identity; await options.beforeAttach?.(identity.runId); return { recovered: true, session }; },
     };
     const failure = options.admissionFailure;
     if (!failure) return backend;
@@ -140,13 +176,13 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
   const fixture = nativeRestartFixture({});
 
   async function startTask(db: ReturnType<typeof createDb>, heartbeat: ReturnType<typeof heartbeatService>,
-    status: "in_progress" | "blocked" = "in_progress") {
+    status: "in_progress" | "blocked" = "in_progress", provider: "codex" | "pi_rpc" = "codex") {
     const { companyId, agentId } = fixture.current;
     const userId = randomUUID();
     await db.insert(authUsers).values({ id: userId, name: "Task owner", email: `${userId}@example.invalid`,
       createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, membershipRole: "owner" });
-    await db.update(agents).set({ status: "idle", adapterConfig: { provider: "codex" } }).where(eq(agents.id, agentId));
+    await db.update(agents).set({ status: "idle", adapterConfig: { provider } }).where(eq(agents.id, agentId));
     await instanceSettingsService(db).updateExperimental({ enableAgentChat: true, enableNativeRunner: true });
     const [issue] = await db.insert(issues).values({ companyId, title: "Survive a database fault", status,
       assigneeAgentId: agentId, responsibleUserId: userId, conversationAgentId: agentId, conversationUserId: userId,
@@ -163,8 +199,272 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
       contextSnapshot: { issueId: issue!.id, taskKey: issue!.id, wakeCommentId: message!.id } });
     expect(run).not.toBeNull();
     await waitForCondition("the first run to settle", () => heartbeat.getTaskDrainStatus().quiescent);
-    return { issueId: issue!.id, runId: run!.id };
+    return { issueId: issue!.id, runId: run!.id, userId };
   }
+
+  it.each(["local", "borrowed", "staged"] as const)("warm Pi session survives Stop before dispatch and answers two later messages in the same session (%s)", async mode => {
+    const { companyId, agentId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const messages = new Map<string, string>();
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, { turnMessages: messages }) });
+    const gate = Promise.withResolvers<void>();
+    let entered = false;
+    try {
+      const { issueId, runId, userId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
+      const good = (await heartbeat.getRun(runId))!;
+      expect(good.status).toBe("succeeded");
+      expect(good.nativeSessionId).toEqual(expect.any(String));
+      const send = async (body: string) => {
+        const [comment] = await db.insert(issueComments).values({ companyId, issueId,
+          authorType: "user", authorUserId: userId, body }).returning();
+        return heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+          requestedByActorType: "user", requestedByActorId: userId, manualUserWake: true,
+          payload: { issueId, commentId: comment!.id },
+          contextSnapshot: { issueId, taskKey: issueId, wakeCommentId: comment!.id } });
+      };
+      const svc = environmentService(db);
+      let borrowed: typeof environmentLeases.$inferSelect | undefined;
+      const acquiredRuns = new Map<string, string>();
+      const providerLeaseId = `warm-box-${runId}`;
+      if (mode !== "local") {
+        const [environment] = await db.insert(environments).values({ name: `warm-${runId}`, driver: "sandbox" }).returning();
+        const metadata = { agentId, savedSessionId: good.nativeSessionId,
+          reusableSandboxLease: { adapterType: "paperclip_runner" } };
+        borrowed = await svc.acquireLease({ companyId, environmentId: environment!.id, heartbeatRunId: runId, issueId,
+          provider: "daytona", providerLeaseId, leasePolicy: "reuse_by_environment", metadata });
+        await svc.releaseLease(borrowed.id, "retained", { cleanupStatus: "success" });
+      }
+      const acquire = async (nextRunId: string) => {
+        if (!borrowed) return;
+        borrowed = await svc.acquireLease({ companyId, environmentId: borrowed.environmentId!, heartbeatRunId: nextRunId,
+          issueId, provider: "daytona", providerLeaseId, leasePolicy: "reuse_by_environment",
+          metadata: { agentId, savedSessionId: good.nativeSessionId, reusableSandboxLease: { adapterType: "paperclip_runner" } },
+          replacesReusableLeaseId: borrowed.id });
+        borrowed = await svc.acquireLease({ companyId, environmentId: borrowed.environmentId!, heartbeatRunId: nextRunId,
+          issueId, provider: "daytona", providerLeaseId, leasePolicy: "reuse_by_environment",
+          metadata: borrowed.metadata, reusesReusableLeaseId: borrowed.id });
+        acquiredRuns.set(nextRunId, borrowed.id);
+      };
+      admissionFaults.beforeReserve = async nextRunId => {
+        await acquire(nextRunId);
+        if (mode === "staged") {
+          // Full staged inherited profile, with no committed recovery-v1 metadata.
+          const profile = { ...good.runnerProfileJson };
+          delete profile.nativeControllerRecovery;
+          const checkpoint = profile.sessionCheckpoint as Record<string, unknown>;
+          profile.sessionCheckpoint = { ...checkpoint, identity: { ...(checkpoint.identity as Record<string, unknown>), runId: nextRunId } };
+          await db.update(heartbeatRuns).set({ runnerProfileJson: profile }).where(eq(heartbeatRuns.id, nextRunId));
+        }
+        entered = true; await gate.promise;
+      };
+      const stopped = await send("Accidental submission; Stop before start");
+      expect(stopped).not.toBeNull();
+      await waitForCondition("pre-dispatch admission gate", () => entered);
+      await heartbeat.cancelRun(stopped!.id, "Person Stop", {
+        resultJson: { cancelledByActorType: "user", cancelledByUserId: userId } });
+      admissionFaults.beforeReserve = undefined;
+      gate.resolve();
+      await waitForCondition("Stop preparation settlement", () => heartbeat.getTaskDrainStatus().quiescent);
+      const cancelled = (await heartbeat.getRun(stopped!.id))!;
+      expect(cancelled.status).toBe("cancelled");
+      expect(cancelled.resultJson?.preDispatchCancellationSettledAt).toEqual(expect.any(String));
+      expect(messages.has(stopped!.id)).toBe(false);
+      if (borrowed) {
+        expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, borrowed.id)))[0])
+          .toMatchObject({ status: "released", cleanupStatus: "success", providerLeaseId,
+            metadata: { savedSessionId: good.nativeSessionId } });
+        const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+        expect(holds.filter(hold => hold.evidence?.runId === stopped!.id), JSON.stringify(holds)).toEqual([
+          expect.objectContaining({ status: "resolved", outcome: "cancelled", resolutionNote: "stopped before dispatch" }),
+        ]);
+      }
+      admissionFaults.beforeReserve = acquire;
+      for (const body of ["First follow-up", "Second follow-up"]) {
+        const next = await send(body);
+        expect(next).not.toBeNull();
+        await waitForCondition("follow-up settlement", () => heartbeat.getTaskDrainStatus().quiescent);
+        const answered = (await heartbeat.getRun(next!.id))!;
+        expect(answered.status, JSON.stringify(answered.resultJson)).toBe("succeeded");
+        expect(answered.nativeSessionId).toBe(good.nativeSessionId);
+        expect(messages.get(next!.id)).toContain(body);
+        if (borrowed) {
+          expect(acquiredRuns.has(next!.id)).toBe(true);
+          expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquiredRuns.get(next!.id)!)))[0])
+            .toMatchObject({ providerLeaseId, metadata: { savedSessionId: good.nativeSessionId } });
+          await svc.releaseLease(borrowed.id, "retained", { cleanupStatus: "success" });
+        }
+      }
+      const all = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, issueId));
+      expect(all.filter(run => run.status === "succeeded")).toHaveLength(3);
+      expect(all.some(run => run.error?.includes("metadata_format"))).toBe(false);
+      expect(all.some(run => run.status === "scheduled_retry")).toBe(false);
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments.filter(comment => comment.body === "Done.")).toHaveLength(3);
+      expect(comments.some(comment => comment.body === "New session")).toBe(false);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).not.toBe("blocked");
+      expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 0 });
+      if (process.env.CS_STOP_EVIDENCE_DIR) writeFileSync(join(process.env.CS_STOP_EVIDENCE_DIR, `warm-stop-${mode}.json`),
+        JSON.stringify({ mode, seedRunId: runId, stoppedRunId: stopped!.id, sessionId: good.nativeSessionId, providerLeaseId,
+          runs: all.map(row => ({ id: row.id, status: row.status, nativeSessionId: row.nativeSessionId,
+            errorCode: row.errorCode, profileKeys: Object.keys(row.runnerProfileJson ?? {}),
+            recoverySchema: (row.runnerProfileJson?.nativeControllerRecovery as Record<string, unknown> | undefined)?.schema ?? null })),
+          acquiredRuns: [...acquiredRuns], replies: comments.filter(comment => comment.body === "Done.").map(comment => comment.body),
+          leases: (await db.select().from(environmentLeases).where(eq(environmentLeases.issueId, issueId)))
+            .filter(row => row.provider === "daytona").map(row => ({ id: row.id, heartbeatRunId: row.heartbeatRunId,
+              providerLeaseId: row.providerLeaseId, status: row.status, cleanupStatus: row.cleanupStatus })),
+          recovery: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+        }, null, 2));
+    } finally {
+      admissionFaults.beforeReserve = undefined; gate.resolve();
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); await db.$client.end();
+    }
+  }, 90_000);
+
+  // 0427: a real PG row on either side of firstTurnDispatchCommitted's transaction.
+  it.each(["before_admission", "person_before_admission", "held_before_admission", "postpress_before_release", "after_admission", "after_submitted"] as const)("honors a person's Stop %s and continues the same Pi session", async boundary => {
+    const { companyId, agentId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 8 });
+    const submissions: string[] = [];
+    const messages = new Map<string, string>(), gate = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const liveTurn = { runId: "", interrupted: false, submissions: 0, end: Promise.withResolvers<void>() };
+    let pauseAttach = false, stop: Promise<request.Response> | undefined;
+    let delivery: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
+    const deliveryErrors: unknown[] = [];
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db, {
+      turnMessages: messages, turnSubmissions: submissions, liveTurn,
+      beforeAttach: async () => { if (pauseAttach) { entered.resolve(); await gate.promise; } },
+    }) });
+    try {
+      const { issueId, runId: seedRunId, userId } = await startTask(db, heartbeat, "in_progress", "pi_rpc");
+      if (boundary === "postpress_before_release") {
+        delivery = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { deliveryErrors.push(error); } });
+        await heartbeat.registerDeferredReceiptWork(delivery, () => true).ready;
+      }
+      const good = (await heartbeat.getRun(seedRunId))!;
+      expect(good.status).toBe("succeeded");
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId, companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "admin", status: "active" }], isInstanceAdmin: false }; next(); });
+      app.use("/api", agentRoutes(db, {}));
+      const unusedStorage = async () => { throw new Error("Stop restoration must not access object storage"); };
+      app.use("/api", issueRoutes(db, { provider: "local_disk", putFile: unusedStorage,
+        getObject: unusedStorage, headObject: unusedStorage, deleteObject: unusedStorage }));
+      app.use(errorHandler);
+      const send = async (body: string) => {
+        const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId, body }).returning();
+        const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+          requestedByActorType: "user", requestedByActorId: userId, manualUserWake: true,
+          payload: { issueId, commentId: comment!.id }, contextSnapshot: { issueId, taskKey: issueId, wakeCommentId: comment!.id } });
+        return { run: run!, comment: comment! };
+      };
+      const dispatched = boundary === "after_admission" || boundary === "after_submitted";
+      if (dispatched) firstTurnGate.afterAdmission = async () => { entered.resolve(); await gate.promise; };
+      else pauseAttach = true;
+      const { run: stopped, comment: m1 } = await send("M1 accidental input 0427");
+      liveTurn.runId = dispatched ? stopped.id : "";
+      await Promise.race([entered.promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("First-turn gate did not open")), 10_000).unref())]);
+      const before = (await heartbeat.getRun(stopped.id))!;
+      const eventsBefore = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, stopped.id));
+      expect(eventsBefore.some(event => event.eventType === "native.process_start_requested")).toBe(true);
+      expect(messages.has(stopped.id)).toBe(false);
+      expect(Boolean(before.resultJson?.firstTurnDispatchCommitted)).toBe(dispatched);
+      if (boundary === "after_submitted") {
+        firstTurnGate.afterAdmission = undefined; gate.resolve();
+        await waitForCondition("Pi turn submitted", () => messages.has(stopped.id));
+      }
+      if (boundary === "held_before_admission" || boundary === "person_before_admission") {
+        // Exercise admission itself, without a route-written startup fence.
+        const pressedAt = new Date().toISOString();
+        await db.update(heartbeatRuns).set({ resultJson: { ...before.resultJson,
+          ...(boundary === "held_before_admission" ? { personStopHeld: { pressedAt, userId } }
+            : { personStop: { requestedAt: pressedAt, userId } }) } }).where(eq(heartbeatRuns.id, stopped.id));
+      } else {
+        stop = request(app).post(`/api/heartbeat-runs/${stopped.id}/cancel`).send({}).then(response => response);
+        await waitForCondition("Stop to commit before releasing first-turn gate", async () => {
+          const current = (await heartbeat.getRun(stopped.id))!;
+          return boundary === "after_admission" ? Boolean(current.resultJson?.personStopHeld)
+            : boundary === "after_submitted" ? Boolean(current.resultJson?.personStop) : Boolean(current.resultJson?.startupCancellation);
+        });
+      }
+      // M2 arrives after the press but BEFORE the blocked runtime unwinds.
+      // The page acknowledges M1's return while that gate still owns startup.
+      let pendingM2: Awaited<ReturnType<typeof send>> | undefined;
+      if (boundary === "postpress_before_release") {
+        expect((await request(app).delete(`/api/issues/${issueId}/comments/${m1.id}`).send({})).status).toBe(200);
+        pendingM2 = await send("M2 corrected request 0427 during Stop");
+        expect(pendingM2.run).toBeNull();
+      }
+      pauseAttach = false; firstTurnGate.afterAdmission = undefined; gate.resolve();
+      if (stop) expect((await stop).status).toBe(boundary === "after_admission" ? 202 : 200);
+      await waitForCondition("stopped run to drain", () => heartbeat.getTaskDrainStatus().quiescent);
+      const ended = (await heartbeat.getRun(stopped.id))!;
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, stopped.id));
+      const personStop = ended.resultJson?.personStop as { returned?: string[] } | undefined;
+      if (dispatched) {
+        expect(liveTurn.interrupted).toBe(true);
+        expect(liveTurn.submissions).toBe(1);
+        expect(ended.status).toBe("succeeded");
+        expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).some(comment => comment.body === "Stopped.")).toBe(true);
+        expect(messages.get(stopped.id)).toContain(m1.body);
+        expect(personStop?.returned ?? []).not.toContain(m1.id);
+        expect(ended.resultJson?.startupCancellation).toBeUndefined();
+        expect((await db.select().from(issueComments).where(eq(issueComments.id, m1.id)))[0].deletedAt).toBeNull();
+      } else {
+        expect(ended.status).toBe("cancelled");
+        expect(ended.resultJson?.startupCancellation).toBeTruthy();
+        expect(personStop?.returned).toContain(m1.id);
+        expect(messages.has(stopped.id)).toBe(false);
+        expect(events.filter(event => event.eventType.startsWith("turn."))).toHaveLength(0);
+        if (!pendingM2) {
+          const restored = await request(app).delete(`/api/issues/${issueId}/comments/${m1.id}`).send({});
+          expect(restored.status).toBe(200); // The page's back-in-box acknowledgement.
+        }
+        expect((await db.select().from(issueComments).where(eq(issueComments.id, m1.id)))[0].deletedAt).toBeInstanceOf(Date);
+      }
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, stopped.id)))).toHaveLength(0);
+      const { run: next, comment: m2 } = pendingM2 ?? await send("M2 corrected request 0427");
+      await waitForCondition("next message delivered after Stop", () => [...messages].some(([id, message]) => id !== stopped.id && message.includes(m2.body)), pendingM2 ? 45_000 : 10_000).catch(async error => {
+        const state = { runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
+          wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)),
+          issue: await db.select().from(issues).where(eq(issues.id, issueId)),
+          finalization: await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.companyId, companyId)),
+          leases: await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId)),
+          deliveryErrors,
+          recovery: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, companyId)) };
+        if (process.env.CS_STOP_EVIDENCE_DIR) writeFileSync(join(process.env.CS_STOP_EVIDENCE_DIR, "m2-wait-failure.json"), JSON.stringify(state, null, 2));
+        throw error;
+      });
+      await waitForCondition("next message answered", () => heartbeat.getTaskDrainStatus().quiescent);
+      const nextId = next?.id ?? [...messages].find(([id, message]) => id !== stopped.id && message.includes(m2.body))?.[0];
+      expect(nextId).toBeTruthy();
+      const answered = (await heartbeat.getRun(nextId!))!;
+      expect(answered.status, JSON.stringify(answered.resultJson)).toBe("succeeded");
+      expect(answered.nativeSessionId).toBe(good.nativeSessionId);
+      expect(messages.get(answered.id)).toContain(m2.body);
+      expect([...messages.values()].filter(message => message.includes(m2.body))).toHaveLength(1);
+      expect(submissions.filter(id => id === answered.id)).toHaveLength(1);
+      if (!dispatched) {
+        expect(messages.get(answered.id)).not.toContain(m1.body);
+        expect(submissions.filter(id => id === stopped.id)).toHaveLength(0);
+      }
+      expect(deliveryErrors).toEqual([]);
+      const proof = { boundary, seedRunId, stoppedRunId: stopped.id, nextRunId: answered.id,
+        sessionId: good.nativeSessionId, nextSessionId: answered.nativeSessionId, stoppedStatus: ended.status,
+        personStop, m1: m1.id, m1SoftDeleted: !dispatched, m2: m2.id, m2SentBeforeRuntimeRelease: Boolean(pendingM2),
+        turnEvents: events.filter(event => event.eventType.startsWith("turn.")).map(event => event.eventType),
+        m1Submissions: submissions.filter(id => id === stopped.id).length,
+        m2Submissions: submissions.filter(id => id === answered.id).length,
+        interrupted: liveTurn.interrupted, nextStatus: answered.status };
+      process.stdout.write(`STOP_ADMISSION_PROOF ${JSON.stringify(proof)}\n`);
+      if (process.env.CS_STOP_EVIDENCE_DIR) writeFileSync(join(process.env.CS_STOP_EVIDENCE_DIR, `admission-${boundary}.json`), JSON.stringify(proof, null, 2));
+    } finally {
+      pauseAttach = false; firstTurnGate.afterAdmission = undefined; gate.resolve(); liveTurn.end.resolve();
+      await stop?.catch(() => undefined);
+      await delivery?.stop();
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); await db.$client.end();
+    }
+  }, 90_000);
 
   it("re-queues a native run that failed at budget admission and completes it without a Retry", async () => {
     const { companyId } = fixture.current;

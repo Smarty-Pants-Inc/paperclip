@@ -128,6 +128,8 @@ import type { TrustPresetResolution } from "../trust-preset-resolver.js";
 
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 
+import { readLimitFromEnv } from "../env-limits.js";
+
 export const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
@@ -136,18 +138,6 @@ export const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 
 export const PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY =
   "paperclipExternalChatExecutionBound";
-
-const MAX_INLINE_WAKE_COMMENTS = 8;
-
-const MAX_INLINE_WAKE_ATTACHMENTS = 20;
-
-const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
-
-const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
-
-const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
-
-const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 
 export const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 
@@ -850,7 +840,7 @@ function sanitizeAgentSessionMessageText(value: unknown): string | null {
   if (!text) return null;
   const redacted = redactSensitiveText(text).slice(
     0,
-    MAX_AGENT_SESSION_MESSAGE_CHARS,
+    readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_SESSION_MESSAGE_CHARS", 12_000),
   );
   return redacted.trim().length > 0 ? redacted : null;
 }
@@ -2285,6 +2275,7 @@ export async function buildPaperclipWakePayload(input: {
   runId?: string | null;
   contextSnapshot: Record<string, unknown>;
   wakeCommentRows?: Awaited<ReturnType<typeof readHeartbeatWakeComments>>;
+  retainFullCommentBodies?: boolean;
   continuationSummary?: {
     key: string;
     title: string | null;
@@ -2309,6 +2300,11 @@ export async function buildPaperclipWakePayload(input: {
   // Simplified Technical English (rendered as a prompt directive downstream).
   simplifiedEnglishInteractions?: boolean;
 }) {
+  const maxComments = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_COMMENTS", 8);
+  const maxAttachments = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_ATTACHMENTS", 20);
+  const maxCommentChars = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_COMMENT_CHARS", 4_000);
+  const maxTotalCommentChars = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_TOTAL_COMMENT_CHARS", 12_000);
+  const maxDescriptionChars = readLimitFromEnv("PAPERCLIP_WAKE_INPUT_MAX_DESCRIPTION_CHARS", 12_000);
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
   const annotationCommentId = readNonEmptyString(
@@ -2364,12 +2360,12 @@ export async function buildPaperclipWakePayload(input: {
   const issueDescription = conversationMode ? null : issueSummary?.description ?? null;
   const issueDescriptionTruncated =
     issueDescription !== null &&
-    issueDescription.length > MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS;
+    issueDescription.length > maxDescriptionChars;
   const inlineIssueDescription = issueDescriptionTruncated
-    ? issueDescription.slice(0, MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS)
+    ? issueDescription.slice(0, maxDescriptionChars)
     : issueDescription;
   const comments: Array<Record<string, unknown>> = [];
-  let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
+  let remainingBodyChars = maxTotalCommentChars;
   let truncated = false;
   let missingCommentCount = 0;
   const safeContinuationSummary =
@@ -2384,7 +2380,7 @@ export async function buildPaperclipWakePayload(input: {
       missingCommentCount += 1;
       continue;
     }
-    if (comments.length >= MAX_INLINE_WAKE_COMMENTS) {
+    if (comments.length >= maxComments && !input.retainFullCommentBodies) {
       truncated = true;
       break;
     }
@@ -2395,11 +2391,11 @@ export async function buildPaperclipWakePayload(input: {
         ? row
         : sanitizeQuarantinedCommentForHigherTrust(row);
     const fullBody = deletedAt ? "" : row.origin === "fast_response" ? `[Paperclip acknowledgement; not agent work] ${safeRow.body}` : safeRow.body;
-    const allowedBodyChars = Math.min(
-      MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+    const allowedBodyChars = Math.max(0, Math.min(
+      maxCommentChars,
       remainingBodyChars,
-    );
-    if (allowedBodyChars <= 0) {
+    ));
+    if (allowedBodyChars <= 0 && !input.retainFullCommentBodies) {
       truncated = true;
       break;
     }
@@ -2420,6 +2416,7 @@ export async function buildPaperclipWakePayload(input: {
         (row.authorAgentId ? "agent" : row.authorUserId ? "user" : "system"),
       body,
       bodyTruncated,
+      ...(input.retainFullCommentBodies && !deletedAt ? { fullBody } : {}),
       presentation: deletedAt ? null : (safeRow.presentation ?? null),
       metadata: deletedAt ? null : (safeRow.metadata ?? null),
       deletedAt: deletedAt ? deletedAt.toISOString() : null,
@@ -2473,8 +2470,8 @@ export async function buildPaperclipWakePayload(input: {
             ),
           )
           .orderBy(asc(issueAttachments.createdAt), asc(issueAttachments.id))
-          .limit(MAX_INLINE_WAKE_ATTACHMENTS + 1);
-  if (attachmentRows.length > MAX_INLINE_WAKE_ATTACHMENTS) truncated = true;
+          .limit(maxAttachments + 1);
+  if (attachmentRows.length > maxAttachments) truncated = true;
   const attachmentsByCommentId = new Map<
     string,
     Array<{
@@ -2487,7 +2484,7 @@ export async function buildPaperclipWakePayload(input: {
   >();
   for (const attachment of attachmentRows.slice(
     0,
-    MAX_INLINE_WAKE_ATTACHMENTS,
+    maxAttachments,
   )) {
     if (!attachment.issueCommentId) continue;
     const descriptors =
@@ -2560,11 +2557,11 @@ export async function buildPaperclipWakePayload(input: {
               anchorState: row.anchorState,
               anchorConfidence: row.anchorConfidence,
               body:
-                row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS
-                  ? row.body.slice(0, MAX_INLINE_WAKE_COMMENT_BODY_CHARS)
+                row.body.length > maxCommentChars
+                  ? row.body.slice(0, maxCommentChars)
                   : row.body,
               bodyTruncated:
-                row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+                row.body.length > maxCommentChars,
               createdAt: row.createdAt.toISOString(),
               author: row.authorAgentId
                 ? { type: "agent", id: row.authorAgentId }
@@ -2678,8 +2675,27 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const nativeStatusRetry = input.contextSnapshot.source === "native_status_decision" &&
+    input.contextSnapshot.statusDecisionSource === "native_status_decision" && input.contextSnapshot.nativeStatusRetry
+    ? parseObject(input.contextSnapshot.nativeStatusRetry) : null;
+  const retryDelta = parseObject(parseObject(input.contextSnapshot.executionContinuation).resumeDelta);
+  const retryPersonIds = nativeStatusRetry && Array.isArray(retryDelta.messages)
+    ? [...new Set(retryDelta.messages.flatMap(message => {
+      const entry = parseObject(message);
+      const id = readNonEmptyString(entry.id);
+      return entry.authorType === "user" && id ? [id] : [];
+    }))] : [];
+  // Status wakes need not name a comment, and continuation deltas omit file
+  // descriptors. Check unseen person input too before offering plain text.
+  const [retryAttachment] = issueId && retryPersonIds.length
+    ? await input.db.select({ id: issueAttachments.id }).from(issueAttachments).where(and(
+      eq(issueAttachments.companyId, input.companyId), eq(issueAttachments.issueId, issueId),
+      inArray(issueAttachments.issueCommentId, retryPersonIds),
+    )).limit(1) : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    ...(input.contextSnapshot.nativeTaskUnclaimed === true ? { nativeTaskUnclaimed: true } : {}),
+    ...(nativeStatusRetry ? { nativeStatusRetry: { ...nativeStatusRetry, hasUnseenAttachments: !!retryAttachment } } : {}),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,
@@ -3036,13 +3052,14 @@ export function createHeartbeatRunPreparation(db: Db) {
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: { originKind: string | null; originId: string | null; originRunId: string | null } | null,
-  ) {
+  ): Promise<{ routineId: string | null; liveRoutineId?: string | null;
+    env: NonNullable<RoutineRevisionSnapshotV1["routine"]["env"]> | null; responsibleUserId: string | null }> {
     if (
       !issueContext ||
       issueContext.originKind !== "routine_execution" ||
       !issueContext.originId
     ) {
-      return { routineId: null, env: null, responsibleUserId: null };
+      return { routineId: null, liveRoutineId: null, env: null, responsibleUserId: null };
     }
 
     const routineRun = issueContext.originRunId
@@ -3082,6 +3099,8 @@ export function createHeartbeatRunPreparation(db: Db) {
       if (snapshot?.version === 1) {
         return {
           routineId: issueContext.originId,
+          // Immutable revision: later routine saves must not retire this launch.
+          liveRoutineId: null,
           env: snapshot.routine.env ?? null,
           responsibleUserId:
             routineRun?.responsibleUserId ??
@@ -3107,6 +3126,7 @@ export function createHeartbeatRunPreparation(db: Db) {
       .then((rows) => rows[0] ?? null);
     return {
       routineId: issueContext.originId,
+      liveRoutineId: issueContext.originId,
       env: routine?.env ?? null,
       responsibleUserId:
         routineRun?.responsibleUserId ?? routine?.responsibleUserId ?? null,

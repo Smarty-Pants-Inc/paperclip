@@ -7,7 +7,7 @@ import { resolveGrokDisableWebSearch, admittedGrokWebSearchPolicy } from "../dri
 import { PRP_COMPLETION_TOOL_NAME, PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA } from "../contracts/completion-result.js";
 import { RunnerLaunchPreparationStore } from "./runner-launch-preparation-store.js";
 import type { PreparedRunnerProviderLaunch, RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
-import { preparedRunnerLaunchWorkingDirectory, validatePreparedRunnerLaunch, runnerLaunchSettingsMatch, runnerProviderLaunchRequirements, createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
+import { preparedRunnerLaunchWorkingDirectory, validatePreparedRunnerLaunch, runnerLaunchRequirementsDigest, runnerLaunchSettingsMatch, runnerProviderLaunchRequirements, createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
 export { createRunnerdCodexAppServerArgs, resolveRunnerdAcpxPermissionMode, trustedRuntimeReadOnlyRoots, withCodexCollaborationRuntimeInstructions } from "./runner-provider-launch.js";
 import { applyProviderObservabilityEnvironment, redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import type { RunnerExecutionDriver } from "../control-plane/runner-execution-driver.js";
@@ -58,6 +58,7 @@ import type {
   CodexTransportProcessInfo,
 } from "../drivers/codex/app-server-transport.js";
 import { createSanitizedCodexEnvironment } from "../drivers/codex/app-server-transport.js";
+import { CODEX_SKILLLESS_PERMISSION_PROFILE, CODEX_PLANNING_PERMISSION_PROFILE } from "../drivers/codex/codex-security-config.js";
 import {
   CodexAppServerDriver,
   codexSemanticToolSpecs,
@@ -74,7 +75,7 @@ import type {
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
 } from "../contracts/harness-driver.js";
-import { NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
+import { NativeRunnerClosedBeforeAttachmentError, NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
   inspectStagedRunAttachment,
@@ -121,6 +122,13 @@ const MAX_NOTIFICATION_COUNT = 2_048;
 const MAX_NOTIFICATION_BYTES = 4 * 1024 * 1024;
 // How often the event pump retries events that it is holding back itself.
 const PUMP_HELD_RETRY_MS = 5;
+export const ADOPTED_RUNNER_POLL_MS = (() => {
+  const value = Number(process.env.PAPERCLIP_ADOPTED_RUNNER_POLL_MS);
+  return Number.isInteger(value) && value >= 250 && value <= 60_000 ? value : 250;
+})();
+const TRACE_CORRELATION_RETRY_MS = 250;
+// Debug correlation must never keep a warm transport polling indefinitely.
+const TRACE_CORRELATION_MAX_AGE_MS = 30_000;
 const RUNNER_CLIENT_VERSION = "0.3.0";
 const RUNNER_BOOTSTRAP_TICKET_TTL_MS = 60_000;
 const RUNNER_RESTORE_STABLE_MS = 60_000;
@@ -584,6 +592,7 @@ function rotatedRunAttachPayload(
     { revision: string; criterionIds: readonly string[] } | undefined,
   runtimeContext?: NativeRuntimeContextSnapshot | null,
   currentInstructions?: { text: string; context: NativeRuntimeContextSnapshot | null },
+  refreshPiInstructions = false,
 ): Record<string, unknown> {
   const commands = Array.isArray(state.commands)
     ? state.commands.map(record)
@@ -611,6 +620,7 @@ function rotatedRunAttachPayload(
     completionContract,
     runtimeContext,
     currentInstructions,
+    refreshPiInstructions,
   );
 }
 
@@ -622,6 +632,7 @@ function retargetRunAttachPayload(
     { revision: string; criterionIds: readonly string[] } | undefined,
   runtimeContext?: NativeRuntimeContextSnapshot | null,
   currentInstructions?: { text: string; context: NativeRuntimeContextSnapshot | null },
+  refreshPiInstructions = false,
 ): Record<string, unknown> {
   const payload = structuredClone(seedPayload);
   const provider = record(payload.provider);
@@ -646,10 +657,11 @@ function retargetRunAttachPayload(
       provider.runtimeContext = structuredClone(runtimeContext);
     }
     payload.provider = provider;
-  } else if (provider.kind === "cursor_cloud" && currentInstructions !== undefined) {
+  } else if ((provider.kind === "cursor_cloud" || (provider.kind === "pi_rpc" && refreshPiInstructions)) && currentInstructions !== undefined) {
     provider.instructions = currentInstructions.context && runtimeContext !== undefined
       ? retargetComposedInstructions(currentInstructions.text, currentInstructions.context, runtimeContext)
       : currentInstructions.text;
+    if (provider.kind === "pi_rpc" && runtimeContext !== undefined) provider.runtimeContext = structuredClone(runtimeContext);
     payload.provider = provider;
   }
   if (authorizedTools !== null) payload.authorizedTools = authorizedTools;
@@ -1741,7 +1753,7 @@ export interface CapabilityRunnerdProcessEvidence {
 export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
   observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   homeMode?: "isolated" | "preconfigured";
-  provider?: "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  provider?: "cursor_cloud" | "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx";
   observeCredentials?: boolean;
   onCredentialsUpdated?: (event: PrpEvent) => Promise<void>;
   onAccountingEvent?: (event: PrpEvent) => Promise<void>;
@@ -1762,6 +1774,8 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   acpxCandidateAdmission?: AcpxCandidateAdmission;
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxMode?: string;
+  piRpcModel?: string;
+  piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   piThinkingLevel?: "off" | "low" | "high" | "max";
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -1826,6 +1840,9 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   /** SHA-256 verified by the provider-pack authority before runner startup. */
   opencodeProxySha256?: string;
   opencodeRuntimeDirectory?: string;
+  piProxyPath?: string;
+  piRuntimeDirectory?: string;
+  piResourcesDirectory?: string;
   environment?: NodeJS.ProcessEnv;
   /** Provider system instructions supplied by a native execution caller. */
   baseInstructions?: string;
@@ -2233,12 +2250,13 @@ function appServerThreadGoal(
 }
 
 type PendingTraceRehydration = {
+  enqueuedAt: number;
   sourceEventId: string;
   eventType: string;
   visibleNotificationCount: number;
 };
 
-type PendingDriverTraceInterpretation = CodexTraceInterpretation;
+type PendingDriverTraceInterpretation = CodexTraceInterpretation & { enqueuedAt: number };
 
 function appendRunnerdRehydrationTrace(
   index: RunnerdTraceFrameIndex,
@@ -2247,14 +2265,10 @@ function appendRunnerdRehydrationTrace(
   eventType: string,
   visibleNotificationCount: number,
   debugSequence: number,
-): "written" | "retry" | "not_applicable" {
+): "written" | "retry" | "write_retry" | "not_applicable" {
   if (!tracePath) return "not_applicable";
-  if (!existsSync(tracePath)) return "retry";
   try {
-    const { frameId, nativeChannelSettled } = index.locate(
-      tracePath,
-      sourceEventId,
-    );
+    const { frameId, nativeChannelSettled } = index.lookup(sourceEventId);
     if (frameId === null)
       return nativeChannelSettled ? "not_applicable" : "retry";
     appendFileSync(
@@ -2298,23 +2312,19 @@ function appendRunnerdRehydrationTrace(
     return "written";
   } catch {
     // Debug delivery is deliberately outside run authority and never fails it.
-    return "retry";
+    return "write_retry";
   }
 }
 
 function appendCodexDriverInterpretationTrace(
   index: RunnerdTraceFrameIndex,
   tracePath: string | undefined,
-  input: PendingDriverTraceInterpretation,
+  input: CodexTraceInterpretation,
   debugSequence: number,
-): "written" | "retry" | "not_applicable" {
+): "written" | "retry" | "write_retry" | "not_applicable" {
   if (!tracePath) return "not_applicable";
-  if (!existsSync(tracePath)) return "retry";
   try {
-    const { frameId, nativeChannelSettled } = index.locate(
-      tracePath,
-      input.sourceEventId,
-    );
+    const { frameId, nativeChannelSettled } = index.lookup(input.sourceEventId);
     if (frameId === null) {
       return nativeChannelSettled ? "not_applicable" : "retry";
     }
@@ -2355,7 +2365,7 @@ function appendCodexDriverInterpretationTrace(
     return "written";
   } catch {
     // Debug delivery is deliberately outside run authority and never fails it.
-    return "retry";
+    return "write_retry";
   }
 }
 
@@ -2544,6 +2554,7 @@ export function rehydrateRunnerdItemNotification(
       type: rawItem.type ?? rawParams.kind,
       status: rawItem.status ?? rawParams.status,
       text: rawItem.text ?? rawParams.text,
+      ...(rawItem.answers === undefined && Array.isArray(rawParams.answers) ? { answers: rawParams.answers } : {}),
       ...(phase === undefined ? {} : { phase }),
       ...(channel === undefined ? {} : { channel }),
     },
@@ -3937,6 +3948,12 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     }
     return selected;
   }
+  if (input.provider === "pi_rpc") {
+    return { ...createSanitizedPiRunnerEnvironment(input.options.environment), ...commonIdentity,
+      PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? input.options.stateDirectory,
+      PAPERCLIP_PI_RESOURCES_DIR: input.options.piResourcesDirectory,
+      ...(input.options.piRpcThinkingLevel === undefined ? {} : { PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel }) };
+  }
   if (input.provider === "opencode") {
     return {
       ...createSanitizedOpenCodeRunnerEnvironment(input.options.environment),
@@ -4067,6 +4084,19 @@ function createSanitizedOpenCodeRunnerEnvironment(
   ) };
 }
 
+function createSanitizedPiRunnerEnvironment(source: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  const candidate = { ...process.env, ...source };
+  return { ...configuredEnvironment(source), ...githubCredentialEnvironment(source ?? {}),
+    ...Object.fromEntries(Object.entries(candidate).filter(([key, value]) => typeof value === "string"
+      && !key.startsWith("PAPERCLIP_") && key !== "OPENROUTER_API_KEY"
+      && (OPEN_CODE_RUNNER_ENVIRONMENT_KEYS.has(key) || /^LC_[A-Z0-9_]{1,32}$/.test(key)))),
+    ...Object.fromEntries(["PAPERCLIP_PI_CONTINUOUS", "PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_KEY",
+      "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH", "PAPERCLIP_AI_PROVIDER_HEADERS",
+      "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"]
+      .flatMap(key => source?.[key] === undefined ? [] : [[key, source[key]]])),
+  };
+}
+
 export function resolveSourceCodexHome(
   environment: NodeJS.ProcessEnv | undefined,
 ): string | null {
@@ -4148,6 +4178,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #pumpActive = false;
   #pumpWake: NodeJS.Immediate | null = null;
   #pumpRetry: NodeJS.Timeout | null = null;
+  #pumpRetryMs = 0;
   #stopFollowingCore: (() => void) | null = null;
   #eventSourceSeq = 0;
   #eventIdentity: DurableRecoveryIdentity | null = null;
@@ -4321,10 +4352,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     ((settlement: "settled" | "unsettled") => Promise<void> | void) | null =
     null;
   #controlPlaneRelease: ((reason?: "detach") => Promise<void> | void) | null = null;
+  #restartConnection: RunnerProcessConnection | undefined;
   /** Quiesce hooks of the registered routes that have not been released yet. */
   readonly #controlPlaneQuiesces = new Set<() => void>();
   #nextTraceDebugSequence = 1;
   #traceRehydrationSpoolOverflow = false;
+  #traceRehydrationUnmatched = false;
+  #traceCorrelationsDirty = false;
+  #nextTraceRefreshAt = 0;
+  #traceRefreshSourceSeq = -1;
   readonly #traceFrameIndex = new RunnerdTraceFrameIndex();
   /** Clock of the startup, recovery, or turn-start admission in progress, if any. */
   #admissionClock: RunnerStallLedger | null = null;
@@ -4476,6 +4512,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               options.environment,
               options.acpxAgent ?? "codex",
             ).env
+          : options.provider === "pi_rpc" ? createSanitizedPiRunnerEnvironment(options.environment)
           : options.provider === "opencode"
             ? createSanitizedOpenCodeRunnerEnvironment(options.environment)
             : options.provider === "claude_managed"
@@ -5139,15 +5176,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runId: string;
     turnId: string;
     itemId: string;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }): Promise<void> {
+    if (this.#closed || this.#failure !== null) return Promise.reject(new NativeRunnerClosedBeforeAttachmentError());
     const earlyClaim = this.#earlyClaim?.runId === input.runId ? this.#earlyClaim.operation : undefined;
     if (this.#attachmentOperation !== null && earlyClaim === undefined) {
       return Promise.reject(new Error("native_runner_run_attachment_in_progress"));
     }
     this.#earlyClaim = null;
     const operation = Promise.resolve().then(() => {
+      // Still before any attachment command, including the queued microtask.
+      if (this.#closed || this.#failure !== null) throw new NativeRunnerClosedBeforeAttachmentError();
       this.#assertStartupOpen();
       return this.#attachRun(input, earlyClaim);
     }).finally(() => { this.#attachmentOperation = null; });
@@ -5159,6 +5200,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runId: string;
     turnId: string;
     itemId: string;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }, earlyClaim?: Promise<void>): Promise<void> {
@@ -5187,6 +5229,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runId: string;
     turnId: string;
     itemId: string;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     currentRunGrant?: NativeRunRuntimeGrant;
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }, earlyClaim?: Promise<void>): Promise<void> {
@@ -5233,26 +5276,35 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         .update(`${prior.runId}:${desired.runId}:${desired.turnId}`)
         .digest("hex")
         .slice(0, 32)}`;
+      // The retained transport's options and cache belong to the prior run.
+      const authorizedTools = input.dynamicTools === undefined ? this.#authorizedTools
+        : authorizedToolSetForProvider(this.options.provider, [...input.dynamicTools, ...codexSemanticToolSpecs()]);
       const stagedCandidate = inspectStagedRunAttachment(core.store.state);
       const staged = stagedCandidate && recoveryIdentityMatches(stagedCandidate.targetIdentity, desired) ? stagedCandidate : undefined;
+      if (staged && input.dynamicTools !== undefined
+        && commandDigest(staged.runAttachTemplate.authorizedTools) !== commandDigest(authorizedTools)) {
+        throw new Error("native_runner_staged_attachment_tools_changed");
+      }
       const runAttachTemplate = staged ? structuredClone(staged.runAttachTemplate) : this.#runAttachTemplate
         ? retargetRunAttachPayload(
             this.#runAttachTemplate,
             desired,
-            this.#authorizedTools,
+            authorizedTools,
             // A retained transport's options belong to its first run.
             input.completionContract ?? this.options.resumeCompletionContract,
             currentRunGrant?.runtimeContext,
             currentRunGrant ? { text: currentRunGrant.instructions, context: currentRunGrant.runtimeContext } : undefined,
+            this.options.environment?.PAPERCLIP_PI_CONTINUOUS === "1",
           )
         : rotatedRunAttachPayload(
             core.store.state,
             desired,
-            this.#authorizedTools,
+            authorizedTools,
             // A retained transport's options belong to its first run.
             input.completionContract ?? this.options.resumeCompletionContract,
             currentRunGrant?.runtimeContext,
             currentRunGrant ? { text: currentRunGrant.instructions, context: currentRunGrant.runtimeContext } : undefined,
+            this.options.environment?.PAPERCLIP_PI_CONTINUOUS === "1",
           );
       if (this.options.prepareLaunch && !staged) {
         const priorProvider = record(runAttachTemplate.provider);
@@ -5314,6 +5366,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
       activationStarted = true;
       core.rotateRunIdentity(desired, runAttachTemplate);
+      this.#restartConnection = connection;
       if (core.store.state.stagedRunAttachment && this.options.readRunnerState
         && (registration?.connection?.mode === "listen" || registration?.connection?.mode === "external")) {
         const deadline = Math.min(Date.now() + (this.options.runnerReconnectGraceMs ?? 5_000), this.#sourceAttachmentDeadline ?? Infinity);
@@ -5358,6 +5411,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       }
       this.#assertStartupOpen();
       if (retainingSource) await core.flushCheckpoint();
+      this.#authorizedTools = authorizedTools;
       this.#eventIdentity = structuredClone(desired);
       this.#retainedSourceIdentity = null;
       this.#eventSourceSeq = 0;
@@ -5434,24 +5488,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   recordTraceInterpretation(input: CodexTraceInterpretation): void {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
-    if (!tracePath) return;
-    const traceResult = appendCodexDriverInterpretationTrace(
-      this.#traceFrameIndex,
-      tracePath,
-      input,
-      this.#nextTraceDebugSequence,
-    );
-    if (traceResult === "written") {
-      this.#nextTraceDebugSequence += 1;
-    } else if (
-      traceResult === "retry" &&
-      this.#pendingDriverTraceInterpretations.length < 4_096
-    ) {
-      this.#pendingDriverTraceInterpretations.push(structuredClone(input));
-      this.#retryPumpWhile(true);
-    } else if (traceResult === "retry") {
-      this.#traceRehydrationSpoolOverflow = true;
-    }
+    if (!tracePath || (this.options.provider === "pi_rpc" && !this.#traceFrameIndex.nativeChannelCaptured)) return;
+    // Driver ingress can follow a native append after the last delivery pass.
+    // Always resolve against that pass's fresh index, never its cached prefix.
+    if (this.#pendingDriverTraceInterpretations.length < 4_096) {
+      this.#pendingDriverTraceInterpretations.push({ ...structuredClone(input), enqueuedAt: Date.now() });
+      this.#traceCorrelationsDirty = true;
+      this.#nextTraceRefreshAt = 0;
+      this.#wakePump();
+    } else this.#traceRehydrationSpoolOverflow = true;
   }
 
   processInfo(): CodexTransportProcessInfo {
@@ -6024,10 +6069,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#diagnostic(`runner shutdown failed: ${String(error)}`);
       }
     }
-    this.#flushPendingTraceRehydrations();
+    this.#flushPendingTraceRehydrations(false, true);
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
     if (tracePath) {
       const incomplete =
+        this.#traceRehydrationUnmatched ||
         this.#traceRehydrationSpoolOverflow ||
         this.#pendingTraceRehydrations.length > 0 ||
         this.#pendingDriverTraceInterpretations.length > 0;
@@ -6242,9 +6288,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     runtimeContext: NativeRuntimeContextSnapshot | null, instructions: string,
     recovery?: PreparedRunnerProviderLaunch,
     recordedRequirements?: RunnerProviderLaunchRequirements,
+    refreshInstructions = false,
   ): Promise<PreparedRunnerProviderLaunch> {
     const prior = record(template.provider);
-    const requirements = recordedRequirements ?? runnerProviderLaunchRequirements(this.options, identity, {
+    let requirements = recordedRequirements ?? runnerProviderLaunchRequirements(this.options, identity, {
       model: prior.model, approvalPolicy: prior.approvalPolicy,
       permissions: prior.readOnly === true || record(prior.providerPolicy).readOnly === true || prior.collaborationMode === "plan"
         ? "paperclip-runner-workspace-read-only" : "paperclip-runner-workspace-only",
@@ -6256,15 +6303,27 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       throw new Error("runner_launch_recovery_requirements_unavailable");
     }
     this.#assertStartupOpen();
-    const prepared = await this.options.prepareLaunch!(requirements, recovery);
+    let prepared = await this.options.prepareLaunch!(requirements, recovery);
     validatePreparedRunnerLaunch(requirements, prepared);
+    if (refreshInstructions) {
+      // Reuse the environment's launch, not the first run's instruction text.
+      const currentInstructions = runtimeContext
+        ? retargetComposedInstructions(instructions, runtimeContext, requirements.runtimeContext) : instructions;
+      requirements = { ...requirements, instructions: currentInstructions };
+      prepared = { ...prepared, requirementsDigest: runnerLaunchRequirementsDigest(requirements),
+        provider: { ...prepared.provider, instructions: requirements.runtimeContext
+          ? retargetComposedInstructions(currentInstructions, requirements.runtimeContext,
+            prepared.provider.runtimeContext as NativeRuntimeContextSnapshot | null)
+          : currentInstructions } };
+      validatePreparedRunnerLaunch(requirements, prepared);
+    }
     this.#recordPreparedWorkingDirectory(prepared);
     this.#assertStartupOpen();
     template.provider = prepared.provider;
     const sourceLaunch = this.options.recoveryLaunch
       && recoveryIdentityMatches(identity, this.options.recoveryLaunch.requirements.identity);
     if (!sourceLaunch) {
-      new RunnerLaunchPreparationStore(this.#root).save(requirements, prepared, this.#core!.store.state.identity);
+      new RunnerLaunchPreparationStore(this.#root).save(requirements, prepared, this.#core!.store.state.identity, refreshInstructions);
       this.#core!.persistPreparedLaunchConfiguration(identity, prepared.configurationId);
     }
     return prepared;
@@ -6485,7 +6544,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ), {
         options: this.options, root: this.#root, cwd: String(params.cwd ?? tmpdir()),
         codexHome, providerNodeCommand, codexCommand: effectiveCodexCommand,
-        opencodeProxyPath, acpxSidecarPath, cursorCloudProxyPath,
+        opencodeProxyPath, piProxyPath: this.options.piProxyPath, acpxSidecarPath, cursorCloudProxyPath,
       }),
     };
     return { runAttachTemplate, runnerAcpxLaunchProfile, runnerOpenCodeLaunchProfile, runnerCursorCloudLaunchProfile,
@@ -6831,6 +6890,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.options.provider === undefined ||
       this.options.provider === "codex" ||
       this.options.provider === "opencode" ||
+      this.options.provider === "pi_rpc" ||
       this.options.provider === "acpx";
     const localStateOwner =
       this.options.readRunnerState === undefined &&
@@ -7270,7 +7330,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ? retargetComposedInstructions(previous.requirements.instructions, previous.requirements.runtimeContext, preparedContext)
           : previous?.requirements.instructions ?? String(record(template.provider).instructions ?? ""));
       environmentPrepared = await this.#prepareOwnedProvider(template, desiredIdentity,
-        preparedContext, preparedInstructions, saved?.prepared, saved?.requirements);
+        preparedContext, preparedInstructions, saved?.prepared, saved?.requirements,
+        rotatedAuthority && provider === "pi_rpc" && this.options.environment?.PAPERCLIP_PI_CONTINUOUS === "1"
+          && saved !== undefined && this.options.baseInstructions !== undefined
+          && this.options.baseInstructions !== saved.requirements.instructions);
       this.#runAttachTemplate = structuredClone(template);
     }
     if (rotatedAuthority || sourceAttachmentTarget) {
@@ -7288,6 +7351,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.options.baseInstructions === undefined
           ? undefined
           : { text: this.options.baseInstructions, context: sourceRuntimeContext },
+        this.options.environment?.PAPERCLIP_PI_CONTINUOUS === "1",
       );
       if (!this.options.prepareLaunch && provider === "codex") {
         // These controller-owned, token-free paths belong to the new run.
@@ -8092,6 +8156,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ...(compactionPayload ?? { text: message }),
           ...(this.options.recordTimingReceipt ? {performance:true} : {}),
           ...((this.options.provider ?? "codex") === "codex" && params.effort !== undefined ? { effort: params.effort } : {}),
+          ...(this.options.provider === "pi_rpc" && !compactionTurn ? {
+            ...(this.options.piRpcModel === undefined ? {} : { model: this.options.piRpcModel }),
+            ...(this.options.piRpcThinkingLevel === undefined ? {} : { effort: this.options.piRpcThinkingLevel }),
+          } : {}),
           ...(reasoningMode === undefined ? {} : { reasoningMode }),
           ...(skills.length ? { skills } : {}),
           ...(!compactionTurn && this.#providerStartedTurns() ? { providerStartedTurns: true } : {}),
@@ -8460,6 +8528,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       remaining === "held" ||
         this.#pendingTraceRehydrations.length > 0 ||
         this.#pendingDriverTraceInterpretations.length > 0,
+      remaining === "held" ? PUMP_HELD_RETRY_MS : TRACE_CORRELATION_RETRY_MS,
     );
   }
 
@@ -8477,8 +8546,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       !recoveryIdentityMatches(core.store.state.identity, this.#eventIdentity)
     )
       return "none";
-    this.#flushPendingTraceRehydrations();
     const events = core.store.state.committedEvents;
+    const traceSourceSeq = events.at(-1)?.sourceSeq ?? 0;
+    // A held event is not new ingress on every 5ms retry. Only newly committed
+    // events bypass the trace-only cadence; visible delivery itself stays eager.
+    this.#flushPendingTraceRehydrations(traceSourceSeq !== this.#traceRefreshSourceSeq);
+    this.#traceRefreshSourceSeq = traceSourceSeq;
     for (;;) {
       const deferredEvent =
         !this.#recoveryTurnBindingPending &&
@@ -8721,6 +8794,22 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           : canonicalMethod
             ? expandRunnerdCanonicalNotifications(canonicalMethod, eventPayload, event.eventType)
             : [];
+      // Stock can hang live after an accepted finish: kill runnerd before the
+      // provider terminal, then restore (stock Codex gate-7 H2 8bcd040b; offline
+      // finish/restart kit). History already recognizes the recovery pair;
+      // project it here too, only for this run/session's bound provider turn.
+      if (event.eventType === "run.terminal" && this.#threadId && this.#turnId &&
+          recoveryIdentityMatches(event.envelope, core.store.state.identity)) {
+        const turnEvents = events.filter(candidate => candidate.sourceSeq <= event.sourceSeq &&
+          recoveryIdentityMatches(candidate.envelope, core.store.state.identity));
+        const terminal = runnerdRecoveredTurnTerminal(turnEvents, this.#turnId);
+        const prior = runnerdRecoveredTurnTerminal(
+          turnEvents.filter(candidate => candidate.sourceSeq < event.sourceSeq), this.#turnId);
+        if (terminal && !prior) notifications.push({ method: "turn/completed", params: {
+          threadId: this.#threadId, turnId: this.#turnId,
+          turn: { id: this.#turnId, ...terminal, items: [] },
+        } });
+      }
       for (const payload of notifications) {
         const method = payload.method;
         if (typeof method !== "string") continue;
@@ -8845,8 +8934,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             : {}),
         });
       }
-      if (this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH) {
+      if (this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH &&
+        (this.options.provider !== "pi_rpc" || this.#traceFrameIndex.nativeChannelCaptured)) {
         const pending = {
+          enqueuedAt: Date.now(),
           sourceEventId: event.sourceEventId,
           eventType: event.eventType,
           visibleNotificationCount: notifications.length,
@@ -8859,15 +8950,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           pending.visibleNotificationCount,
           this.#nextTraceDebugSequence,
         );
-        if (traceResult === "written") {
-          this.#nextTraceDebugSequence += 1;
-        } else if (
-          traceResult === "retry" &&
-          this.#pendingTraceRehydrations.length < 4_096
-        ) {
-          this.#pendingTraceRehydrations.push(pending);
-        } else if (traceResult === "retry") {
-          this.#traceRehydrationSpoolOverflow = true;
+        if (traceResult === "written") this.#nextTraceDebugSequence += 1;
+        else if (traceResult === "retry" || traceResult === "write_retry") {
+          if (this.#pendingTraceRehydrations.length < 4_096) {
+            this.#pendingTraceRehydrations.push(pending);
+            this.#traceCorrelationsDirty = true;
+          } else this.#traceRehydrationSpoolOverflow = true;
         }
       }
       // The strict Codex driver must bind the provider turn from the response
@@ -9017,9 +9105,50 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#diagnostic(`confirmed adopted provider identity against ${source}`);
   }
 
-  #flushPendingTraceRehydrations(): void {
+  #flushPendingTraceRehydrations(refreshForDelivery = false, closing = false): void {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
-    if (!tracePath) return;
+    // Pi writes its own raw/driver trace, not the runner's native channel.
+    // Unread bytes (or our own interpretations) must never opt it into scans,
+    // including the synchronous close-time backlog drain below.
+    if (!tracePath || (this.options.provider === "pi_rpc" && !this.#traceFrameIndex.nativeChannelCaptured)) return;
+    if (!refreshForDelivery && this.#pendingTraceRehydrations.length === 0 && this.#pendingDriverTraceInterpretations.length === 0) return;
+    const now = Date.now();
+    if (!closing && !refreshForDelivery && now < this.#nextTraceRefreshAt) return;
+    // Throttle attempts too: a missing/unreadable file must not stat every held pass.
+    this.#nextTraceRefreshAt = now + TRACE_CORRELATION_RETRY_MS;
+    let refreshed = false;
+    try {
+      // One bounded refresh per live pass. At close, keep the incremental cursor
+      // and finish an already-arrived suffix while each read makes progress.
+      let unreadBytes = Infinity;
+      for (;;) {
+        refreshed = this.#traceFrameIndex.refresh(tracePath) || refreshed || this.#traceCorrelationsDirty;
+        const remaining = this.#traceFrameIndex.unreadBytes;
+        if (!closing || remaining === 0 || remaining >= unreadBytes) break;
+        unreadBytes = remaining;
+      }
+      this.#traceCorrelationsDirty = false;
+    } catch {
+      // Missing/unreadable files still expire, but never use their stale index.
+      refreshed = false;
+    }
+    // pi_rpc normally captures no native channel. A captured channel, not the
+    // provider's name alone, decides whether native correlations are applicable.
+    if (this.options.provider === "pi_rpc" && !this.#traceFrameIndex.nativeChannelCaptured) {
+      this.#pendingTraceRehydrations = [];
+      this.#pendingDriverTraceInterpretations = [];
+      return;
+    }
+    const unexpired = (pending: { enqueuedAt: number }) => {
+      if (now - pending.enqueuedAt < TRACE_CORRELATION_MAX_AGE_MS || (refreshed && this.#traceFrameIndex.unreadBytes > 0)) return true;
+      this.#traceRehydrationUnmatched = true;
+      return false;
+    };
+    if (!refreshed) {
+      this.#pendingTraceRehydrations = this.#pendingTraceRehydrations.filter(unexpired);
+      this.#pendingDriverTraceInterpretations = this.#pendingDriverTraceInterpretations.filter(unexpired);
+      return;
+    }
     const retry: PendingTraceRehydration[] = [];
     for (const pending of this.#pendingTraceRehydrations) {
       const traceResult = appendRunnerdRehydrationTrace(
@@ -9031,9 +9160,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#nextTraceDebugSequence,
       );
       if (traceResult === "written") this.#nextTraceDebugSequence += 1;
-      else if (traceResult === "retry") retry.push(pending);
+      else if (traceResult === "retry" || traceResult === "write_retry") {
+        retry.push(pending);
+        if (traceResult === "write_retry") this.#traceCorrelationsDirty = true;
+      }
     }
-    this.#pendingTraceRehydrations = retry;
+    this.#pendingTraceRehydrations = retry.filter(unexpired);
 
     const driverRetry: PendingDriverTraceInterpretation[] = [];
     for (const pending of this.#pendingDriverTraceInterpretations) {
@@ -9044,9 +9176,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#nextTraceDebugSequence,
       );
       if (traceResult === "written") this.#nextTraceDebugSequence += 1;
-      else if (traceResult === "retry") driverRetry.push(pending);
+      else if (traceResult === "retry" || traceResult === "write_retry") {
+        driverRetry.push(pending);
+        if (traceResult === "write_retry") this.#traceCorrelationsDirty = true;
+      }
     }
-    this.#pendingDriverTraceInterpretations = driverRetry;
+    this.#pendingDriverTraceInterpretations = driverRetry.filter(unexpired);
   }
 
   #pumpEventsSafely(): void {
@@ -9093,9 +9228,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
   }
 
-  #retryPumpWhile(held: boolean): void {
+  #retryPumpWhile(held: boolean, retryMs = PUMP_HELD_RETRY_MS): void {
     if (held && this.#pumpActive) {
-      this.#pumpRetry ??= setInterval(() => this.#pumpEventsSafely(), PUMP_HELD_RETRY_MS);
+      if (this.#pumpRetry !== null && this.#pumpRetryMs !== retryMs) {
+        clearInterval(this.#pumpRetry);
+        this.#pumpRetry = null;
+      }
+      this.#pumpRetryMs = retryMs;
+      this.#pumpRetry ??= setInterval(() => this.#pumpEventsSafely(), retryMs);
     } else if (this.#pumpRetry !== null) {
       clearInterval(this.#pumpRetry);
       this.#pumpRetry = null;
@@ -9179,7 +9319,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         .finally(() => {
           checking = false;
         });
-    }, 250);
+    }, ADOPTED_RUNNER_POLL_MS);
     this.#adoptedRunnerMonitor.unref?.();
   }
 
@@ -9408,7 +9548,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           const ticket = this.#core.issueBootstrapTicket(RUNNER_BOOTSTRAP_TICKET_TTL_MS);
           await this.#core.flushCheckpoint();
           if (this.#closed || this.#failure !== null) return;
-          recoveredHandle = restart(ticket);
+          recoveredHandle = restart(ticket, this.#core.store.state.identity, this.#restartConnection);
         } catch (error) {
           lastDetail = error instanceof Error ? error.message : String(error);
           attempt += 1;
@@ -9646,7 +9786,7 @@ function retainNativeProbeCleanup(cleanup: (retry: boolean) => Promise<void>) {
 
 export async function probeNativeRunnerEnvironment(options: {
   runtimeDirectory: string;
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
   model: string | null;
   reasoningEffort?: string;
   /** Verify native session identity/model and cleanup without a billable turn. */
@@ -9660,7 +9800,7 @@ export async function probeNativeRunnerEnvironment(options: {
   onCodexCredentialRefresh?: (filename: string) => Promise<void>;
   onCleanupConfirmed?: () => Promise<void>;
 }): Promise<{
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
   providerDriver: string;
   effectiveModel: string;
   helloProbePassed: boolean;
@@ -9692,11 +9832,11 @@ export async function probeNativeRunnerEnvironment(options: {
   };
   let registrationCleanupConfirmed = true;
   const cleanupBudget = probeCleanupBudget(options.cleanupTimeoutMs);
-  const sourceCodexHome = ownsPreparation || preconfiguredHome ? undefined : options.transportOptions?.sourceCodexHome ?? resolveSourceCodexHome(environment);
+  const sourceCodexHome = options.provider === "pi_rpc" || ownsPreparation || preconfiguredHome ? undefined : options.transportOptions?.sourceCodexHome ?? resolveSourceCodexHome(environment);
   delete environment.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX;
   if (!ownsPreparation && !preconfiguredHome) {
     environment.HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "probe-home");
-    environment.CODEX_HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "codex-home");
+    if (options.provider !== "pi_rpc") environment.CODEX_HOME = resolve(remoteFilesystemRoot ?? options.runtimeDirectory, "codex-home");
   }
   // A prepared launch reports its own directory; Core does not assign one.
   if (!ownsPreparation) environment.PAPERCLIP_WORKSPACE_CWD = workingDirectory;
@@ -9747,7 +9887,8 @@ export async function probeNativeRunnerEnvironment(options: {
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     conversationMode: "direct",
-    requestedCollaborationMode: "plan",
+    // Pi's existing launch contract requires sandbox-owned, not read-only, permissions.
+    requestedCollaborationMode: options.provider === "pi_rpc" ? "default" : "plan",
     approvalPolicy: "never",
     includeCollaborationModeInstructions: false,
     dynamicTools: [],
@@ -9773,15 +9914,16 @@ export async function probeNativeRunnerEnvironment(options: {
       workingDirectory, signal: controller.signal });
     controller.signal.throwIfAborted();
     const ids = session.ids();
-    const expectedDriver = { codex: "codex_app_server", opencode: "opencode_server", acpx: "acpx_runtime" }[options.provider];
+    const expectedDriver = { codex: "codex_app_server", opencode: "opencode_server", acpx: "acpx_runtime", pi_rpc: "pi_rpc" }[options.provider];
     if (!ids.driverSessionId || !ids.providerSessionId || bundle.evidence().providerDriver !== expectedDriver) {
       throw new Error(`The native environment probe returned no matching provider identity (${bundle.evidence().providerDriver ?? "missing driver"}).`);
     }
     const events = session.events()[Symbol.asyncIterator]();
     const first = await events.next();
     const context = record(first.value?.payload.context);
-    if (first.value?.eventType !== "session.started" || !context.model || record(record(context.sandbox).permissionProfile).id !== "paperclip-runner-workspace-read-only") {
-      throw new Error("The native environment probe returned no observed model or read-only runtime identity.");
+    const expectedPermission = options.provider === "pi_rpc" ? CODEX_SKILLLESS_PERMISSION_PROFILE : CODEX_PLANNING_PERMISSION_PROFILE;
+    if (first.value?.eventType !== "session.started" || !context.model || record(record(context.sandbox).permissionProfile).id !== expectedPermission) {
+      throw new Error("The native environment probe returned no observed model or matching runtime permission identity.");
     }
     {
       effectiveModel = typeof context.model === "string" && context.model.trim() && context.model !== "unknown" ? context.model : undefined;
@@ -10012,7 +10154,7 @@ export function resolveRunnerdCodexSkillInputs(
  */
 export function coldAdmissionTimeoutMs(provider: string | undefined, agent: string | undefined, coldProcess: boolean): number {
   if (!coldProcess) return 30_000;
-  return (provider === "acpx" && (agent === "pi" || agent === "claude")) || provider === "opencode" ? 60_000 : 30_000;
+  return (provider === "acpx" && (agent === "pi" || agent === "claude")) || provider === "opencode" || provider === "pi_rpc" ? 60_000 : 30_000;
 }
 
 export interface RunnerCommandFailure extends Error {

@@ -97,7 +97,10 @@ export interface PrpEvent {
   observedAt?: string;
   source?: string;
   type?: never;
-  payload: Record<string, unknown>;
+  payload: Record<string, unknown> & {
+    /** Person comment ids consumed since the previous final; absent on older packs. */
+    answers?: string[];
+  };
   debug?: Record<string, unknown>;
 }
 /** Runtime-validated composition of the JSON-Schema-derived contract types. */

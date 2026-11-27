@@ -251,6 +251,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST = [
   "if-match",
   "if-none-match",
   "x-paperclip-github-capability",
+  "x-paperclip-github-repository",
 ] as const;
 
 export interface SandboxCallbackBridgeRequest extends SandboxCallbackBridgeBody {
@@ -819,6 +820,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
   pollIntervalMs?: number | null;
+  // Opt-in idle backoff. Without a queue notification, a long idle sleep
+  // cannot retain the base-interval pickup bound, so the default stays off.
+  idleMaxMs?: number | null;
   // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
   // poll and one `processRequestFile`). On timeout the loop `catch` runs
   // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
@@ -862,6 +866,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
   runtimeSpan?: RuntimeSpanRunner;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
+  const idleMaxMs = Math.max(pollIntervalMs, Math.min(5000,
+    normalizeTimeoutMs(input.idleMaxMs, pollIntervalMs)));
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
   const abortedHandlerGraceMs = normalizeTimeoutMs(
@@ -1521,6 +1527,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // successful iteration and fails the queued requests fast, while this loop
       // keeps probing for recovery.
       let consecutivePollFailures = 0;
+      let idleWaitMs = pollIntervalMs;
       while (true) {
         let fileNames: string[];
         try {
@@ -1557,13 +1564,16 @@ export async function startSandboxCallbackBridgeWorker(input: {
         // an exec storm against a real sandbox channel, and with an in-memory
         // client a pure-microtask loop that starves every timer in the process
         // (including the guard's own backstop and abort timers).
+        // Any request, including a guarded in-flight one, ends the empty streak.
+        if (fileNames.length > 0) idleWaitMs = pollIntervalMs;
         const actionableFileNames = fileNames.filter((fileName) => !inFlightRequestGuards.has(fileName));
         if (actionableFileNames.length === 0) {
           lastSuccessfulIterationAt = Date.now();
           if (stopping) {
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+          await new Promise((resolve) => setTimeout(resolve, idleWaitMs));
+          if (fileNames.length === 0) idleWaitMs = Math.min(idleMaxMs, idleWaitMs * 2);
           continue;
         }
         for (const fileName of actionableFileNames) {

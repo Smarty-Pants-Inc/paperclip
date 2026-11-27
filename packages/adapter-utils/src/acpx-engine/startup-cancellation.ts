@@ -68,7 +68,7 @@ export function cancellableSandboxStartup(ctx: AdapterExecutionContext) {
   const runner: CommandManagedRuntimeRunner = {
     ...original,
     execute: input => guard(() => original.execute(input)),
-    ...(original.syncIn ? { syncIn: (input: Parameters<NonNullable<typeof original.syncIn>>[0]) => guard(() => original.syncIn!(input)) } : {}),
+    ...(original.syncIn ? { syncIn: (...args: Parameters<NonNullable<typeof original.syncIn>>) => guard(() => original.syncIn!(...args)) } : {}),
     ...(original.syncOut ? { syncOut: (input: Parameters<NonNullable<typeof original.syncOut>>[0]) => guard(() => original.syncOut!(input)) } : {}),
     ...(original.openDuplexChannel ? {
       openDuplexChannel: (input: Parameters<NonNullable<typeof original.openDuplexChannel>>[0]) => guard(async () => {

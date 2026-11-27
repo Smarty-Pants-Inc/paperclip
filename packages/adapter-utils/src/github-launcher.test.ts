@@ -12,6 +12,179 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 
 describe("managed GitHub launchers", () => {
 
+  it("sends the current Git remote as a repository hint for implicit gh operations", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-repository-hint-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), real = path.join(root, "real");
+    await mkdir(bin); await mkdir(real);
+    await exec("git", ["init", "-q", root]);
+    await exec("git", ["-C", root, "remote", "add", "origin", "git@github.com:Second-Org/App.git"]);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(real, "gh"), `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN || '');\n`, { mode: 0o700 });
+    const hints: unknown[] = [];
+    const server = createServer((req, res) => {
+      hints.push(req.headers["x-paperclip-github-repository"]);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "selected-installation" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }), PATH: `${bin}:${real}:${process.env.PATH}` };
+    expect((await exec(path.join(bin, "gh"), ["pr", "list"], { cwd: root, env })).stdout).toBe("selected-installation");
+    expect(hints).toEqual(["second-org/app"]);
+  });
+
+  it.each<[string, string[], string, string]>([
+    ...[["run", "view", "7", "--log-failed"], ["run", "watch", "7", "--exit-status"], ["pr", "review", "7", "--approve"],
+      ["pr", "edit", "7", "--add-label", "x"], ["workflow", "run", "ci.yml", "--ref", "main"]]
+      .map<[string, string[], string, string]>(args => ["gh", args, "", "example-org/fetch"]),
+    ...[["merge", "-s"], ["merge", "-m"], ["merge", "-r"], ["review", "-a"], ["review", "-r"]]
+      .map<[string, string[], string, string]>(([command, flag]) => ["gh", ["pr", command, flag, "https://github.com/second-org/other/pull/42"], "", "second-org/other"]),
+    ["gh", ["api", "repos/{owner}/{repo}/pulls"], "second-org/env", "second-org/env"],
+    ["gh", ["api", "repos/{owner}/{repo}/pulls"], "github.com/second-org/other", "second-org/other"],
+    ["gh", ["api", "repos/second-org/other/pulls", "-R", "example-org/fetch"], "example-org/fetch", "example-org/fetch"],
+    ["gh", ["pr", "view", "https://github.com/second-org/other/pull/42", "-R", "example-org/fetch"], "example-org/fetch", "example-org/fetch"],
+    ["gh", ["api", "repos/{owner}/{repo}/pulls"], "", "example-org/fetch"],
+    ["gh", ["api", "https://api.github.com:443/repos/second-org/other"], "", "second-org/other"],
+    ["gh", ["api", "orgs/second-org/repos"], "", "second-org"],
+    ["gh", ["api", "users/second-org/repos?per_page=100"], "example-org/fetch", "second-org"],
+    ["gh", ["repo", "clone", "--", "second-org/other"], "", "second-org/other"],
+    ["gh", ["api", "--method", "GET", "/%72epos/%73econd-org//other?per_page=100", "--input", "/tmp/request.json"], "invalid", "second-org/other"],
+    ["gh", ["api", "-f", "unused=repos/example-org/fetch", "https://api.github.com:8443//repos/second-org/other/issues"], "", "second-org/other"],
+    ["gh", ["api", "--", "repos/second-org/other"], "", "second-org/other"],
+    ["gh", ["api", "repos/second-org/other", "--input", "-"], "", "second-org/other"],
+    ["gh", ["issue", "view", "https://github.com:443/second-org/other/issues/42", "--repo=example-org/fetch"], "invalid", "example-org/fetch"],
+    ["gh", ["pr", "list", "--repo", "second-org/other"], "invalid", "second-org/other"],
+    ["gh", ["pr", "diff", "https://github.com/example-org/work/pull/42", "--patch"], "second-org/other", "example-org/work"],
+    ["gh", ["pr", "view", "https://github.com/example-org/work/pull/42", "--json", "title,body"], "second-org/other", "example-org/work"],
+    ["gh", ["pr", "checks", "https://github.com/example-org/work/pull/42"], "second-org/other", "example-org/work"],
+    ["gh", ["issue", "view", "https://github.com/example-org/work/issues/42", "--comments"], "second-org/other", "example-org/work"],
+    ["gh", ["pr", "diff", "https://github.com/second-org/other/pull/42", "--patch"], "example-org/fetch", "second-org/other"],
+    ["gh", ["pr", "view", "https://github.com/second-org/other/pull/42", "--json", "title,body"], "example-org/fetch", "second-org/other"],
+    ["gh", ["pr", "checks", "https://github.com/second-org/other/pull/42"], "example-org/fetch", "second-org/other"],
+    ["gh", ["issue", "view", "https://github.com/second-org/other/issues/42", "--comments"], "example-org/fetch", "second-org/other"],
+    ["gh", ["pr", "diff", "--name-only", "https://github.com/second-org/other/pull/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "view", "--web", "https://github.com/second-org/other/pull/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "view", "--json=title,body", "-q", ".body", "https://github.com/second-org/other/pull/42"], "invalid", "second-org/other"],
+    ["gh", ["issue", "view", "--comments", "--json", "body", "--jq", ".body", "https://github.com/second-org/other/issues/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "diff", "--color", "never", "--exclude", "docs/*", "-e", "*.md", "https://github.com/second-org/other/pull/42", "--patch", "-R", "example-org/fetch"], "invalid", "example-org/fetch"],
+    ["gh", ["pr", "checks", "--required", "--watch", "--fail-fast", "-i", "5", "https://github.com/second-org/other/pull/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "checks", "--interval=5", "https://github.com/example-org/work/pull/42", "--repo", "second-org/other"], "invalid", "second-org/other"],
+    ["gh", ["issue", "view", "-c", "https://github.com/second-org/other/issues/42"], "invalid", "second-org/other"],
+    ["gh", ["pr", "create", "--title", "A title", "--body", "https://github.com/second-org/other"], "", "second-org/other"],
+    ["gh", ["pr", "list", "--unknown", "second-org/other"], "", "example-org/fetch"],
+    ["gh", ["pr", "view", "--", "--repo", "second-org/other"], "", "example-org/fetch"],
+    ["git", ["push", "other", "main"], "", "second-org/other"],
+    ["git", ["push", "--force", "other", "main"], "", "second-org/other"],
+    ["git", ["push", "origin", "main"], "", "second-org/push"],
+    ["git", ["clone", "https://github.com:443/second-org/port.git"], "", "second-org/port"],
+  ])("routes %s %j to the operation repository", async (program, args, ghRepo, expected) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-operation-repo-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), real = path.join(root, "real");
+    await mkdir(bin); await mkdir(real);
+    await exec("git", ["init", "-q", root]);
+    await exec("git", ["-C", root, "remote", "add", "origin", "https://github.com/example-org/fetch.git"]);
+    await exec("git", ["-C", root, "remote", "set-url", "--push", "origin", "git@github.com:second-org/push.git"]);
+    await exec("git", ["-C", root, "remote", "add", "other", "https://github.com/second-org/other.git"]);
+    for (const name of ["git", "gh"]) await writeFile(path.join(bin, name), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(real, "gh"), `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN || '');\n`, { mode: 0o700 });
+    await writeFile(path.join(real, "git"), `#!${process.execPath}
+if (process.argv.includes('get-url')) {
+  const result = require('node:child_process').spawnSync('/usr/bin/git', process.argv.slice(2), { env: process.env, stdio: 'inherit' });
+  process.exit(result.status ?? 1);
+}
+process.stdout.write(process.env.GH_TOKEN || '');
+`, { mode: 0o700 });
+    const hints: unknown[] = [];
+    const server = createServer((req, res) => {
+      const repository = req.headers["x-paperclip-github-repository"];
+      hints.push(repository);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: `token-${repository || "default"}` } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      GH_REPO: ghRepo, PATH: `${bin}:${real}:${process.env.PATH}` };
+    expect((await exec(path.join(bin, program), args, { cwd: root, env })).stdout).toBe(`token-${expected}`);
+    expect(hints).toEqual([expected]);
+  });
+
+  // Never export an origin credential to a different repository.
+  it.each(["second-org/other.git", ""])("binds real git credential fill to its requested path %j", async requestedPath => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-credential-path-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", "-q", root]);
+    await exec("git", ["-C", root, "remote", "add", "origin", "https://github.com/example-org/fetch.git"]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    const hints: unknown[] = [];
+    const server = createServer((req, res) => {
+      const repository = req.headers["x-paperclip-github-repository"];
+      hints.push(repository);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: {
+        PAPERCLIP_GIT_TOKEN: `token-${repository}`,
+        GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "credential.helper", GIT_CONFIG_VALUE_0: "",
+        GIT_CONFIG_KEY_1: "credential.https://github.com.helper",
+        GIT_CONFIG_VALUE_1: "!f() { cat >/dev/null; printf 'username=x-access-token\\npassword=%s\\n' \"$PAPERCLIP_GIT_TOKEN\"; }; f",
+      } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }), PATH: `${bin}:${process.env.PATH}` };
+    const result = await new Promise<{ code: number | string | undefined; stdout: string; stderr: string }>(resolve => {
+      const child = execFile(path.join(bin, "git"), ["credential", "fill"], { cwd: root, env, timeout: 5000 }, (error, stdout, stderr) =>
+        resolve({ code: error?.code ?? undefined, stdout, stderr }));
+      child.stdin!.end(`protocol=https\nhost=github.com\n${requestedPath ? `path=${requestedPath}\n` : ""}\n`);
+    });
+    if (requestedPath) {
+      expect(result.code).toBeUndefined();
+      expect(result.stdout).toContain("password=token-second-org/other");
+      expect(hints).toEqual(["second-org/other"]);
+    } else {
+      expect(result.code).not.toBeUndefined();
+      expect(result.stderr).toContain("repository_target_required");
+      expect(hints).toEqual([]);
+    }
+    expect(result.stdout + result.stderr).not.toContain("token-example-org/fetch");
+  });
+
+  it.each([
+    ["pr", "merge", "https://github.com/example-org/work/pull/7", "https://github.com/second-org/other/pull/42"],
+    ["api", "graphql", "-f", 'query={repository(owner:"second-org",name:"other"){name}}'],
+    ["api", "graphql", "-F", "owner=second-org", "-F", "name=other", "-f", "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){name}}"],
+    ["api", "graphql", "--input", "query.json"],
+    ["api", "https://api.github.com:443/graphql", "-f", 'query={repository(owner:"second-org",name:"other"){name}}'],
+    ["api", "https://api.github.com:8443//%67raphql?unused=1", "--input", "query.json"],
+    ["api", "-X", "POST", "--", "graphql"],
+    ["api", "search/repositories?q=second-org"],
+    ["api", "repos/%zz/other"],
+    ["api", "repos/second-org/../other"],
+    ["repo", "clone", "--", "not-a-repository"],
+    ["pr", "list", "--repo"],
+    ["pr", "view", "https://github.com/%73econd-org/other/pull/42"],
+    ["repo", "clone", "https://github.com:443/%73econd-org/other.git"],
+  ])("refuses unsupported explicit targets instead of using origin: %j", async (...args) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-graphql-target-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), real = path.join(root, "real");
+    await mkdir(bin); await mkdir(real);
+    await exec("git", ["init", "-q", root]);
+    await exec("git", ["-C", root, "remote", "add", "origin", "https://github.com/example-org/fetch.git"]);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(real, "gh"), `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN || '');`, { mode: 0o700 });
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: "", token: "" }), PATH: `${bin}:${real}:${process.env.PATH}` };
+    await expect(exec(path.join(bin, "gh"), args, { cwd: root, env })).rejects.toMatchObject({
+      code: 1, stdout: "", stderr: expect.stringContaining("repository_target_required"),
+    });
+  });
+
   it("uses a private interpreter without selecting Node from PATH", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-interpreter-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));

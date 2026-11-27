@@ -17,16 +17,30 @@ function resolveStdoutParser(source: StdoutLineParser | TranscriptParserSource) 
 }
 
 export function appendTranscriptEntry(entries: TranscriptEntry[], entry: TranscriptEntry) {
+  // Completion carries the authoritative text and channel for a streamed item.
+  if (entry.kind === "assistant" && !entry.delta && entry.itemId) {
+    const matches = (item: TranscriptEntry) => item.kind === "assistant" && item.itemId === entry.itemId;
+    const first = entries.findIndex(matches);
+    if (first >= 0) {
+      entries[first] = entry;
+      for (let index = entries.length - 1; index > first; index -= 1) {
+        if (matches(entries[index]!)) entries.splice(index, 1);
+      }
+      return;
+    }
+  }
   if ((entry.kind === "thinking" || entry.kind === "assistant") && entry.delta) {
     const last = entries[entries.length - 1];
     if (
       last &&
       last.kind === entry.kind &&
       last.delta &&
+      last.itemId === entry.itemId &&
       last.channel === entry.channel
     ) {
       last.text += entry.text;
       last.ts = entry.ts;
+      last.contentVersion = entry.contentVersion;
       return;
     }
   }

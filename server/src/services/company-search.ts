@@ -54,6 +54,7 @@ type IssueSearchRow = {
   description: string | null;
   status: string;
   displayStatus: string;
+  unblockDescriptor: CompanySearchIssueSummary["unblockDescriptor"];
   priority: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
@@ -457,6 +458,7 @@ function issueResult(row: IssueSearchRow, prefix: string, normalizedQuery: strin
     title: row.title,
     status: row.status as CompanySearchIssueSummary["status"],
     displayStatus: row.displayStatus as CompanySearchIssueSummary["displayStatus"],
+    unblockDescriptor: row.unblockDescriptor ?? null,
     priority: row.priority as CompanySearchIssueSummary["priority"],
     assigneeAgentId: row.assigneeAgentId,
     assigneeUserId: row.assigneeUserId,
@@ -636,7 +638,7 @@ export function companySearchService(db: Db) {
           conditions.length > 0 ? sql`WHERE ${sql.join(conditions, sql` AND `)}` : sql``;
         // Count branches must match the result branch's column list; the
         // trailing NULLs pad the issue data columns.
-        const countTail = sql`, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::uuid, NULL::text, NULL::uuid, NULL::timestamptz, NULL::timestamptz, NULL::double precision, NULL::text[]`;
+        const countTail = sql`, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::jsonb, NULL::text, NULL::uuid, NULL::text, NULL::uuid, NULL::timestamptz, NULL::timestamptz, NULL::double precision, NULL::text[]`;
         const branches: SQL[] = [];
 
         const wantResultRows = scopeIncludesIssues(scope)
@@ -663,6 +665,7 @@ export function companySearchService(db: Db) {
                 WHERE issue_text.id = m.id AND issue_text.company_id = ${companyId}) AS description,
               m.status,
               m.display_status AS "displayStatus",
+              m.unblock_descriptor AS "unblockDescriptor",
               m.priority,
               m.assignee_agent_id AS "assigneeAgentId",
               m.assignee_user_id AS "assigneeUserId",
@@ -770,6 +773,7 @@ export function companySearchService(db: Db) {
               description: row.description,
               status: row.status,
               displayStatus: row.displayStatus,
+              unblockDescriptor: row.unblockDescriptor,
               priority: row.priority,
               assigneeAgentId: row.assigneeAgentId,
               assigneeUserId: row.assigneeUserId,

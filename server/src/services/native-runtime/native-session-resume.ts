@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { resolveSessionContinuity } from "./continued-session.js";
+import { OWN_PROCESS_START_EVENT_TYPES } from "../native-process-start-events.js";
 import { and, desc, eq, exists, inArray, isNotNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
   heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, nativeRunnerCheckpoints, nativeRunResults, type Db,
@@ -255,9 +257,9 @@ const INHERITED_CHECKPOINT_SOURCE_FIELDS = ["backendKind", "driverKind", "sessio
 export async function findNativeSessionResumeRun(db: Db, input: NativeSessionResumeSelection) {
   if (!isNativeSessionId(input.normalizedSessionId)) return null;
   const barrier = await selectNativeSessionResumeBarrier(db, input, []);
-  // A follow-up that failed before any provider or controller work holds only
-  // the checkpoint it inherited. Select its source instead, but only when
-  // every skipped run proves that and inherited exactly that source session.
+  // A failed follow-up may have started a process/controller without a turn.
+  // Select its inherited source only when every skipped run has no own
+  // checkpoint, result or provider progress and inherited that exact session.
   const skipped: NonNullable<typeof barrier>[] = [];
   let selected = barrier;
   while (selected && skipped.length < NATIVE_RESUME_CANDIDATE_WINDOW &&
@@ -269,13 +271,16 @@ export async function findNativeSessionResumeRun(db: Db, input: NativeSessionRes
   const source = record(selected?.runnerProfileJson.sessionCheckpoint);
   const inherited = selected !== null && typeof source.sessionId === "string" && skipped.every(run => {
     const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
-    return INHERITED_CHECKPOINT_SOURCE_FIELDS.every(field => checkpoint[field] === source[field]);
+    return INHERITED_CHECKPOINT_SOURCE_FIELDS.every(field => checkpoint[field] === source[field]) &&
+      // A staged follower may inherit a non-null committed cursor. It is not
+      // new progress, but it must still be the exact source cursor.
+      (checkpoint.cursor == null || isDeepStrictEqual(checkpoint.cursor, source.cursor));
   });
   return inherited ? selected : barrier;
 }
 
-/** The run row, its coordinator, and the absence of controller checkpoints,
- * results and provider events together prove no provider work started. */
+/** A process/controller startup is not a committed turn. Keep all provider
+ * progress fences and prove no controller checkpoint parts belong to this run. */
 async function isUnstartedInheritedFollowUp(
   db: Db,
   input: NativeSessionResumeSelection,
@@ -284,29 +289,60 @@ async function isUnstartedInheritedFollowUp(
 ): Promise<boolean> {
   const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
   const identity = record(checkpoint.identity);
-  if (run.runtimeMode !== "native" || run.status !== "failed" || run.processPid !== null ||
-      run.processGroupId !== null || run.processStartedAt !== null || run.runnerProfileJson.nativeControllerRecovery != null ||
-      identity.runId !== run.id || identity.sessionId !== input.normalizedSessionId || checkpoint.cursor !== null) return false;
+  if (run.runtimeMode !== "native" || !["failed", "cancelled"].includes(run.status) ||
+      record(run.runnerProfileJson.nativeControllerRecovery).schema === "paperclip.native-controller-recovery.v1" ||
+      identity.companyId !== input.companyId || identity.agentId !== input.agentId || identity.issueId !== input.issueId ||
+      identity.sessionId !== input.normalizedSessionId || typeof identity.runId !== "string" ||
+      checkpoint.activeTurnId != null || (Array.isArray(checkpoint.pendingRuntimeRequests) && checkpoint.pendingRuntimeRequests.length > 0)) return false;
+  return nativeRunHasNoProviderWork(db, input, run.id, { allowDispatchHandoff: true, allowProcessStartup: true });
+}
+
+/** Shared negative-work proof for inherited-source selection and the preparation
+ * owner's Stop settlement. A cancellation label or lease release alone is not proof.
+ * Only source selection may allow dispatch/process/controller startup; Stop must
+ * still prove no handoff or process/controller ownership. Neither may skip a turn. */
+export async function nativeRunHasNoProviderWork(db: Db,
+  input: Pick<NativeSessionResumeSelection, "companyId" | "agentId" | "issueId">, runId: string,
+  options: { allowDispatchHandoff?: boolean; allowProcessStartup?: boolean } = {}): Promise<boolean> {
   const [evidence] = await db.select({
+    processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
+    processStartedAt: heartbeatRuns.processStartedAt, profile: heartbeatRuns.runnerProfileJson,
+    dispatchHandedOffAt: sql<unknown>`${heartbeatRuns.usageJson}#>'{budgetDispatch,handedOffAt}'`,
     executionRecovery: sql<unknown>`${heartbeatRuns.resultJson}->'executionRecovery'`,
     phase: nativeRunFinalizations.phase,
     resultId: nativeRunFinalizations.resultId,
     leaseOwner: nativeRunFinalizations.leaseOwner,
     controllerPid: nativeRunFinalizations.controllerPid,
+    processStart: sql<boolean>`exists (select 1 from ${heartbeatRunEvents}
+      where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+        and ${heartbeatRunEvents.eventType} in (${sql.join(OWN_PROCESS_START_EVENT_TYPES.map(type => sql`${type}`), sql`, `)}))`,
+    committedTurn: sql<boolean>`exists (select 1 from ${heartbeatRunEvents}
+      where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId} and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+        and (${heartbeatRunEvents.eventType} in ('turn.started', 'turn.completed') or ${heartbeatRunEvents.eventType} like 'item.%'))`,
     controllerCheckpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints}
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
       where ${nativeRunResults.companyId} = ${heartbeatRuns.companyId} and ${nativeRunResults.runId} = ${heartbeatRuns.id})`,
-  }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
+  }).from(heartbeatRuns).leftJoin(nativeRunFinalizations, and(
     eq(nativeRunFinalizations.runId, heartbeatRuns.id), eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId),
     eq(nativeRunFinalizations.issueId, input.issueId),
-  )).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, input.companyId),
-    eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId)));
+  )).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId),
+    sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${input.issueId}`));
+  // Stop before dispatch may have no coordinator and no executionRecovery
+  // record at all. Absence of actual work, not the failure label, is the proof.
   const recovery = record(evidence?.executionRecovery);
-  return Boolean(evidence && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false &&
-    evidence.phase === "terminal_failure" && evidence.resultId === null && evidence.leaseOwner === null &&
-    evidence.controllerPid === null && !evidence.controllerCheckpoint && !evidence.result &&
-    !(await nativeSessionProviderEvidence(db, [run.id])).has(run.id));
+  const checkpoint = record(evidence?.profile?.sessionCheckpoint);
+  return Boolean(evidence && (options.allowProcessStartup || (evidence.processPid === null && evidence.processGroupId === null &&
+    evidence.processStartedAt === null && evidence.leaseOwner === null && evidence.controllerPid === null && !evidence.processStart)) &&
+    (options.allowDispatchHandoff || evidence.dispatchHandedOffAt == null) &&
+    record(evidence.profile?.nativeControllerRecovery).schema !== "paperclip.native-controller-recovery.v1" &&
+    checkpoint.activeTurnId == null &&
+    (!Array.isArray(checkpoint.pendingRuntimeRequests) || checkpoint.pendingRuntimeRequests.length === 0) &&
+    recovery.providerWorkStarted !== true &&
+    (evidence.phase === null || ["observed", "terminal_failure"].includes(evidence.phase)) &&
+    evidence.resultId === null && !evidence.committedTurn && !evidence.controllerCheckpoint && !evidence.result &&
+    !(await nativeSessionProviderEvidence(db, [runId])).has(runId));
 }
 
 async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResumeSelection, skippedRunIds: string[]) {
@@ -493,10 +529,15 @@ export function isUnusedLegacyNativeRetryReplacement(input: {
   );
 }
 
-function sameProvider(
+export function nativeSessionProvidersMatch(
   previous: NativeExecutionInput["provider"],
   current: NativeExecutionInput["provider"],
 ): boolean {
+  if (previous.kind === "pi_rpc" && current.kind === "pi_rpc" &&
+      resolveSessionContinuity(previous.kind, previous.sessionContinuity) === "continuous" &&
+      resolveSessionContinuity(current.kind, current.sessionContinuity) === "continuous")
+    return isDeepStrictEqual({ ...previous, model: undefined, piRpcThinkingLevel: undefined, sessionContinuity: undefined },
+      { ...current, model: undefined, piRpcThinkingLevel: undefined, sessionContinuity: undefined });
   return JSON.stringify(previous) === JSON.stringify(current);
 }
 
@@ -548,6 +589,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
   previousRun:
     Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
   normalizedSessionId: string;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -575,6 +617,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
       const retainedCheckpoint = rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: retainedFormat,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -586,6 +629,7 @@ export function buildNativeExecutionWithCheckpoint(input: {
     ? rebindNativeSessionCheckpoint({
         previousRun: input.previousRun,
         currentExecution: execution,
+        sessionContinuity: input.sessionContinuity,
         executionTargetKind: input.executionTargetKind,
         toolRefreshOnResume: input.toolRefreshOnResume,
         refreshTools: input.refreshTools,
@@ -614,9 +658,21 @@ export function nativeRuntimeContextsMatch(
   previous: NativeRuntimeContextSnapshot,
   current: NativeRuntimeContextSnapshot,
   toolRefreshOnResume?: boolean,
+  instructionRefreshOnResume = false,
+  packPromptRefreshOnResume = false,
+  skillRefreshOnResume = false,
 ): boolean {
   return previous.aggregateDigest === current.aggregateDigest ||
-    (toolRefreshOnResume === true && canonicalNativeRuntimeContextDigest({ ...previous, mcp: current.mcp }) === current.aggregateDigest);
+    ((instructionRefreshOnResume || packPromptRefreshOnResume || skillRefreshOnResume || toolRefreshOnResume === true) && canonicalNativeRuntimeContextDigest({
+      ...previous,
+      ...(instructionRefreshOnResume ? { instructions: current.instructions } : {}),
+      // Pack-owned execution framing may advance; account instructions and
+      // tool assignments are still retained-session compatibility inputs.
+      ...(packPromptRefreshOnResume ? { prompt: current.prompt } : {}),
+      // A continuous Pi session takes a new skill list at its next launch.
+      ...(skillRefreshOnResume ? { skills: current.skills } : {}),
+      ...(toolRefreshOnResume === true ? { mcp: current.mcp } : {}),
+    }) === current.aggregateDigest);
 }
 
 /**
@@ -634,6 +690,7 @@ export function rebindNativeSessionCheckpoint(input: {
     runnerProfileJson: unknown;
   };
   currentExecution: NativeExecutionInput;
+  sessionContinuity?: unknown;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -660,6 +717,8 @@ export function rebindNativeSessionCheckpoint(input: {
   const checkpointIdentity = record(rawCheckpoint.identity);
   const current = input.currentExecution;
   const normalizedSessionId = current.session.normalizedSessionId;
+  const continuousPi = current.provider.kind === "pi_rpc" &&
+    resolveSessionContinuity(current.provider.kind, current.provider.sessionContinuity) === "continuous";
   if (
     !isNativeSessionId(normalizedSessionId) ||
     input.previousRun.companyId !== current.binding.companyId ||
@@ -682,6 +741,13 @@ export function rebindNativeSessionCheckpoint(input: {
   } catch {
     return null;
   }
+  const localContinuousPi = current.provider.kind === "pi_rpc" &&
+    resolveSessionContinuity(current.provider.kind, input.sessionContinuity) === "continuous" &&
+    (input.executionTargetKind ?? "local") === "local";
+  const workspaceChanged = !sameWorkspaceScope({ previousExecution, previousRunId: input.previousRun.id, currentExecution: current }) ||
+    (localContinuousPi && previousExecution.workspace.cwd !== current.workspace.cwd);
+  const workspaceContinuation = workspaceChanged && localContinuousPi &&
+    (!rawCheckpoint.goal || record(rawCheckpoint.goal).status === "complete");
   if (
     previousExecution.binding.runId !== input.previousRun.id ||
     previousExecution.binding.companyId !== current.binding.companyId ||
@@ -689,22 +755,17 @@ export function rebindNativeSessionCheckpoint(input: {
     previousExecution.binding.agentId !== current.binding.agentId ||
     previousExecution.session.normalizedSessionId !== normalizedSessionId ||
     previousExecution.session.driverKind !== current.session.driverKind ||
-    !sameWorkspaceScope({
-      previousExecution,
-      previousRunId: input.previousRun.id,
-      currentExecution: current,
-    }) ||
+    (workspaceChanged && !workspaceContinuation) ||
     previousExecution.task.workMode !== current.task.workMode ||
     ("executionMode" in previousExecution
       ? previousExecution.executionMode
       : "default") !==
       ("executionMode" in current ? current.executionMode : "default") ||
-    !sameProvider(previousExecution.provider, current.provider) ||
+    !nativeSessionProvidersMatch(previousExecution.provider, current.provider) ||
     previousExecution.schema !== current.schema ||
     ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
-    ("runtimeContext" in previousExecution &&
-      "runtimeContext" in current &&
-      !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume))
+    ("runtimeContext" in previousExecution && "runtimeContext" in current &&
+      !nativeRuntimeContextsMatch(previousExecution.runtimeContext, current.runtimeContext, input.toolRefreshOnResume, continuousPi, continuousPi, continuousPi))
   )
     return null;
 
@@ -731,6 +792,7 @@ export function rebindNativeSessionCheckpoint(input: {
       issueId: current.binding.issueId,
       agentId: current.binding.agentId,
     },
+    ...(workspaceContinuation ? { workingDirectory: current.workspace.cwd ?? undefined } : {}),
     cursor: null,
     semanticResult: null,
     terminal: null,

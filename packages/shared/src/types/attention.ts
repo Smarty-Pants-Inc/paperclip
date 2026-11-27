@@ -3,6 +3,8 @@ import type {
   IssueThreadInteractionEffectiveResolverPolicySource,
   IssueThreadInteractionResolverPolicyProvenance,
 } from "../constants.js";
+import type { IssueDisplayStatus } from "../constants.js";
+import type { IssueUnblockDescriptor } from "./issue.js";
 import type { InboxDismissalKind } from "./inbox-dismissal.js";
 
 export const ATTENTION_SOURCE_KINDS = [
@@ -36,6 +38,9 @@ export type AttentionSubjectKind =
 export type AttentionSeverity = "critical" | "high" | "medium" | "low";
 
 export interface AttentionSubject {
+  /** Task sign projection, present on issue subjects and related issues. */
+  displayStatus?: IssueDisplayStatus;
+  unblockDescriptor?: IssueUnblockDescriptor | null;
   kind: AttentionSubjectKind;
   id: string;
   companyId: string;

@@ -147,10 +147,15 @@ export function useLiveRunTranscripts({
     return value;
   };
   const gapPendingRef = useRef(new Set<string>());
+  const [catchingUpRunIds, setCatchingUpRunIds] = useState<ReadonlySet<string>>(new Set());
+  const [incompleteRunIds, setIncompleteRunIds] = useState<ReadonlySet<string>>(new Set());
   const refreshByRunRef = useRef(new Map<string, (force?: boolean) => void>());
   const requestCatchUp = (runId: string) => {
     if (gapPendingRef.current.has(runId)) return;
     gapPendingRef.current.add(runId);
+    setCatchingUpRunIds(new Set(gapPendingRef.current));
+    missingTerminalLogRunIdsRef.current.delete(runId);
+    // A stream gap requests durable history; it is not a failed history read.
     refreshByRunRef.current.get(runId)?.();
   };
   const bindLog = (runId: string, store: unknown, ref: unknown): "same" | "changed" | "stale" => {
@@ -170,6 +175,10 @@ export function useLiveRunTranscripts({
     trimmedSeqFloorByRunRef.current.delete(runId); sequencesRef.current.delete(runId);
     for (const key of seenChunkKeysRef.current) if (key.includes(`:${runId}:`)) seenChunkKeysRef.current.delete(key);
     setChunksByRun(previous => new Map(previous).set(runId, []));
+    setIncompleteRunIds(previous => {
+      if (!previous.has(runId)) return previous;
+      const next = new Set(previous); next.delete(runId); return next;
+    });
     setTruncatedRunIds(previous => {
       if (!previous.has(runId)) return previous;
       const next = new Set(previous); next.delete(runId); return next;
@@ -202,7 +211,7 @@ export function useLiveRunTranscripts({
     seenChunkKeysRef.current.clear(); trimmedSeqFloorByRunRef.current.clear();
     pendingLogRowsByRunRef.current.clear(); logOffsetByRunRef.current.clear(); logReadLimitByRunRef.current.clear();
     logIdentityRef.current.clear(); retiredLogIdentitiesRef.current.clear(); sequencesRef.current.clear();
-    gapPendingRef.current.clear(); missingTerminalLogRunIdsRef.current.clear();
+    gapPendingRef.current.clear(); setCatchingUpRunIds(new Set()); setIncompleteRunIds(new Set()); missingTerminalLogRunIdsRef.current.clear();
     absenceDeadlineByRunRef.current.clear(); prevKnownRunIdsRef.current.clear(); transcriptCacheRef.current.clear();
   }, [companyId]);
 
@@ -306,6 +315,10 @@ export function useLiveRunTranscripts({
       const next = new Set([...previous].filter((id) => retainedRunIds.has(id)));
       return next.size === previous.size ? previous : next;
     });
+    setIncompleteRunIds((previous) => {
+      const next = new Set([...previous].filter((id) => retainedRunIds.has(id)));
+      return next.size === previous.size ? previous : next;
+    });
 
     for (const key of pendingLogRowsByRunRef.current.keys()) {
       const runId = key.replace(/:records$/, "");
@@ -339,6 +352,7 @@ export function useLiveRunTranscripts({
       for (const id of map.keys()) if (!retainedRunIds.has(id)) map.delete(id);
     }
     for (const id of gapPendingRef.current) if (!retainedRunIds.has(id)) gapPendingRef.current.delete(id);
+    setCatchingUpRunIds(previous => previous.size === gapPendingRef.current.size ? previous : new Set(gapPendingRef.current));
 
     // Re-run once the nearest grace window elapses so a run that stays gone is
     // pruned even if `normalizedRuns` never changes again.
@@ -473,10 +487,6 @@ export function useLiveRunTranscripts({
             rewinding = false;
           }
           alignStartToRecord = false;
-          setErrorsByRun(previous => {
-            if (!previous.has(run.id)) return previous;
-            const next = new Map(previous); next.delete(run.id); return next;
-          });
           const rows = parsePersistedLogContent(run.id, result.content, pendingLogRowsByRunRef.current);
           appendChunks(run.id, rows);
           for (const row of rows) sequence(run.id).confirm(row.seq);
@@ -485,19 +495,36 @@ export function useLiveRunTranscripts({
           if (result.nextOffset === undefined || result.content.length === 0 || next <= offset) break;
           offset = next;
         }
-        failed = sequence(run.id).needsCatchup;
-        if (!failed) gapPendingRef.current.delete(run.id);
+        // Only a complete successful read of a terminal run can establish lost
+        // output. Live persistence may still catch up; failed reads prove neither.
+        const gapRemains = sequence(run.id).needsCatchup;
+        const incomplete = gapRemains && isTerminalStatus(run.status);
+        setIncompleteRunIds(previous => {
+          if (previous.has(run.id) === incomplete) return previous;
+          const next = new Set(previous);
+          if (incomplete) next.add(run.id);
+          else next.delete(run.id);
+          return next;
+        });
+        failed = gapRemains && !incomplete;
+        if (!failed && gapPendingRef.current.delete(run.id)) setCatchingUpRunIds(new Set(gapPendingRef.current));
+        setErrorsByRun(previous => {
+          if (!previous.has(run.id)) return previous;
+          const next = new Map(previous); next.delete(run.id); return next;
+        });
       } catch (error) {
         if (cancelled) return;
         failed = true;
-        if (error instanceof ApiError && error.status === 404) {
+        if (error instanceof ApiError && error.status === 404 && (run.status === "running" ||
+          (offset === 0 && !sequence(run.id).needsCatchup && !run.hasStoredOutput && runKnownLogBytes(run) === null))) {
           setErrorsByRun((previous) => {
             if (!previous.has(run.id)) return previous;
             const next = new Map(previous);
             next.delete(run.id);
             return next;
           });
-          // A newly started run may not have created its log yet.
+          // Live native output/metadata can precede creation of its saved log.
+          // A terminal run with recorded output must still report a real 404.
           if (isTerminalStatus(run.status)) { missingTerminalLogRunIdsRef.current.add(run.id); failed = false; }
         } else {
           setErrorsByRun((previous) => {
@@ -513,7 +540,7 @@ export function useLiveRunTranscripts({
           if (pendingRefresh.has(run.id)) {
             missingTerminalLogRunIdsRef.current.delete(run.id);
             void readRunLog(run);
-          } else if (failed && stream.healthy) {
+          } else if (failed && (stream.healthy || isTerminalStatus(run.status))) {
             const timer = window.setTimeout(() => { retryTimers.delete(run.id); void readRunLog(run); }, LOG_POLL_INTERVAL_MS);
             retryTimers.set(run.id, timer);
           }
@@ -600,7 +627,7 @@ export function useLiveRunTranscripts({
 
   return {
     transcriptByRun,
-    hydratedRunIds, truncatedRunIds, errorsByRun, retry,
+    hydratedRunIds, truncatedRunIds, catchingUpRunIds, incompleteRunIds, errorsByRun, retry,
     isInitialHydrating: normalizedRuns.some((run) => canReadPersistedLog(run) && !hydratedRunIds.has(run.id)),
     hasOutputForRun(runId: string) {
       return (chunksByRun.get(runId)?.length ?? 0) > 0 || runById.get(runId)?.hasStoredOutput === true;

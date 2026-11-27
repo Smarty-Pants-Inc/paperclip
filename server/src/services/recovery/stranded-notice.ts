@@ -1,4 +1,6 @@
-import type { IssueCommentMetadata, IssueCommentPresentation } from "@paperclipai/shared";
+import { isNativeInputSizeRefusal } from "../native-input-refusal.js";
+import { NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, nativePromptRefusalCause, nativePromptRefusalDetail, nativePromptRefusalTitle, type NativePromptRefusalCause } from "../native-runtime/native-turn-budget.js";
+import type { IssueCommentMetadata, IssueCommentPresentation, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
 import { PROJECT_STORAGE_ENVIRONMENT_INCOMPATIBLE } from "../project-storage-environment-reason.js";
 import {
@@ -62,6 +64,37 @@ const STRANDED_RECOVERY_NOTICE_TITLES_BY_RUN_ERROR_CODE: Record<string, string> 
   claude_auth_required: "Error: not logged in to Claude",
   acpx_auth_required: "Error: agent login required",
 };
+
+/** Public failure copy is classified, never a provider's diagnostic or URL. */
+export function classifiedRunFailure(run: {
+  errorCode?: string | null;
+  failedStage?: string | null;
+  previousSessionUnconfirmed?: boolean;
+  resultJson?: Record<string, unknown> | null;
+}): NonNullable<TaskInterruptionPresentation["failure"]> & { cause?: NativePromptRefusalCause } {
+  let code = run.errorCode ?? "run_failed";
+  if (code === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND) {
+    const cause = nativePromptRefusalCause(run.resultJson?.nativeTurnPromptRefusalCause);
+    return { code, title: nativePromptRefusalTitle(cause), detail: nativePromptRefusalDetail(cause), ...(cause ? { cause } : {}) };
+  }
+  if (code === "native_predecessor_retirement_unproven"
+      || code === "native_session_interrupted" && run.previousSessionUnconfirmed)
+    code = "previous_session_unconfirmed";
+  else if (code === "native_session_interrupted") {
+    if (["runner.ingress.acquire", "runner.transport.connect"].includes(run.failedStage ?? "")) code = "agent_machine_unreachable";
+    else if (["environment.acquire", "environment.resume"].includes(run.failedStage ?? "")) code = "agent_machine_unavailable";
+  }
+  if (code === "agent_machine_unreachable") return { code, title: "Couldn't connect to the agent's machine",
+    detail: "No agent work started. Your message is saved." };
+  if (code === "agent_machine_unavailable") return { code, title: "The agent's machine was unavailable",
+    detail: "The agent's machine could not be started or resumed. No agent work started. Your message is saved." };
+  if (code === "previous_session_unconfirmed") return { code, title: "Couldn't confirm the previous session stopped",
+    detail: "The previous session could not be confirmed stopped, so no new agent work started. Your message is saved." };
+  const notice = WORKSPACE_SCAN_NOTICES[code] ?? SETUP_FAILURE_NOTICES[code];
+  return { code, title: STRANDED_RECOVERY_NOTICE_TITLES_BY_RUN_ERROR_CODE[code]
+    ?? notice?.title ?? STRANDED_RECOVERY_NOTICE_TITLES_BY_CAUSE[code] ?? "The agent's run failed",
+    detail: "This attempt did not finish. Your message is saved." };
+}
 
 const TEMPORARY_SETUP_NEXT_ACTION = "Setting up the workspace took too long, so no agent work started. "
   + "Paperclip tries again automatically.";
@@ -249,6 +282,36 @@ export function buildConfigurationIncompleteRecoveryNoticeSeed(
       tone: "danger",
     };
   }
+  if (["configuration_supersession_refused", "configuration_recovery_stalled", "configuration_recovery_unavailable"].includes(readNonEmptyStringField(configurationIncomplete, "reason") ?? "")) {
+    return {
+      title: "Configuration restart stopped",
+      body: readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_recovery_unavailable"
+        ? "Automatic configuration restart stopped because a database operation still failed on the final recovery attempt."
+        : readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_recovery_stalled"
+          ? "Automatic configuration restart stopped because execution ownership or cleanup still failed on the final recovery attempt."
+          : "Configuration changed before launch, but execution ownership no longer permits an automatic restart. This attempt stopped.",
+      nextAction: readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_recovery_unavailable"
+        ? "Review the database failure, then retry the task when it is safe."
+        : "Review execution ownership and cleanup, then retry the task when it is safe.",
+      tone: "danger",
+    };
+  }
+  if (readNonEmptyStringField(configurationIncomplete, "reason") === "configuration_churn") {
+    return {
+      title: "Configuration kept changing",
+      body: "The agent did not start because its configuration changed during three automatic retries. No provider work was started.",
+      nextAction: "Wait for configuration changes to finish, then retry the task.",
+      tone: "danger",
+    };
+  }
+  if (["secret_deleted", "secret_inactive", "version_inactive"].includes(readNonEmptyStringField(configurationIncomplete, "reason") ?? "")) {
+    return {
+      title: "Required secret unavailable",
+      body: "The agent did not start because a required secret or its selected version was removed or revoked before launch.",
+      nextAction: "Restore an active secret binding in the agent's settings, then retry the task.",
+      tone: "danger",
+    };
+  }
   return {
     body:
       "The agent did not start because a secret it needs is not set. " +
@@ -295,6 +358,9 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     status: string;
     errorCode?: string | null;
     errorSummary?: string | null;
+    failedStage?: string | null;
+    previousSessionUnconfirmed?: boolean;
+    resultJson?: Record<string, unknown> | null;
   } | null | undefined;
 }): StrandedRecoveryEscalationNotice {
   const scanNotice = WORKSPACE_SCAN_NOTICES[input.sourceRun?.errorCode ?? ""];
@@ -302,15 +368,23 @@ export function buildStrandedRecoveryEscalationNotice(input: {
   const workspaceScan = scanNotice && TEMPORARY_SETUP_CODES.has(input.sourceRun?.errorCode ?? "") && !retriesItself
     ? { ...scanNotice, nextAction: scanNotice.nextAction.replace(AUTOMATIC_RETRY_SENTENCE, MANUAL_RETRY_SENTENCE) }
     : scanNotice;
-  const seed = workspaceScan ? {
+  const failure = input.sourceRun ? classifiedRunFailure(input.sourceRun) : null;
+  const connectionFailure = failure && ["agent_machine_unreachable", "agent_machine_unavailable", "previous_session_unconfirmed"].includes(failure.code)
+    ? { title: failure.title, body: failure.detail, nextAction: "Press Retry to start it again.", tone: "danger" as const } : null;
+  const inputFailure = isNativeInputSizeRefusal(input.sourceRun?.errorCode)
+    ? { title: nativePromptRefusalTitle(nativePromptRefusalCause(input.sourceRun?.resultJson?.nativeTurnPromptRefusalCause)),
+      body: nativePromptRefusalDetail(nativePromptRefusalCause(input.sourceRun?.resultJson?.nativeTurnPromptRefusalCause)),
+      nextAction: nativePromptRefusalDetail(nativePromptRefusalCause(input.sourceRun?.resultJson?.nativeTurnPromptRefusalCause)), tone: "danger" as const }
+    : null;
+  const seed = inputFailure ?? connectionFailure ?? (workspaceScan ? {
     ...workspaceScan,
     body: retriesItself
       ? `Paperclip could not prepare the workspace before the agent started. ${workspaceScan.nextAction}`
       : `Paperclip could not prepare the workspace before the agent started. Automatic recovery could not continue. ${workspaceScan.nextAction}`,
     tone: "danger" as const,
-  } : SETUP_FAILURE_NOTICES[input.sourceRun?.errorCode ?? ""] ?? input.seed;
+  } : SETUP_FAILURE_NOTICES[input.sourceRun?.errorCode ?? ""] ?? input.seed);
   const fallbackBody = input.fallbackBody?.trim();
-  const honest = (text: string) => input.retryOffered === false ? withoutRetryInstruction(text) : text;
+  const honest = (text: string) => !inputFailure && input.retryOffered === false ? withoutRetryInstruction(text) : text;
   const body = honest(seed?.body ?? (fallbackBody || DEFAULT_STRANDED_RECOVERY_NOTICE_BODY));
   const title =
     STRANDED_RECOVERY_NOTICE_TITLES_BY_RUN_ERROR_CODE[input.sourceRun?.errorCode?.trim() ?? ""] ??
@@ -340,7 +414,7 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     runRows.push(runLinkRow("Source run", input.sourceRun));
     const failureCode = input.sourceRun.errorCode?.trim();
     if (failureCode) runRows.push(keyValueRow("Failure code", failureCode));
-    const failureSummary = input.sourceRun.errorSummary?.trim();
+    const failureSummary = connectionFailure || inputFailure ? null : input.sourceRun.errorSummary?.trim();
     if (failureSummary) runRows.push(keyValueRow("Failure summary", failureSummary));
   }
 

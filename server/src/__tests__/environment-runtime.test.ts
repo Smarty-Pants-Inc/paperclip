@@ -809,7 +809,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
   async function seedReusablePluginSandboxLease(
     adapterType: string | null = null,
-    options: { timeoutMs?: number | null; defaultAcquireTimeoutMs?: number } = {},
+    options: { timeoutMs?: number | null; bridgeRequestTimeoutMs?: number; defaultAcquireTimeoutMs?: number } = {},
   ) {
     const pluginId = randomUUID();
     const { companyId, agentId, environment: baseEnvironment, runId } = await seedEnvironment();
@@ -817,6 +817,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       provider: "fake-plugin",
       image: "fake:test",
       ...(options.timeoutMs === null ? {} : { timeoutMs: options.timeoutMs ?? 1234 }),
+      ...(options.bridgeRequestTimeoutMs === undefined ? {} : { bridgeRequestTimeoutMs: options.bridgeRequestTimeoutMs }),
       reuseLease: true,
     };
     const environment: Environment = {
@@ -847,6 +848,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
             properties: {
               image: { type: "string" },
               timeoutMs: { type: "number" },
+              bridgeRequestTimeoutMs: { type: "number" },
               reuseLease: { type: "boolean" },
             },
           },
@@ -922,13 +924,45 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const input = { environment: seeded.environment, lease: seeded.reusableLease, operations: [] };
     await runtime[method]({ ...input, minimumTimeoutMs: 900_000 });
     expect(call.mock.calls[0]?.[1]).toBe(method === "syncIn" ? "environmentSyncIn" : "environmentSyncOut");
-    expect(call.mock.calls[0]?.[2]).toMatchObject({ config: { timeoutMs }, minimumTimeoutMs: 900_000 });
+    expect(call.mock.calls[0]?.[2]).toMatchObject({
+      config: { timeoutMs: method === "syncOut" ? Math.max(timeoutMs, 900_000) : timeoutMs },
+      minimumTimeoutMs: 900_000,
+    });
     expect(call.mock.calls[0]?.[3]).toBeGreaterThan(Math.max(900_000, timeoutMs));
     await runtime[method](input);
-    expect(call.mock.calls[1]?.[2]).toMatchObject({ config: { timeoutMs } });
+    expect(call.mock.calls[1]?.[2]).toMatchObject({
+      config: { timeoutMs: method === "syncOut" ? Math.max(timeoutMs, 300_000) : timeoutMs },
+    });
     expect(call.mock.calls[1]?.[2]).not.toHaveProperty("minimumTimeoutMs");
     expect(seeded.environment.config.timeoutMs).toBe(timeoutMs);
     expect((await environmentService(db).getById(seeded.environment.id))?.config.timeoutMs).toBe(timeoutMs);
+  });
+
+  it.each([
+    { method: "syncOut" as const, label: "no configured timeouts", bridgeRequestTimeoutMs: undefined, minimumTimeoutMs: undefined, configTimeoutMs: 300_000, rpcTimeoutMs: 330_000 },
+    { method: "syncOut" as const, label: "a larger bridge budget", bridgeRequestTimeoutMs: 600_000, minimumTimeoutMs: undefined, configTimeoutMs: 600_000, rpcTimeoutMs: 630_000 },
+    { method: "syncOut" as const, label: "a larger supplied minimum", bridgeRequestTimeoutMs: undefined, minimumTimeoutMs: 1_800_000, configTimeoutMs: 1_800_000, rpcTimeoutMs: 1_830_000 },
+    { method: "syncIn" as const, label: "no configured timeouts", bridgeRequestTimeoutMs: undefined, minimumTimeoutMs: undefined, configTimeoutMs: undefined, rpcTimeoutMs: 30_000 },
+  ])("applies the outbound-only timeout floor to $method with $label", async ({ method, bridgeRequestTimeoutMs, minimumTimeoutMs, configTimeoutMs, rpcTimeoutMs }) => {
+    const seeded = await seedReusablePluginSandboxLease(null, { timeoutMs: null, bridgeRequestTimeoutMs });
+    const call = vi.fn(async (..._args: unknown[]) => ({ operations: [] }));
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: vi.fn(() => true), call,
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentSyncIn", "environmentSyncOut"] })),
+    } as unknown as PluginWorkerManager });
+    await runtime[method]({ environment: seeded.environment, lease: seeded.reusableLease,
+      operations: [], ...(minimumTimeoutMs === undefined ? {} : { minimumTimeoutMs }) });
+    const params = call.mock.calls[0]?.[2] as { config: Record<string, unknown> };
+    expect(call.mock.calls[0]?.[1]).toBe(method === "syncOut" ? "environmentSyncOut" : "environmentSyncIn");
+    expect({
+      configTimeoutMs: params.config.timeoutMs,
+      // An omitted RPC budget uses plugin-worker-manager's existing 30 s default.
+      rpcTimeoutMs: call.mock.calls[0]?.[3] ?? 30_000,
+    }).toEqual({ configTimeoutMs, rpcTimeoutMs });
+    if (method === "syncIn") expect(call.mock.calls[0]?.[3]).toBeUndefined();
+    expect(params.config.bridgeRequestTimeoutMs).toBe(bridgeRequestTimeoutMs);
+    expect(seeded.environment.config).not.toHaveProperty("timeoutMs");
+    expect((await environmentService(db).getById(seeded.environment.id))?.config).toEqual(seeded.environment.config);
   });
 
   it.each(["syncIn", "syncOut"] as const)("rejects invalid %s deadlines before a provider call", async method => {
@@ -990,6 +1024,65 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(next.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
     expect(workerManager.call).toHaveBeenCalledTimes(2);
     expect((await environmentService(db).getLeaseById(first.lease.id))?.status).toBe("failed");
+  });
+
+  it.each(["succeeded", "failed", "cancelled"])("passes the retained lease's last run outcome on acquisition reuse: %s", async status => {
+    const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+    const finishedAt = new Date("2026-01-02T03:04:05.000Z");
+    const call = vi.fn(async (_id: string, method: string) => {
+      if (method !== "environmentResumeLease" && method !== "environmentAcquireLease") throw new Error(`Unexpected plugin method: ${method}`);
+      return { providerLeaseId: seeded.reusableLease.providerLeaseId, metadata: { remoteCwd: "/workspace" } };
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    // Prime through real acquisition so the stored reuse identity matches the
+    // host-resolved runtime config, rather than a hand-constructed fingerprint.
+    await environmentService(db).releaseLease(seeded.reusableLease.id, "expired");
+    const input = { companyId: seeded.companyId, environment: seeded.environment,
+      issueId: null, agentId: seeded.agentId, adapterType: "paperclip_runner",
+      persistedExecutionWorkspace: { id: seeded.executionWorkspaceId, mode: "shared_workspace" as const } };
+    const first = await runtime.acquireRunLease({ ...input, heartbeatRunId: seeded.runId });
+    await db.update(heartbeatRuns).set({ status, finishedAt }).where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, first.lease.id));
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: seeded.companyId, agentId: seeded.agentId, status: "running" });
+    const acquired = await runtime.acquireRunLease({ ...input, heartbeatRunId: nextRunId });
+    expect(acquired.lease.providerLeaseId).toBe(seeded.reusableLease.providerLeaseId);
+    expect(call).toHaveBeenCalledWith(seeded.pluginId, "environmentResumeLease", expect.objectContaining({
+      leaseStatus: "retained", lastRun: { id: seeded.runId, status, finishedAt: finishedAt.toISOString() },
+    }), expect.any(Number));
+  });
+
+  it.each(["running", "failed"])("passes the active lease's own run during restart recovery: %s", async status => {
+    const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+    const finishedAt = status === "running" ? null : new Date("2026-01-02T03:04:05.000Z");
+    await db.update(heartbeatRuns).set({ status, finishedAt }).where(eq(heartbeatRuns.id, seeded.runId));
+    const call = vi.fn(async () => ({ providerLeaseId: seeded.reusableLease.providerLeaseId }));
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    await runtime.resumeRunLease({ environment: seeded.environment, lease: seeded.reusableLease });
+    expect(call).toHaveBeenCalledWith(seeded.pluginId, "environmentResumeLease", expect.objectContaining({
+      leaseStatus: "active", lastRun: { id: seeded.runId, status, finishedAt: finishedAt?.toISOString() ?? null },
+    }), expect.any(Number));
+    expect((await environmentService(db).getLeaseById(seeded.reusableLease.id))?.status).toBe("active");
+  });
+
+  it("passes null lastRun when the resumed lease has no bound heartbeat run", async () => {
+    const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+    await db.update(environmentLeases).set({ heartbeatRunId: null }).where(eq(environmentLeases.id, seeded.reusableLease.id));
+    const lease = (await environmentService(db).getLeaseById(seeded.reusableLease.id))!;
+    const call = vi.fn(async () => ({ providerLeaseId: lease.providerLeaseId }));
+    await environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager }).resumeRunLease({ environment: seeded.environment, lease });
+    expect(call).toHaveBeenCalledWith(seeded.pluginId, "environmentResumeLease", expect.objectContaining({
+      leaseStatus: "active", lastRun: null,
+    }), expect.any(Number));
   });
 
   it("acquires and resumes a reusable lease after a task changes from per-turn to warm", async () => {

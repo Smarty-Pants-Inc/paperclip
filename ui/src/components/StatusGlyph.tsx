@@ -7,6 +7,7 @@ import {
   CircleDashed,
   CircleDot,
   CircleMinus,
+  CirclePause,
   createLucideIcon,
   type LucideIcon,
 } from "lucide-react";
@@ -47,7 +48,9 @@ export type StatusGlyphStatus =
   | "in_review"
   | "done"
   | "blocked"
+  | "blocked_lifecycle"
   | "cancelled"
+  | "paused"
   | "in_queue";
 
 // LoaderCircle uses a 9-unit radius. Keep its open arc, but use the same
@@ -66,7 +69,9 @@ const STATUS_ICON: Record<string, LucideIcon> = {
   in_review: CircleDot,
   done: CircleCheck,
   blocked: CircleMinus,
+  blocked_lifecycle: CircleMinus,
   cancelled: Ban,
+  paused: CirclePause,
   in_queue: CircleMinus,
 };
 

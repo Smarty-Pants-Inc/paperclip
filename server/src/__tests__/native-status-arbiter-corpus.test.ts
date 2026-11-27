@@ -2898,6 +2898,25 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
   describe("native status reassessment work", () => {
     const selectedScope = (seeded: { issueId: string; runId: string }) => ({ companyId, issueId: seeded.issueId, runId: seeded.runId });
 
+    it.each([false, true])("settles three historical conversation runs across status-only turns (issue decision=%s)", async stableDecision => {
+      const seeded = await seedAutomaticReview(), work = nativeStatusReassessmentWork(db), scope = { companyId, issueId: seeded.issueId };
+      const [[run], [result], [assessment]] = await Promise.all([db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)), db.select().from(nativeRunResults).where(eq(nativeRunResults.id, seeded.resultId!)), db.select().from(workAssessments).where(eq(workAssessments.id, seeded.assessmentId))]);
+      for (let index = 1; index < 3; index++) { const runId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID();
+        await db.insert(heartbeatRuns).values({ ...run, id: runId, status: "failed", finishedAt: new Date(Date.now() - 7_200_000) }); await db.insert(nativeRunResults).values({ ...result, id: resultId, runId });
+        await db.insert(workAssessments).values({ ...assessment, id: assessmentId, runId, resultId, supersedesAssessmentId: null, inputDigest: assessmentId });
+        await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId: seeded.issueId, phase: "assessing", resultId, assessmentId });
+      }
+      await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: seeded.issueId, conversationState: "waiting", lastStatusDecisionId: stableDecision ? seeded.decision.id : null }).where(eq(issues.id, seeded.issueId));
+      for (const version of [2, 3, 4]) {
+        await db.update(issues).set({ status: "in_progress", conversationState: "active" }).where(eq(issues.id, seeded.issueId));
+        await db.update(issues).set({ status: "in_review", conversationState: "waiting", statusVersion: version }).where(eq(issues.id, seeded.issueId));
+        const pending = await work.load(scope); for (const entry of pending) await work.check(entry); await reconcileNativeFinalizations(db, [seeded.runId]);
+        expect.soft(await db.select({ count: sql<number>`count(*)::int` }).from(statusDecisions).where(and(eq(statusDecisions.issueId, seeded.issueId), eq(statusDecisions.reasonCode, "prior_status_terminal_preserved"))).groupBy(statusDecisions.runId)).toEqual([{ count: 1 }, { count: 1 }, { count: 1 }]); expect.soft(pending).toHaveLength(version === 2 ? 3 : 0);
+      }
+      await db.update(issues).set({ statusVersion: 5 }).where(eq(issues.id, seeded.issueId)); await db.update(issueWorkProducts).set({ updatedAt: new Date(Date.now() + 1000) }).where(eq(issueWorkProducts.id, seeded.workProductId));
+      const evidence = await work.load(scope); expect(evidence).toHaveLength(3); for (const entry of evidence) await work.check(entry); expect(await db.select({ count: sql<number>`count(*)::int` }).from(statusDecisions).where(and(eq(statusDecisions.issueId, seeded.issueId), eq(statusDecisions.reasonCode, "prior_status_terminal_preserved"))).groupBy(statusDecisions.runId)).toEqual([{ count: 2 }, { count: 2 }, { count: 2 }]);
+    });
+
     it.each(["retired review", "new evidence", "task status"] as const)("discovers and settles %s without revisiting settled history", async trigger => {
       const seeded = await seedAutomaticReview();
       const work = nativeStatusReassessmentWork(db), scope = selectedScope(seeded);

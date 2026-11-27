@@ -1,0 +1,37 @@
+.chat-composer-accessory-host {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  min-width: 0;
+}
+.chat-composer-accessory-host[hidden],
+.chat-composer-accessory-primary[hidden] {
+  display: none;
+}
+.chat-composer-accessory-primary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.chat-composer-accessory-selector {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: var(--sz-44px);
+  min-height: var(--sz-44px);
+  color: var(--muted-foreground);
+}
+.chat-composer-accessory-selector select {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  width: 100%;
+  cursor: pointer;
+}
+.chat-composer-accessory-selector:focus-within {
+  outline-style: solid;
+  outline-color: var(--ring);
+}

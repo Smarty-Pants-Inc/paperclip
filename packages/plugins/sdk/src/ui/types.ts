@@ -30,6 +30,13 @@ import type {
   PluginRenderCloseEvent,
 } from "../protocol.js";
 
+/** Context-only accessory props. The host arbitrates a single non-wrapping row;
+ * accessories start folded and anchor any panel upward. No task data is supplied. */
+export type {
+  PluginChatComposerAccessoryContext,
+  PluginChatComposerAccessoryProps,
+} from "@paperclipai/shared/types/plugin";
+
 // Re-export PluginBridgeErrorCode for plugin UI authors
 export type {
   PluginBridgeErrorCode,

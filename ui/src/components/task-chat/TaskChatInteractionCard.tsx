@@ -2,6 +2,7 @@ import type { ComponentProps } from "react";
 import type { IssueDocument } from "@paperclipai/shared";
 import type { MentionOption } from "@/components/MarkdownEditor";
 import { IssueThreadInteractionCard } from "@/components/IssueThreadInteractionCard";
+import { ResumeReviewAction } from "@/components/ResumeReviewAction";
 import { RoutineSuggestionCard } from "@/components/RoutineSuggestionCard";
 import { BarProposalCard } from "@/components/responsibilities/BarProposalCard";
 import { AutomationProposalCard } from "@/components/responsibilities/AutomationProposalCard";
@@ -141,6 +142,7 @@ export function TaskChatInteractionCard({
           <span className="min-w-0 flex-1"><span className="block text-xs">{label}</span><span className="block truncate">{previewText}</span></span>
           <ChevronRight aria-hidden className="h-3 w-3 shrink-0" />
         </button>
+        {interaction.kind === "request_confirmation" ? <ResumeReviewAction interaction={interaction} /> : null}
       </div>
     );
   }

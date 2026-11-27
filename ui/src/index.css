@@ -210,6 +210,8 @@
 
 :root {
   --breadcrumb-parent-max-width: 40%;
+  --chat-task-tray-panel-max-height: 50dvh;
+  --chat-task-tray-panel-mobile-max-height: 60dvh;
   color-scheme: light;
   --font-paper-mono: "Paper Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   --file-tree-indent-base: calc(var(--spacing) * 2);
@@ -611,7 +613,7 @@
   --tc-composer-bottom: var(--sz-calc-8);
   --mobile-chat-viewport-height: 100dvh;
   --tc-composer-editor-max-height: min(var(--sz-28dvh), calc(var(--mobile-chat-viewport-height) * 0.4));
-  --tc-composer-visible-nav-offset: calc(4rem + var(--spacing) * 1.5 + var(--sz-safe-bottom));
+  --tc-composer-visible-nav-offset: calc(var(--mobile-nav-height) + var(--spacing) * 1.5 + var(--mobile-nav-bottom));
   /* With the dock's pb-1, leave 12px below the card when the nav hides. */
   --tc-composer-hidden-nav-offset: calc(var(--sz-safe-bottom) + var(--spacing) * 2);
 
@@ -955,19 +957,88 @@ select:where(:not([multiple]):not(.appearance-none)):where(:not([size]), [size="
   }
 }
 
-/* Keep the nav on the compositor; the composer follows the same easing and
-   duration while the page retains its reserved bottom space. */
-.mobile-bottom-nav {
-  transform: translateY(0);
-  transition: transform var(--motion-mobile-nav-enter) var(--motion-ease-out-expo);
-  will-change: transform;
+/* Phone capsule: shared by both shells; reserves stay stable during scrolling. */
+:root {
+  --mobile-nav-height: 48px;
+  --mobile-nav-inset: 14px;
+  --mobile-nav-bottom: max(8px, var(--sz-safe-bottom));
+  --mobile-nav-radius: 26px;
+  --mobile-nav-padding: 2px;
+  --mobile-tab-height: 44px;
+  --mobile-tab-radius: 23px;
+  --mobile-tab-gap: 1px;
+  --mobile-tab-font: 11px;
+  --mobile-tab-line: 14px;
+  --mobile-tab-active: color-mix(in srgb, var(--foreground) 9%, transparent);
+  --mobile-nav-solid: var(--muted);
+  --mobile-nav-glass: color-mix(in srgb, var(--background) 80%, transparent);
+  --mobile-nav-filter: blur(20px) saturate(1.35);
+  --mobile-nav-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foreground) 12%, transparent), 0 4px 18px oklch(0 0 0 / 13%);
+  --mobile-badge-font: 9px;
+  --mobile-badge-line: 12px;
+  --mobile-badge-padding: 3px;
+  --mobile-badge-width: 16px;
+  --mobile-badge-radius: 8px;
+  --mobile-badge-left: calc(50% + 2px);
 }
-
-.mobile-bottom-nav[data-visible="false"] {
-  transform: translateY(100%);
-  transition-duration: var(--motion-mobile-nav-exit);
-  transition-timing-function: var(--motion-ease-standard);
-  pointer-events: none;
+.dark { --mobile-nav-glass: color-mix(in srgb, var(--muted) 82%, transparent); }
+@media (max-width: 767px) {
+  html:root { --selection-bar-bottom: calc(var(--mobile-nav-height) + var(--spacing) * 3 + var(--mobile-nav-bottom) - env(safe-area-inset-bottom, 0px)); }
+  .mobile-bottom-nav {
+    left: var(--mobile-nav-inset);
+    right: var(--mobile-nav-inset);
+    bottom: var(--mobile-nav-bottom);
+    transform: translateY(0);
+    transition: transform var(--motion-mobile-nav-enter) var(--motion-ease-out-expo);
+    will-change: transform;
+  }
+  .mobile-tab-bar {
+    height: var(--mobile-nav-height);
+    border-radius: var(--mobile-nav-radius);
+    padding: var(--mobile-nav-padding);
+    background: var(--mobile-nav-glass);
+    -webkit-backdrop-filter: var(--mobile-nav-filter);
+    backdrop-filter: var(--mobile-nav-filter);
+    box-shadow: var(--mobile-nav-shadow);
+  }
+  .mobile-tab {
+    height: var(--mobile-tab-height);
+    min-width: var(--mobile-tab-height);
+    border-radius: var(--mobile-tab-radius);
+    gap: var(--mobile-tab-gap);
+    font-size: var(--mobile-tab-font);
+    line-height: var(--mobile-tab-line);
+  }
+  .mobile-tab-active { background: var(--mobile-tab-active); }
+  .mobile-tab-badge {
+    top: 0;
+    left: var(--mobile-badge-left);
+    font-size: var(--mobile-badge-font);
+    line-height: var(--mobile-badge-line);
+    padding: 0 var(--mobile-badge-padding);
+    min-width: var(--mobile-badge-width);
+    border-radius: var(--mobile-badge-radius);
+    background: var(--foreground);
+    color: var(--background);
+    text-align: center;
+  }
+  .mobile-bottom-nav[data-visible="false"] {
+    transform: translateY(calc(100% + var(--mobile-nav-bottom)));
+    transition-duration: var(--motion-mobile-nav-exit);
+    transition-timing-function: var(--motion-ease-standard);
+    pointer-events: none;
+  }
+  /* display:none removes keyboard-hidden links from focus and accessibility. */
+  .paperclip-app-shell[data-keyboard-open="true"] .mobile-bottom-nav { display: none; }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .mobile-tab-bar { background: var(--mobile-nav-solid); -webkit-backdrop-filter: none; backdrop-filter: none; }
+  }
+  @media (prefers-reduced-transparency: reduce) {
+    .mobile-tab-bar { background: var(--mobile-nav-solid); -webkit-backdrop-filter: none; backdrop-filter: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .mobile-bottom-nav { transition: none; }
+  }
 }
 
 .mobile-nav-composer {
@@ -1807,6 +1878,16 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
   line-height: inherit;
 }
 
+/* Inline reasoning shares the answer's inset and type; only tone and italic differ. */
+.task-chat-reasoning-inline .paperclip-markdown,
+.task-chat-reasoning-inline .paperclip-markdown :is(p, h1, h2, h3, h4, h5, h6, strong, em, a) {
+  color: inherit;
+  font-style: inherit;
+}
+.task-chat-reasoning-inline .paperclip-markdown code {
+  font-style: normal;
+}
+
 /* Activity rows stay on one bounded line until explicitly expanded. The mask
    gives long provider text a quieter edge than an ellipsis, while the shared
    expanded treatment safely wraps paths, identifiers, and unbroken tokens. */
@@ -1846,6 +1927,36 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
   .tc-live-ping {
     animation: none;
   }
+}
+
+/* Approved status line: one 32px row immediately above the composer. */
+.task-chat-status-line {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  height: calc(var(--spacing) * 8);
+  min-height: calc(var(--spacing) * 8);
+  min-width: 0;
+  padding-inline: calc(var(--spacing) * 4);
+  font-size: var(--text-sm);
+  line-height: var(--text-sm--line-height);
+  color: var(--foreground);
+}
+.task-chat-status-label { font-weight: 500; white-space: nowrap; }
+.task-chat-status-shimmer {
+  --status-shimmer-highlight: oklch(0.5 0 0);
+  background: linear-gradient(90deg, var(--foreground) 0%, var(--foreground) 38%, var(--status-shimmer-highlight) 50%, var(--foreground) 62%, var(--foreground) 100%);
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer-text-slide var(--motion-conversation-tool-shimmer) linear infinite;
+}
+@media (max-width: 767px) {
+  .task-chat-status-line { padding-inline: calc(var(--spacing) * 3); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-chat-status-shimmer { animation: none; background: none; -webkit-text-fill-color: currentColor; }
 }
 
 /* Shimmer text effect for active "Working" state — Cursor-style sweep */
@@ -2154,6 +2265,65 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
   width: 100%;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+/* Phone composer row: one 44px control line in a 52px card; text grows to five lines. */
+@media (max-width: 767px) {
+.paperclip-task-chat-composer[data-composer-layout="phone-row"] {
+  --tc-phone-row-line-height: calc(var(--spacing) * 6);
+  --tc-phone-row-text-inset: calc(var(--spacing) * 2.5);
+  --tc-composer-editor-max-height: calc(5 * var(--tc-phone-row-line-height) + 2 * var(--tc-phone-row-text-inset));
+  min-height: var(--sz-52px);
+  border-width: var(--sz-1px);
+  padding: var(--sz-3px);
+}
+[data-composer-layout="phone-row"] .task-chat-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--spacing);
+  min-width: 0;
+}
+[data-composer-layout="phone-row"] [data-testid="task-chat-composer-input"] {
+  flex: 1;
+  min-width: 0;
+}
+[data-composer-layout="phone-row"] .task-chat-phone-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--spacing);
+  min-width: 0;
+}
+[data-composer-layout="phone-row"] [data-testid="task-chat-composer-selection"] {
+  flex: 0 1 auto;
+  max-width: calc(var(--spacing) * 32);
+}
+[data-composer-layout="phone-row"] .task-chat-composer-row button {
+  min-height: var(--sz-44px);
+}
+[data-composer-layout="phone-row"] :is([data-testid="task-chat-composer-add"], [data-testid="task-chat-composer-mode"], [data-testid="task-chat-composer-send"], [data-testid="task-chat-composer-stop"]) {
+  width: var(--sz-44px);
+  min-width: var(--sz-44px);
+  height: var(--sz-44px);
+}
+[data-composer-layout="phone-row"] .task-chat-phone-editor {
+  min-height: var(--sz-44px);
+  max-height: var(--tc-composer-editor-max-height);
+  overflow-y: auto;
+  line-height: var(--tc-phone-row-line-height);
+  /* Borders reserve the inset outside the scrollport; padding would let a
+     sixth line paint into that inset once the caret scrolls the field. */
+  padding: 0 !important;
+  border-block: var(--tc-phone-row-text-inset) solid transparent;
+}
+[data-composer-layout="phone-row"] .paperclip-mdxeditor-content p + p {
+  margin-top: 0;
+}
+[data-composer-layout="phone-row"] .paperclip-mdxeditor [class*="_placeholder_"] {
+  padding: var(--tc-phone-row-text-inset) 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 }
 
 .paperclip-mdxeditor-content {
@@ -3143,13 +3313,13 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   --sz-260px: 260px; /* Extracted from ui/src/components/KanbanBoard.tsx (min-w-[260px]). */
   --sz-120px: 120px; /* Extracted from ui/src/components/KanbanBoard.tsx (min-h-[120px]). */
   --sz-safe-top: env(safe-area-inset-top); /* Extracted from ui/src/components/Layout.tsx (pt-[env(safe-area-inset-top)]). */
-  --sz-calc-14: calc(5rem + env(safe-area-inset-bottom)); /* Extracted from ui/src/components/Layout.tsx (pb-[calc(5rem+env(safe-area-inset-bottom))]). */
+  --sz-calc-14: calc(var(--mobile-nav-height) + var(--spacing) * 4 + var(--mobile-nav-bottom)); /* Extracted from ui/src/components/Layout.tsx (pb-[calc(5rem+env(safe-area-inset-bottom))]). */
   --sz-38ch: 38ch; /* Extracted from ui/src/components/MarkdownBody.test.tsx (max-w-[38ch]). */
   --sz-208px: 208px; /* Extracted from ui/src/components/MarkdownEditor.test.tsx (max-h-[208px]). */
   --sz-180px: 180px; /* Extracted from ui/src/components/MarkdownEditor.tsx (min-w-[180px]). */
   --sz-calc-15: calc(100vw - 16px); /* Extracted from ui/src/components/MarkdownEditor.tsx (max-w-[calc(100vw-16px)]). */
   --sz-66px: 66px; /* Extracted from ui/src/components/MembershipAction.tsx (w-[66px]). */
-  --sz-safe-bottom: env(safe-area-inset-bottom); /* Extracted from ui/src/components/MobileBottomNav.tsx (pb-[env(safe-area-inset-bottom)]). */
+  --sz-safe-bottom: env(safe-area-inset-bottom, 0px); /* Extracted from ui/src/components/MobileBottomNav.tsx (pb-[env(safe-area-inset-bottom)]). */
   --sz-calc-16: min(calc(100dvh - 2rem),46rem); /* Extracted from ui/src/components/NewAgentDialog.tsx (max-h-[min(calc(100dvh-2rem),46rem)]). */
   --sz-24rem: 24rem; /* Extracted from ui/src/components/NewAgentDialog.tsx (h-[24rem]). */
   --sz-50vh: 50vh; /* Extracted from ui/src/components/NewGoalDialog.tsx (max-h-[50vh]). */
@@ -3162,7 +3332,7 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   --sz-calc-19: calc(1rem + env(safe-area-inset-bottom)); /* Extracted from ui/src/components/RoutineRunVariablesDialog.test.tsx (pb-[calc(1rem+env(safe-area-inset-bottom))]). */
   --sz-calc-20: min(calc(100dvh - 2rem),42rem); /* Extracted from ui/src/components/RoutineRunVariablesDialog.tsx (max-h-[min(calc(100dvh-2rem),42rem)]). */
   --sz-100dvh: 100dvh; /* Originally extracted from the removed RoutineSubSidebar (max-h-[100dvh]). */
-  --sz-calc-21: calc(1.5rem + 5rem + env(safe-area-inset-bottom)); /* Extracted from ui/src/components/ScrollToBottom.tsx (bottom-[calc(1.5rem+5rem+env(safe-area-inset-bottom))]). */
+  --sz-calc-21: calc(1.5rem + var(--sz-calc-14)); /* Extracted from ui/src/components/ScrollToBottom.tsx (bottom-[calc(1.5rem+5rem+env(safe-area-inset-bottom))]). */
   --sz-calc-22: calc(320px + 1.5rem); /* Extracted from ui/src/components/ScrollToBottom.tsx (right-[calc(320px+1.5rem)]). */
   --sz-calc-23: min(32rem,calc(100vw - 2rem)); /* Extracted from ui/src/components/SearchableSelect.tsx (max-w-[min(32rem,calc(100vw-2rem))]). */
   --sz-277px: 277px; /* Extracted from ui/src/components/SidebarAccountMenu.test.tsx (w-[277px]). */
@@ -3668,7 +3838,7 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   --announcement-image-mobile-height: 6rem;
   /* Docked in the sidebar: the navigation keeps at least half the height. */
   --announcement-sidebar-max-height: 50dvh;
-  --announcement-mobile-bottom: calc(var(--spacing) * 19 + env(safe-area-inset-bottom, 0px));
+  --announcement-mobile-bottom: calc(var(--mobile-nav-height) + var(--spacing) * 3 + var(--mobile-nav-bottom));
   --announcement-max-height: calc(100dvh - var(--spacing) * 6);
   --announcement-mobile-max-height: calc(100dvh - var(--announcement-mobile-bottom) - var(--spacing) * 3);
 }
@@ -3739,7 +3909,7 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
 :root {
   --plugin-shell-gap: calc(var(--spacing) * 3);
   --plugin-shell-inset: calc(var(--spacing) * 4);
-  --plugin-shell-mobile-bottom: calc(var(--sz-calc-14) + var(--sz-safe-bottom) + var(--plugin-shell-inset));
+  --plugin-shell-mobile-bottom: calc(var(--sz-calc-14) + var(--plugin-shell-inset));
 }
 .plugin-app-shell-overlays {
   position: fixed;

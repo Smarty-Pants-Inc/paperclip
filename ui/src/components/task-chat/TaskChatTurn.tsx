@@ -1,5 +1,7 @@
 import { groupImageResources } from "./image-resources";
+import { RunnerReasoningDisplay } from "./reasoning-display";
 import { useState, type ReactNode } from "react";
+import { useAgentChatRead } from "@/hooks/useAgentChatRead";
 import { cn } from "@/lib/utils";
 import { TaskChatRunHealthBanner } from "./TaskChatRunHealthBanner";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
@@ -48,7 +50,7 @@ export function turnSummaryMetrics(
 /** "✓ Worked · 38s · 3 tools · +34 −3 · 12.3k tokens" (parts omitted when unknown). */
 export function turnSummaryText(summary: TaskChatTurnItem["summary"]): string {
   const metrics = turnSummaryMetrics(summary);
-  const label = summary.failed ? "Stopped" : "Worked";
+  const label = summary.personStopped ? "Stopped" : summary.failed ? "Couldn't finish" : "Worked";
   return metrics ? `${label} · ${metrics}` : label;
 }
 
@@ -78,6 +80,9 @@ export function TaskChatTurn({
   leading,
 }: TaskChatTurnProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
+  const readRef = useAgentChatRead(item.finalResponse?.id ?? "", item.finalResponse?.createdAtIso,
+    Boolean(item.standaloneHeader && item.finalResponse?.author === "agent" && !item.finalResponse.optimistic));
+  const settledLabel = item.summary.personStopped ? "Stopped" : item.summary.failed ? "Couldn't finish" : "Worked";
   const parentRow = !item.settled && item.liveStatus != null;
   // The new Paperclip Runner task surface owns one durable chronological
   // timeline. The Worked/Stopped row is its stable header, so it stays directly
@@ -86,7 +91,7 @@ export function TaskChatTurn({
   // to use the run-wide fold below.
   if (item.standaloneHeader) {
     return (
-      <div
+      <RunnerReasoningDisplay><div
         data-testid="task-chat-turn"
         data-settled={item.settled ? "true" : "false"}
       >
@@ -104,10 +109,8 @@ export function TaskChatTurn({
           {!item.historical ? <span className="min-w-0 truncate">
             {item.continuedAfterSteering ? "Continued after steering · " : ""}
             {item.summary.durationLabel
-              ? `${item.summary.failed ? "Stopped" : "Worked"} for ${item.summary.durationLabel}`
-              : item.summary.failed
-                ? "Stopped"
-                : "Worked"}
+              ? `${settledLabel} ${item.summary.failed ? "after" : "for"} ${item.summary.durationLabel}`
+              : settledLabel}
           </span> : null}
         </div> : null}
         <TaskChatRunHealthBanner failures={item.mcpStartupFailures ?? []} />
@@ -130,7 +133,7 @@ export function TaskChatTurn({
           </div>
         ) : null}
         {item.finalResponse ? (
-          <div className="w-full" data-testid="task-chat-final-response">
+          <div ref={readRef} className="w-full" data-testid="task-chat-final-response">
             <div
               className="break-words px-1 py-2 text-sm text-foreground"
               data-testid="task-chat-agent-bubble"
@@ -141,7 +144,7 @@ export function TaskChatTurn({
             </div>
           </div>
         ) : null}
-      </div>
+      </div></RunnerReasoningDisplay>
     );
   }
   const persistentItems = item.settled
@@ -210,10 +213,8 @@ export function TaskChatTurn({
       ) : null}
       <span>
         {item.historical ? "Activity" : item.standaloneHeader && item.summary.durationLabel
-          ? `${item.summary.failed ? "Stopped" : "Worked"} for ${item.summary.durationLabel}`
-          : item.summary.failed
-            ? "Stopped"
-            : "Worked"}
+          ? `${settledLabel} ${item.summary.failed ? "after" : "for"} ${item.summary.durationLabel}`
+          : settledLabel}
       </span>
       {!item.standaloneHeader && turnSummaryMetrics(item.summary) ? (
         // Time/tools/tokens is demoted, not deleted (PAP-502): it stays in the

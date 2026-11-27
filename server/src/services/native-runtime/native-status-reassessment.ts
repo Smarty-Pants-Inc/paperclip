@@ -133,6 +133,9 @@ export async function reassessNativeStatusFromSource(
   }
   const retiredAutomaticReview = issueMatchesCurrentDecision && currentDecision
     ? await decisionHasRetiredAutomaticReview(db, currentDecision) : false;
+  // A committed preserve decision settles the run for status-only triggers: only new evidence or a retired review reopens it.
+  if (row.coordinatorPhase === "committed" && currentDecision?.reasonCode === "prior_status_terminal_preserved"
+    && !changedEvidence && !retiredAutomaticReview) return { kind: "unchanged" };
   let reassessment = null;
   let resultRow = null;
   let contractRow = null;

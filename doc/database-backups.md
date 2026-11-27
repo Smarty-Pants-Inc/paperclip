@@ -72,7 +72,7 @@ Environment overrides:
   stays closed before the failover backups of its native sessions expire (see
   `doc/recoverable-disk-cleanup.md`). The default is `7` and the minimum is `1`. A
   negative, empty, or non-numeric value falls back to the default.
-  `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED=false` turns expiry off, and
+  Expiry is off unless `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED=true`, and
   `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DRY_RUN=true` only reports candidates.
   A resumed session restores its failover backup from durable storage before the
   provider starts. Each read has a five-minute idle limit instead of a short total

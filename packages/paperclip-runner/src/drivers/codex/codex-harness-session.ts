@@ -1,4 +1,4 @@
-import { readCodexThreadState, readCodexTurnMetadata, readCodexTurnItems } from "./codex-history.js";
+import { readCodexThreadState, readCodexTurnMetadata, readCodexTurnItems, readCodexUserMessages, readCodexUserInputIds } from "./codex-history.js";
 import type { DurableRecoveryIdentity } from "../../contracts/durable-recovery.js";
 import { codexRunUsage, codexUsageBaselineForNextRun, observeCodexUsage } from "./codex-usage-baseline.js";
 import { randomUUID } from "node:crypto";
@@ -57,6 +57,18 @@ import {
   settledTerminalReplayConflict,
 } from "./codex-session-terminal.js";
 import { boundedText, record, text, userInput } from "./codex-driver-values.js";
+
+function preserveRunnerCommandResult(error: unknown, wrapped: Error): Error {
+  if (error && typeof error === "object" && "runnerCommandResult" in error) {
+    const envelope = record(error.runnerCommandResult);
+    const result = record("result" in envelope ? envelope.result : envelope);
+    Object.defineProperty(wrapped, "runnerCommandResult", { value: {
+      code: typeof result.code === "string" ? result.code : null,
+      message: typeof result.message === "string" ? redactCodexDiagnostic(result.message) : "",
+    }, enumerable: false });
+  }
+  return wrapped;
+}
 
 /** TurnStartParams.summary: provider-written reasoning summaries for every turn. */
 export const CODEX_REASONING_SUMMARY = "auto";
@@ -119,7 +131,7 @@ export class CodexHarnessSession
     return this.transport.beginRunAttachment?.(input) ?? false;
   }
 
-  async attachRun(input: { runId: string; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> {
+  async attachRun(input: { runId: string; dynamicTools?: readonly Readonly<Record<string, unknown>>[]; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> {
     this.assertProtocolIntegrity();
     const transportOwnsQuiescence = this.transport.attachRun !== undefined;
     if (
@@ -137,10 +149,14 @@ export class CodexHarnessSession
         runId: input.runId,
         turnId: `turn_attachment_${randomUUID().replaceAll("-", "")}`,
         itemId: `item_attachment_${randomUUID().replaceAll("-", "")}`,
+        ...(input.dynamicTools !== undefined ? { dynamicTools: structuredClone(input.dynamicTools) } : {}),
         ...(input.currentRunGrant ? { currentRunGrant: structuredClone(input.currentRunGrant) } : {}),
         ...(input.completionContract ? { completionContract: structuredClone(input.completionContract) } : {}),
       });
       this.assertProtocolIntegrity();
+      if (input.dynamicTools !== undefined) {
+        this.dynamicTools = structuredClone(input.dynamicTools);
+      }
       if (transportOwnsQuiescence) {
         // Runnerd's attachment contract performs two durable readiness probes,
         // drains the settled provider tail, and rotates authority atomically.
@@ -193,6 +209,8 @@ export class CodexHarnessSession
     message: NativeUserMessage;
     /** Set by orchestration only after successful provider-session recovery. */
     continuation?: true;
+    /** Explicit semantic-result repair; ordinary prepared turns never set this. */
+    dispositionOnlyRecovery?: true;
     requestedCollaborationMode?: "default" | "plan";
     /** OpenCode/OpenRouter only. Applies to this turn, never subsequent turns. */
     reasoningMode?: "default" | "disabled";
@@ -205,7 +223,7 @@ export class CodexHarnessSession
     effectiveCollaborationMode: "default" | "plan";
   }> {
     this.assertProtocolIntegrity();
-    if (input.compact === true && (input.reasoningMode !== undefined || this.dispositionOnlyRecoveryAvailable)) {
+    if (input.compact === true && (input.reasoningMode !== undefined || this.dispositionOnlyRecoveryAvailable || input.dispositionOnlyRecovery === true)) {
       throw this.unsupported("context compaction", "compaction cannot combine with reasoning or disposition recovery");
     }
     // A compaction-only run resumes the session without a fresh usage report;
@@ -232,7 +250,8 @@ export class CodexHarnessSession
           : `session failed protocol validation: ${this.protocolFailureCode} (${this.protocolFailureMessage ?? "no detail"})`,
       );
     }
-    const dispositionOnlyRecovery = this.dispositionOnlyRecoveryAvailable;
+    const dispositionOnlyRecoveryAvailable = this.dispositionOnlyRecoveryAvailable;
+    const dispositionOnlyRecovery = dispositionOnlyRecoveryAvailable || input.dispositionOnlyRecovery === true;
     // A native continuation already carries just new events and the current
     // completion IDs. Do not wrap it in the prior task objective/constraints
     // or re-invoke a skill whose instructions are already in this session.
@@ -327,9 +346,9 @@ export class CodexHarnessSession
       this.turnStarted = false;
       if (dispositionOnlyRecovery) {
         if (error instanceof CodexRpcError) {
-          // A JSON-RPC error is a definite provider rejection: no turn was
-          // accepted, so the one-shot recovery allowance remains available.
-          this.dispositionOnlyRecoveryAvailable = true;
+          // A definite rejection accepted no turn. Restore only the prior
+          // allowance; explicit repair must not arm ordinary prepared turns.
+          this.dispositionOnlyRecoveryAvailable = dispositionOnlyRecoveryAvailable;
           this.dispositionOnlyRecoveryConsumed = false;
           this.dispositionOnlyRecoveryTurnId = null;
         } else {
@@ -452,12 +471,12 @@ export class CodexHarnessSession
       this.rethrowProtocolIntegrity(error);
       const detail = redactCodexDiagnostic(String(error));
       if (/unsupported|unavailable|capability|method not found/i.test(detail)) {
-        throw this.unsupported("steering", detail);
+        throw preserveRunnerCommandResult(error, this.unsupported("steering", detail));
       }
       // Steering rejection is a retryable operation failure, not evidence
       // that the provider lacks the capability. Preserve that distinction for
       // the control plane while keeping provider diagnostics redacted.
-      throw new Error(detail);
+      throw preserveRunnerCommandResult(error, new Error(detail));
     }
   }
 
@@ -522,7 +541,7 @@ export class CodexHarnessSession
       );
     } catch (error) {
       if (error instanceof HarnessOperationAlreadyTerminalError) throw error;
-      throw this.unsupported("interruption", error);
+      throw preserveRunnerCommandResult(error, this.unsupported("interruption", error));
     }
   }
 
@@ -900,6 +919,14 @@ export class CodexHarnessSession
       terminalTurnId: reconciledTerminalTurnId,
     });
     return snapshot;
+  }
+
+  async readUserMessages(): Promise<string[] | null> {
+    return readCodexUserMessages(this.transport, this.opened.threadId);
+  }
+
+  async readUserInputIds(): Promise<string[] | null> {
+    return readCodexUserInputIds(this.transport, this.opened.threadId);
   }
 
   async usage(): Promise<Record<string, unknown> | null> {

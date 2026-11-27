@@ -1,4 +1,7 @@
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
+import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
+import { hasCommittedIssueDeliveryOwner } from "../conversation-owed-input.js";
+import { readRunFailureStage } from "../run-failure-stage.js";
 import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { OWNER_UNPROVABLE_CAUSE } from "./owner-gone-attestation.js";
@@ -104,6 +107,7 @@ import {
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { canContinueRecoveryRunAutomatically } from "../continuation-cause.js";
+import { hasUnchangedNativeInputRefusal, isNativeInputSizeRefusal } from "../native-input-refusal.js";
 import { STRANDED_CONTINUATION_MAX_AGE_MS, STRANDED_KIND, strandedRunCauseIsTemporary, type StrandedHoldRun } from "./stranded-hold-continuation.js";
 import { runningProcesses } from "../../adapters/index.js";
 import {
@@ -617,6 +621,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   INTERACTION_DELIVERY_DENIED,
   "project_access_denied",
+  "pi_model_provider_required",
   "native_provider_model_rejected",
   "provider_tool_definition_invalid",
   NATIVE_SANDBOX_DISK_FULL,
@@ -4407,13 +4412,16 @@ export function recoveryService(
           input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
+    const deliveryOwned = await hasCommittedIssueDeliveryOwner(tx, input.issue.companyId, input.issue.id);
+    const failureStage = input.latestRun?.errorCode === "native_session_interrupted"
+      ? await readRunFailureStage(tx, input.issue.companyId, input.latestRun.id) : undefined;
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
       seed: input.notice,
       fallbackBody: input.comment,
       recoveryCause,
       recoveryActionId: recoveryAction.id,
       retryOffered,
-      continuesAutomatically: Boolean(input.latestRun) && recoveryAction.kind === STRANDED_KIND
+      continuesAutomatically: deliveryOwned && Boolean(input.latestRun) && recoveryAction.kind === STRANDED_KIND
         && recoveryAction.ownerType === "board" && input.latestRun?.agentId === input.issue.assigneeAgentId
         && strandedRunCauseIsTemporary({
           status: input.latestRun?.status ?? "",
@@ -4435,6 +4443,8 @@ export function recoveryService(
             agentId: input.latestRun.agentId,
             status: input.latestRun.status,
             errorCode: input.latestRun.errorCode,
+            resultJson: parseObject(input.latestRun.resultJson),
+            ...failureStage,
             errorSummary: input.latestRun.error
               ? redactSensitiveText(input.latestRun.error)
               : null,
@@ -4917,7 +4927,13 @@ export function recoveryService(
       }
       if (issue.conversationAgentId) {
         const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
-        if (lastRun?.status === "succeeded") {
+        if (lastRun?.errorCode === "pi_model_provider_required") {
+          // Also runs for an already parked turn: a previous notice insert may
+          // have failed after terminal commit, or the executor may have died.
+          await ensurePiModelSelectionFailureNotice(db, { ...lastRun, companyId: issue.companyId }, issuesSvc.addComment)
+            .catch((err) => logger.warn({ err, runId: lastRun.id }, "Pi selection notice repair deferred"));
+        }
+        if (lastRun?.status === "succeeded" || lastRun?.errorCode === "pi_model_provider_required") {
           if (await settleConversationTurnForRun(db, issue.companyId, lastRun.id)) {
             const [current] = await db.select().from(issues).where(eq(issues.id, issue.id));
             if (current) Object.assign(issue, current);
@@ -4964,6 +4980,13 @@ export function recoveryService(
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      // Waiting for the input owner, not a continuation-exhaustion escalation.
+      // In particular, never write a Press Retry notice for this refusal.
+      if (isNativeInputSizeRefusal(latestRun?.errorCode)
+        && await hasUnchangedNativeInputRefusal(db, { companyId: issue.companyId, issueId: issue.id })) {
+        result.skipped += 1;
+        continue;
+      }
       await deps.afterStrandedLatestRunRead?.({ issueId: issue.id, runId: latestRun?.id ?? null });
       // The run's own executor still settles it: it schedules the bounded retry
       // and releases the claim itself. Escalating in that window clears the
@@ -4972,6 +4995,16 @@ export function recoveryService(
         ? await terminalRunSettlingUntil(issue.companyId, latestRun.id, latestRun) : null;
       if (settlingUntil) {
         opts?.onDeferredDeadline?.(settlingUntil.getTime());
+        result.skipped += 1;
+        continue;
+      }
+      // Repair the run-keyed notice before excluding this non-retryable run.
+      // Conversations already repaired above, before the waiting-state skip.
+      if (latestRun?.errorCode === "pi_model_provider_required") {
+        if (!issue.conversationAgentId) {
+          await ensurePiModelSelectionFailureNotice(db, { ...latestRun, companyId: issue.companyId }, issuesSvc.addComment)
+            .catch((err) => logger.warn({ err, runId: latestRun?.id }, "Pi selection notice repair deferred"));
+        }
         result.skipped += 1;
         continue;
       }

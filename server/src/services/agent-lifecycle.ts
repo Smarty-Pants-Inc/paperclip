@@ -16,6 +16,7 @@ import { and, eq } from "drizzle-orm";
 import { persistActivity, type ActivityPublication } from "./activity-log.js";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
+import { retryDeadlockedTransactionOnce } from "./transient-lock-contention.js";
 import { budgetServiceInTransaction, policyBlocks, type BudgetServiceHooks } from "./budgets.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
@@ -76,7 +77,8 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     },
     reportFailure(context, error) {
       const code = lifecycle.lifecycleFailureCode(error);
-      logger.warn({ ...context, failureCode: code ?? "unclassified" }, "Agent lifecycle operation failed");
+      const failureReason = lifecycle.lifecycleFailureReason(error);
+      logger.warn({ ...context, failureCode: code ?? "unclassified", ...(failureReason ? { failureReason } : {}) }, "Agent lifecycle operation failed");
     },
     transaction: withAccountingTransaction,
     deleteDependencies: deleteAgentDependencies,
@@ -99,7 +101,14 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
 }
 
 export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}) {
-  return lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
+  const service = lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
+  return {
+    ...service,
+    // A status-carrying PATCH is one configuration + lifecycle transaction.
+    // Retry the complete operation, with a fresh post-commit list per attempt.
+    updateAndTransition: (...args: Parameters<typeof service.updateAndTransition>) =>
+      retryDeadlockedTransactionOnce(() => service.updateAndTransition(...args)),
+  };
 }
 
 export function initializeImportedAgentConfigurationInTransaction(tx: Db, publications: ActivityPublication[],

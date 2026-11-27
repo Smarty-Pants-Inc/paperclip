@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { agents as agentsTable, heartbeatRuns, type Db } from "@paperclipai/db";
 import { agentAvatarUrl, resolveAgentAppearance } from "@paperclipai/shared";
 import { executionProjectionForRun, executionProjectionsForRuns } from "./execution-projection.js";
+import { runModelColumn } from "./heartbeat/run-model.js";
 import type { heartbeatService } from "./heartbeat.js";
 import type { agentService } from "./agents.js";
 
@@ -44,6 +45,7 @@ export function issueRunPresenceService(
       .select({
         id: heartbeatRuns.id,
         runtimeMode: heartbeatRuns.runtimeMode,
+        runModel: runModelColumn,
         wakeupRequestId: heartbeatRuns.wakeupRequestId,
         queuedCommentSourceWakeIds: sql<string[] | null>`${heartbeatRuns.contextSnapshot} -> 'queuedCommentSourceWakeIds'`.as("queuedCommentSourceWakeIds"),
         status: heartbeatRuns.status,

@@ -3,6 +3,7 @@ import type { Db } from '@paperclipai/db';
 import { forbidden, unprocessable } from '../errors.js';
 import { toolAccessService } from './tool-access.js';
 import { resolveGitHubOperationCredentials } from './github-operation-credentials.js';
+import { gitHubRepositoryHint } from './git-credentials.js';
 import type { GitHubRead } from './github-skill-source.js';
 import { openGitSkillSnapshot } from './skill-source-git-snapshot.js';
 import { createSkillSourceScanLimiter } from './skill-source-scan-limit.js';
@@ -19,13 +20,13 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
   let chosen: Authorization | undefined;
   const access = toolAccessService(db);
   const localTrusted = actor.type === 'board' && actor.source === 'local_implicit';
-  const headers = async (authorization: Authorization, force = false): Promise<Record<string, string>> => {
+  const headers = async (authorization: Authorization, force = false, repository?: string): Promise<Record<string, string>> => {
     if (actor.type === 'agent') {
       if (!actor.runId || !actor.agentId || actor.companyId !== companyId) {
         if (connectionId) throw forbidden('Private GitHub skills require an authenticated agent run.');
         return {};
       }
-      const result = await resolveGitHubOperationCredentials(db, { companyId, agentId: actor.agentId, runId: actor.runId });
+      const result = await resolveGitHubOperationCredentials(db, { companyId, agentId: actor.agentId, runId: actor.runId, repository });
       if (result.status === 'available') {
         if (connectionId && result.connectionId !== connectionId) throw forbidden('This run cannot use the source’s saved GitHub connection. Choose the run’s authorized connection.');
         authorization.connectionId = result.connectionId ?? null;
@@ -53,7 +54,7 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
     if (!connectionId) result.push({ connectionId: null });
     return result;
   };
-  const authorized = async <T>(operation: (values: Record<string, string>, authorization: Authorization) => Promise<T>, signal?: AbortSignal): Promise<T> => {
+  const authorized = async <T>(operation: (values: Record<string, string>, authorization: Authorization) => Promise<T>, signal?: AbortSignal, repository?: string): Promise<T> => {
     signal?.throwIfAborted();
     let lastError: unknown;
     try {
@@ -62,7 +63,7 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
         try {
           const invoke = async (force = false) => {
             signal?.throwIfAborted();
-            const values = await headers(authorization, force);
+            const values = await headers(authorization, force, repository);
             signal?.throwIfAborted();
             operationStarted = true;
             return operation(values, authorization);
@@ -90,7 +91,11 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
     throw lastError ?? forbidden('Reconnect an active GitHub authorization to read this repository.');
   };
   const read = (async (apiPath: string, signal?: AbortSignal) => {
-    if (!apiPath.startsWith('/repos/') || apiPath.includes('://') || apiPath.startsWith('//')) throw unprocessable('Invalid GitHub repository request.');
+    let segments: string[] = [];
+    try { segments = decodeURIComponent(apiPath.split(/[?#]/)[0]).replace(/\/+/g, '/').split('/'); } catch { /* Refuse malformed encoding below. */ }
+    const repository = segments[1] === 'repos' ? gitHubRepositoryHint(segments.slice(2, 4).join('/')) : undefined;
+    if (!apiPath.startsWith('/') || apiPath.includes('://') || apiPath.startsWith('//') || !repository
+      || segments.some(segment => segment === '.' || segment === '..')) throw unprocessable('Invalid GitHub repository request.');
     return authorized(async authorization => {
       const timeout = AbortSignal.timeout(30_000);
       const response = await fetch(`https://api.github.com${apiPath}`, {
@@ -114,7 +119,7 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
           ...(limited && Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? { retryAfterMs } : {}) });
       }
       return response.json();
-    }, signal);
+    }, signal, repository);
   }) as GitHubRead;
   const callerId = actor.type === 'agent' ? `agent:${actor.agentId}` : `board:${actor.userId ?? actor.source}`;
   let scanLease: ReturnType<typeof limitScans> | undefined;
@@ -133,7 +138,7 @@ export function skillSourceGitHubReader(db: Db, companyId: string, actor: Reques
         if (header && !/^(Bearer|token)\s+\S+$/i.test(header)) throw unprocessable('Reconnect GitHub to download repositories.');
         const token = header?.replace(/^(Bearer|token)\s+/i, '') ?? '';
         return openGitSkillSnapshot({ ...input, token, cacheScope: JSON.stringify([companyId, actor.type, actor.type === 'agent' ? actor.agentId : actor.userId, actor.type === 'agent' ? actor.runId : actor.source, authorization.connectionId, authorization.grantId]) }, { ...options, beforeDownload: lease.beforeDownload });
-      }, options.signal);
+      }, options.signal, gitHubRepositoryHint(input.repositoryUrl));
       return { ...snapshot, release: async () => { try { await snapshot.release(); } finally { if (ownsLease) lease.release(); } } };
     } catch (error) {
       if (ownsLease) lease.release();

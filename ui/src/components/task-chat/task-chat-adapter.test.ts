@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { IssueChatComment } from "@/lib/issue-chat-messages";
+import { ISSUE_COMMENT_PRESENTATION_KINDS, UNRECOVERED_FILES_NOTICE_KIND } from "@paperclipai/shared";
+import { unrecoverableSavedFilesNotice } from "../../../../server/src/services/system-recovery-state";
+import { isUnrecoveredFilesNotice } from "./adjacent-errors";
 import {
   commentsToTaskChatItems,
   formatTaskChatTimestamp,
@@ -315,6 +318,82 @@ describe("commentsToTaskChatItems", () => {
     });
     expect(items[0]).toHaveProperty("authorName", undefined);
     expect(items[0]).toHaveProperty("agentIcon", undefined);
+  });
+
+  it("qualifies only the fresh-session marker in the unrecovered-files interval, independent of input order", () => {
+    const marker = (id: string, at: string) => ({ id, authorType: "system", body: "New session · Earlier messages and files are still available.",
+      conversationSessionGeneration: 0, metadata: { version: 1, sourceRunId: id, sections: [] }, createdAt: at,
+      updatedAt: id === "fresh-workspace" ? "2026-11-27T11:44:27Z" : at });
+    const lost = { id: "lost", authorType: "system", body: "Paperclip could not recover the unsaved files from the previous run: the saved files are unavailable.",
+      createdAt: "2026-11-27T11:44:26Z" };
+    const items = commentsToTaskChatItems([
+      marker("later-session", "2026-11-27T12:00:00Z"), lost,
+      marker("fresh-workspace", "2026-11-27T11:44:00Z"),
+    ] as unknown as IssueChatComment[]);
+    expect(items.find(item => item.id === "fresh-workspace")).toMatchObject({ kind: "marker",
+      detail: "Earlier messages are kept. Files the stopped run did not save or push were not brought into this workspace." });
+    expect(items.find(item => item.id === "later-session")).toMatchObject({ kind: "marker", detail: "Earlier messages and files are still available." });
+    const ordinary = commentsToTaskChatItems([marker("ordinary", "2026-11-27T11:44:00Z")] as unknown as IssueChatComment[]);
+    expect(ordinary[0]).toMatchObject({ detail: "Earlier messages and files are still available." });
+    const deleted = commentsToTaskChatItems([marker("ordinary", "2026-11-27T11:44:00Z"), { ...lost, deletedAt: lost.createdAt }] as unknown as IssueChatComment[]);
+    expect(deleted[0]).toMatchObject({ detail: "Earlier messages and files are still available." });
+  });
+
+  it.each(["allocation_ownership_ambiguous", "source_unavailable", "historical_source_missing"] as const)(
+    "recognises the real server's %s receipt, not a copied test sentence", code => {
+      const body = unrecoverableSavedFilesNotice({ code, retryClass: "service_required", evidenceFingerprint: "receipt" });
+      const [item] = commentsToTaskChatItems([{ id: "lost", authorType: "system", body,
+        createdAt: "2026-11-27T11:44:26Z" }] as unknown as IssueChatComment[]);
+      expect(item.kind).toBe("message");
+      if (item.kind !== "message") throw new Error("Expected the recovery receipt");
+      expect(isUnrecoveredFilesNotice(item)).toBe(true);
+    });
+
+  it("prefers a semantic kind over wording while retaining the legacy system-notice envelope", () => {
+    const text = unrecoverableSavedFilesNotice({ code: "source_unavailable", retryClass: "service_required", evidenceFingerprint: "receipt" });
+    expect(isUnrecoveredFilesNotice({ author: "system", text: "New server wording", presentation: { kind: UNRECOVERED_FILES_NOTICE_KIND } })).toBe(true);
+    for (const kind of ISSUE_COMMENT_PRESENTATION_KINDS.filter(kind => kind !== "system_notice")) {
+      expect(isUnrecoveredFilesNotice({ author: "system", text, presentation: { kind } })).toBe(false);
+    }
+    for (const kind of [null, "system_notice", "files_unrecovered", "recovery_notice", "other_recovery_outcome"]) {
+      expect(isUnrecoveredFilesNotice({ author: "system", text, presentation: { kind } })).toBe(true);
+      expect(isUnrecoveredFilesNotice({ author: "system", text: "Workspace ready.", presentation: { kind } })).toBe(false);
+    }
+    for (const author of ["human", "agent"] as const) {
+      expect(isUnrecoveredFilesNotice({ author, text, presentation: { kind: UNRECOVERED_FILES_NOTICE_KIND } })).toBe(false);
+    }
+    expect(isUnrecoveredFilesNotice({ author: "system", text: `Someone quoted: ${text}` })).toBe(false);
+  });
+
+  it.each([false, true])("assigns a receipt to the following session, never the previous one (backdated=%s)", backdated => {
+    const marker = (id: string, createdAt: string, updatedAt = createdAt) => ({ id, authorType: "system",
+      body: "New session · Earlier messages and files are still available.", conversationSessionGeneration: 0,
+      metadata: { version: 1, sourceRunId: id, sections: [] }, createdAt, updatedAt });
+    const previous = marker("previous", "2026-11-27T11:00:00Z");
+    const fresh = marker("fresh", backdated ? "2026-11-27T11:44:00Z" : "2026-11-27T11:44:30Z", "2026-11-27T11:44:31Z");
+    const later = marker("later", "2026-11-27T12:00:00Z");
+    const lost = { id: "lost", authorType: "system", createdAt: "2026-11-27T11:44:26Z",
+      body: unrecoverableSavedFilesNotice({ code: "source_unavailable", retryClass: "service_required", evidenceFingerprint: "receipt" }) };
+    for (const comments of [[later, lost, previous, fresh], [previous, fresh, lost, later]]) {
+      const items = commentsToTaskChatItems(comments as unknown as IssueChatComment[]);
+      expect(items.find(item => item.id === "fresh")).toMatchObject({ kind: "marker",
+        detail: "Earlier messages are kept. Files the stopped run did not save or push were not brought into this workspace." });
+      for (const id of ["previous", "later"]) expect(items.find(item => item.id === id)).toMatchObject({
+        detail: "Earlier messages and files are still available." });
+    }
+    // A not-yet-published marker must not transfer the warning backwards.
+    expect(commentsToTaskChatItems([previous, lost] as unknown as IssueChatComment[])[0]).toMatchObject({
+      detail: "Earlier messages and files are still available." });
+  });
+
+  it("does not qualify an unrelated session hours after recovery failed to start", () => {
+    const lost = { id: "lost", authorType: "system", createdAt: "2026-11-27T11:00:00Z",
+      body: unrecoverableSavedFilesNotice({ code: "source_unavailable", retryClass: "service_required", evidenceFingerprint: "receipt" }) };
+    const later = { id: "unrelated", authorType: "system", createdAt: "2026-11-27T14:00:00Z",
+      body: "New session · Earlier messages and files are still available.", conversationSessionGeneration: 1 };
+    const items = commentsToTaskChatItems([lost, later] as unknown as IssueChatComment[]);
+    expect(items.find(item => item.id === "unrelated")).toMatchObject({
+      detail: "Earlier messages and files are still available." });
   });
 
   it("keeps an agent comment with message presentation as an agent bubble", () => {

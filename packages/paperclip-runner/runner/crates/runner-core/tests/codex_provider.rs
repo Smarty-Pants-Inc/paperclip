@@ -1246,6 +1246,39 @@ fn verify_late_goal_retention(clear_goal: bool) {
     fs::remove_dir_all(directory).unwrap();
 }
 
+// catch: (Pi startup metadata)
+#[test]
+#[cfg(unix)]
+fn pi_startup_rpc_rejection_preserves_only_validated_provider_failure() {
+    for structured in [true, false] {
+        let directory = temporary_directory("pi-startup-rpc-rejection");
+        let node = std::process::Command::new("node").args(["-p", "process.execPath"]).output().unwrap();
+        assert!(node.status.success());
+        let source = PathBuf::from(String::from_utf8(node.stdout).unwrap().trim());
+        let node = directory.join("node");
+        fs::copy(source, &node).unwrap();
+        let proxy = directory.join("proxy.cjs");
+        let failure = json!({"schema":"paperclip.provider-failure.v1", "phase":"startup", "provider":"pi_rpc", "category":"model_unavailable", "message":"model refused", "retryability":"requires_action"});
+        let error = if structured { json!({"code":-32000,"message":"model refused","data":{"providerFailure":failure}}) }
+            else { json!({"code":-32000,"message":"model refused"}) };
+        fs::write(&proxy, format!(r#"const rl = require('node:readline').createInterface({{input:process.stdin}});
+rl.on('line', line => {{ const m = JSON.parse(line); if (m.id === undefined) return;
+console.log(JSON.stringify(m.method === 'thread/start' ? {{id:m.id,error:{error}}} : {{id:m.id,result:{{}}}})); }});
+"#)).unwrap();
+        let config: CodexProviderConfig = serde_json::from_value(json!({
+            "provider":"pi_rpc", "driver":"pi_rpc", "providerVersion":"pi-rpc-v1",
+            "command":node, "args":[proxy], "cwd":directory, "model":"openai/fixture",
+        })).unwrap();
+        let mut executor = CodexCommandExecutor::with_runner_config(&directory, &durable_config(&directory));
+        executor.execute(&command("prepare", 1, "run.prepare", json!({"provider":config}))).unwrap();
+        let rejected = executor.execute(&command("open", 2, "session.open", json!({}))).unwrap_err();
+        assert!(rejected.to_string().contains("model refused"), "{rejected}");
+        assert_eq!(rejected.provider_failure(), structured.then_some(failure));
+        drop(executor);
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 #[test]
 fn failed_provider_startup_is_persistently_fenced_before_another_process_can_resume() {
     let directory = temporary_directory("failed-startup-fence");
@@ -7538,7 +7571,7 @@ fn pending_runtime_request_count_limit_rejects_the_overflowing_request() {
         .start_turn("Bound pending runtime requests by count.", &config.cwd)
         .expect("start held provider turn");
     provider
-        .interrupt_turn()
+        .interrupt_turn(None)
         .expect("request the runtime-request flood");
 
     let deadline = event_deadline();

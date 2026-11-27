@@ -1,4 +1,5 @@
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { issueStatusProjectionFields } from "./issue-display-status.js";
 import { skillAccessService } from "./skill-access.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
 import { acceptedFirstTurnCommentIdsSql } from "./queued-comment-delivery.js";
@@ -213,6 +214,9 @@ export function activityService(db: Db) {
           ${heartbeatRuns.resultJson} -> 'costUsd'
         ),
         'stopReason', ${heartbeatRuns.resultJson} -> 'stopReason',
+        'personStop', ${heartbeatRuns.resultJson} -> 'personStop',
+        'continuousReplies', ${heartbeatRuns.resultJson} -> 'continuousReplies',
+        'queuedSteeringAcknowledgements', ${heartbeatRuns.resultJson} -> 'queuedSteeringAcknowledgements',
         'effectiveTimeoutSec', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutSec',
         'effectiveTimeoutMs', ${heartbeatRuns.resultJson} -> 'effectiveTimeoutMs',
         'timeoutConfigured', ${heartbeatRuns.resultJson} -> 'timeoutConfigured',
@@ -754,6 +758,7 @@ export function activityService(db: Db) {
           identifier: issues.identifier,
           title: issues.title,
           status: issues.status,
+          ...issueStatusProjectionFields(),
           priority: issues.priority,
         })
         .from(activityLog)
@@ -780,6 +785,7 @@ export function activityService(db: Db) {
           identifier: issues.identifier,
           title: issues.title,
           status: issues.status,
+          ...issueStatusProjectionFields(),
           priority: issues.priority,
         })
         .from(issues)

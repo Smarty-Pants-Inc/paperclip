@@ -973,7 +973,9 @@ async function startServerWithDatabaseTeardown(
     getRetention: async () => (await backupSettingsSvc.getGeneral()).backupRetention,
     logger,
   });
-  const pluginWorkerManager = createPluginWorkerManager();
+  // The process-wide duplex route ceiling (stock 128) by env: a server with many awake agents must not drop runs to the
+  // file bridge (route_busy). Unset or invalid = the stock default (the manager validates it).
+  const pluginWorkerManager = createPluginWorkerManager({ maxConcurrentDuplexRoutes: Number(process.env.PAPERCLIP_MAX_CONCURRENT_DUPLEX_ROUTES) || null });
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;

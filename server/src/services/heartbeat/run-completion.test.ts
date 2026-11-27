@@ -1,11 +1,13 @@
 import { promises as fs } from "node:fs";
+import { runFailureMessage } from "@paperclipai/shared";
+import { NativeTurnPromptExceedsCommandBoundError, type NativePromptRefusalCause } from "../native-runtime/native-turn-budget.js";
 import { createDurableRunLogStore } from "../run-log-store.js";
 import { createServer } from "node:http";
 import { registerLocalRuntimeApiServer } from "../../runtime-api.js";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { executePaperclipNativeSession, closeIdleWarmNativeSessionsForRestart, nativeSessionFailureSourceCode } from "../native-runtime/native-session-executor.js";
+import { executePaperclipNativeSession, closeIdleWarmNativeSessionsForRestart, nativeSessionFailureSourceCode, nativeSessionFailureDisposition } from "../native-runtime/native-session-executor.js";
 import { createHeartbeatRunOutput } from "./run-output.js";
 import { createHeartbeatRunControl } from "./run-control.js";
 import { callbacks as controlCallbacks } from "./__tests__/run-control-fixtures.js";
@@ -81,7 +83,11 @@ vi.mock("../../vendor/paperclip-runner/index.js", async importOriginal => {
     executeNativeSession: async (options: Parameters<typeof actual.executeNativeSession>[0]) => {
       if (!diagnosticNativeFixture.enabled) return actual.executeNativeSession(options);
       const transport = diagnosticNativeFixture.backendOptions!.codexTransportFactory!();
-      const session = { close: async ({ reason }: { reason: string }) => { await transport.close(reason); } };
+      const session = {
+        snapshot: async () => ({ backendKind: "mock" as const, sessionId: options.input.session.normalizedSessionId!,
+          identity: { ...options.input.binding, sessionId: options.input.session.normalizedSessionId! } }),
+        close: async ({ reason }: { reason: string }) => { await transport.close(reason); },
+      };
       await options.onSession?.(session as never);
       await diagnosticNativeFixture.beforeWarmClose?.();
       if (diagnosticNativeFixture.retireWarm) await closeIdleWarmNativeSessionsForRestart();
@@ -852,6 +858,19 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(run.error).not.toContain("private-identity-material");
     expect((await f.deps.getTaskSession(f.agent.companyId, f.agent.id, f.agent.adapterType, "completion-task"))?.sessionDisplayId).toBe("checkpoint");
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledOnce();
+  });
+
+  it.each(["execution", "setup"] as const)("keeps the named prompt refusal and way out on the %s failed-run page", async phase => {
+    const cause: NativePromptRefusalCause = { kind: "newest_message", bytes: 600000, remedies: ["edit_message", "delete_own_message", "new_followup_task"] };
+    const f = await fixture(), error = new NativeTurnPromptExceedsCommandBoundError(cause);
+    expect(nativeSessionFailureSourceCode(error)).toBe(error.code);
+    expect(nativeSessionFailureDisposition(1, new Date(), error.code)).toMatchObject({ phase: "terminal_failure", failureCode: error.code, nextAttemptAt: null });
+    if (phase === "setup") await f.completion.failRunSetup(f.setup(error));
+    else await f.completion.failRun(f.failure(error));
+    const failed = await read(f.run.id);
+    expect(failed).toMatchObject({ status: "failed", errorCode: error.code, error: error.message,
+      resultJson: { nativeTurnPromptRefusalCause: cause } });
+    expect(runFailureMessage(failed)).toMatch(/newest message.*if you wrote it.*new short follow-up task/i);
   });
 
   it.each(["execution", "setup"] as const)("retains a provider startup cause at the outer %s settlement boundary", async phase => {

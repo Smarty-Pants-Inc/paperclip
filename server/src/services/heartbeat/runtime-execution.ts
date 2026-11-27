@@ -1,5 +1,6 @@
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
 import { readContextCompactionRequest } from "../context-compaction.js";
+import { resolveSessionContinuity, withPiOpenTurnDefault } from "../native-runtime/continued-session.js";
 import { remoteWorkspaceFailureCause } from "../remote-workspace-transport.js";
 import { readNativePostResultFailureDiagnostic } from "../native-runtime/native-post-result-failure.js";
 import { acceptedNativeAdapterResult } from "../native-runtime/native-accepted-result-settlement.js";
@@ -132,7 +133,7 @@ export interface HeartbeatRuntimeExecutionInput {
     issueId: string | null;
     taskKey: string | null;
   };
-  runtime: Pick<Selected, "nativeExecution" | "nativeRunnerInstanceId" | "pluginTaskDescription" | "toolRefreshOnResume" | "getNativeFreshSessionHandoff"> & {
+  runtime: Pick<Selected, "nativeExecution" | "nativeRunnerInstanceId" | "pluginTaskDescription" | "workspaceContinuationSource" | "toolRefreshOnResume" | "getNativeFreshSessionHandoff"> & {
     nativeRuntimeResolution: Selection["nativeRuntimeResolution"];
     adapter: ServerAdapterModule;
     runtimeForAdapter: AdapterExecutionContext["runtime"];
@@ -663,6 +664,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               responsibilitiesEnabled: context.paperclipResponsibilitiesEnabled === true,
               db,
               execution: nativeExecution,
+              workspaceContinuationSource: input.runtime.workspaceContinuationSource,
+              sessionContinuity: resolveSessionContinuity(nativeExecution.provider.kind, resolvedConfig.sessionContinuity),
               observability,
               getFreshSessionHandoff: getNativeFreshSessionHandoff,
               refreshTools: context.refreshTools === true,
@@ -731,7 +734,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               outputSecrets: [...identityRedactor.secretSources, ...observabilitySecretValues(observability)],
               dotWorkspaceRoot: nativeExecution.provider.kind === "openai_dot" && resolvedConfig.dotWorkspaceAccess === true ? executionWorkspace.cwd : undefined,
               runnerEnvironment: {
-                ...configuredEnvironmentProjection(configuredTaskEnvironment, secretKeys ?? []),
+                ...configuredEnvironmentProjection(
+                  withPiOpenTurnDefault(nativeExecution.provider.kind, resolvedConfig.sessionContinuity, configuredTaskEnvironment),
+                  secretKeys ?? [],
+                ),
                 ...buildNativeProviderEnvironment(
                   adapterEnv,
                   process.env,

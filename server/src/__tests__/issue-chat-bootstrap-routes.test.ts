@@ -2,14 +2,16 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
-  activityLog, agents, assets, heartbeatRuns, issueAttachments, issueComments, issues, issueThreadInteractions,
+  activityLog, agents, assets, completionContracts, heartbeatRunEvents, heartbeatRuns, issueAttachments, issueComments, issues, issueThreadInteractions,
 } from "@paperclipai/db";
 import { issueRoutes } from "../routes/issues.js";
 import { activityRoutes } from "../routes/activity.js";
 import { agentRoutes } from "../routes/agents.js";
 import { errorHandler } from "../middleware/index.js";
+import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
+import type { PrpEvent } from "../vendor/paperclip-runner/index.js";
 import { describeEmbeddedPostgres, seedCompanyWithBoardAccess, useEmbeddedPostgres, type BoardActor } from "./helpers/route-test-harness.js";
 
 describeEmbeddedPostgres("task chat bootstrap", () => {
@@ -86,6 +88,138 @@ describeEmbeddedPostgres("task chat bootstrap", () => {
     return { issueId, identifier, runId, agentId: agent!.id, commentIds: comments.map((comment) => comment.id) };
   }
 
+  async function openModelPort(companyId: string, task: Awaited<ReturnType<typeof seedTask>>) {
+    const sessionId = randomUUID(), sourceInstanceId = randomUUID(), completionContractId = randomUUID();
+    const identity = { companyId, agentId: task.agentId, issueId: task.issueId, runId: task.runId, sessionId };
+    const binding = { ...identity, sourceInstanceId, controlPlaneSourceInstanceId: `control-${task.runId}`,
+      completionContractId, completionContractSha256: "model-report-contract" };
+    await ctx.db.insert(completionContracts).values({ id: completionContractId, companyId, issueId: task.issueId, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "fixture-v1", risk: "standard",
+      completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "fixture-v1", objective: "Report model", criteria: [{ id: "objective", requirement: "Report" }] },
+      canonicalSha256: binding.completionContractSha256, createdByActorType: "system", createdByActorId: "test" });
+    await ctx.db.update(heartbeatRuns).set({ nativeIssueId: task.issueId, nativeSessionId: sessionId,
+      runnerInstanceId: sourceInstanceId, completionContractId, completionContractSha256: binding.completionContractSha256,
+      runnerProfileJson: { nativeExecutionInput: { provider: { kind: "pi_rpc", model: "saved-launch-model" } } },
+    }).where(eq(heartbeatRuns.id, task.runId));
+    const port = new PaperclipControlPlanePort(ctx.db, binding);
+    await port.openRun({ identity, backendKind: "mock", sourceInstanceId });
+    const measurement = { inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, activeSeconds: 0, requests: 1 };
+    const usage = (sourceSeq: number, model: string | null, provider = "pi_rpc"): PrpEvent => ({
+      schema: "paperclip.prp.event.v1", schemaVersion: 1, priority: 0,
+      sourceEventId: `model-report:${sourceSeq}`, sourceSeq, sourceInstanceId, sourceKind: "runner",
+      runId: task.runId, normalizedSessionId: sessionId, turnId: "model-report-turn",
+      eventType: "usage.reported", emittedAt: "2026-11-09T11:59:30.000Z",
+      payload: { provider, model, cumulative: measurement, runDelta: measurement, runDeltaAvailable: true },
+    });
+    return { port, binding, identity, usage };
+  }
+
+  async function expectRunModel(server: express.Express, companyId: string,
+    task: Awaited<ReturnType<typeof seedTask>>, expected: unknown) {
+    const live = await request(server).get(`/api/issues/${task.issueId}/live-runs`).expect(200);
+    const active = await request(server).get(`/api/issues/${task.issueId}/active-run`).expect(200);
+    const batch = await request(server).get(url(companyId)).query({ ids: task.issueId }).expect(200);
+    const single = await request(server).get(`/api/issues/${task.issueId}/chat-bootstrap`).expect(200);
+    const companyLive = await request(server).get(`/api/companies/${companyId}/live-runs`).expect(200);
+    const models = {
+      issueLive: live.body.find((run: { id: string }) => run.id === task.runId)?.runModel,
+      issueActive: active.body.runModel,
+      batchLive: batch.body.items[0].liveRuns.find((run: { id: string }) => run.id === task.runId)?.runModel,
+      batchActive: batch.body.items[0].activeRun.runModel,
+      singleLive: single.body.liveRuns.find((run: { id: string }) => run.id === task.runId)?.runModel,
+      singleActive: single.body.activeRun.runModel,
+      companyLive: companyLive.body.find((run: { id: string }) => run.id === task.runId)?.runModel,
+    };
+    process.stdout.write(`${JSON.stringify({ runModelEvidence: { runId: task.runId, expected, models } })}\n`);
+    for (const [path, model] of Object.entries(models)) expect(model, path).toEqual(expected);
+  }
+
+  it("projects the latest Pi response report through real ingestion on every run endpoint", async () => {
+    const f = await seedCompanyWithBoardAccess(ctx.db, "Provider model");
+    const task = await seedTask(f.companyId, { userId: f.userId });
+    const { port, usage } = await openModelPort(f.companyId, task);
+    const server = app(f.actor);
+    const launch = { name: "saved-launch-model", source: "launch" };
+    await expectRunModel(server, f.companyId, task, launch);
+    // Codex reconciliation can contain the requested model, not a response model.
+    await port.appendEvent(usage(1, "codex-requested-model", "codex"));
+    await expectRunModel(server, f.companyId, task, launch);
+    await port.appendEvent(usage(2, "response-X"));
+    await expectRunModel(server, f.companyId, task, { name: "response-X", source: "provider" });
+    await port.appendEvent(usage(3, "response-Y"));
+    await expectRunModel(server, f.companyId, task, { name: "response-Y", source: "provider" });
+    // The unchanged runner serializes an absent params.model as JSON null.
+    for (const [index, model] of [null, "", " \t\n\r "].entries()) await port.appendEvent(usage(index + 4, model));
+    await port.appendEvent(usage(7, "not-a-Pi-response", "opencode"));
+    await expectRunModel(server, f.companyId, task, { name: "response-Y", source: "provider" });
+    // Both the explicit active-run pointer and its assignee fallback use the projection.
+    await ctx.db.update(issues).set({ executionRunId: null }).where(eq(issues.id, task.issueId));
+    await expectRunModel(server, f.companyId, task, { name: "response-Y", source: "provider" });
+    const [run] = await ctx.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, task.runId));
+    expect(run!.runnerProfileJson).toMatchObject({ nativeExecutionInput: { provider: { model: "saved-launch-model" } } });
+    const [size] = await ctx.db.execute(sql`select pg_column_size(runner_profile_json->'providerResponseModel') as report_bytes,
+      octet_length((runner_profile_json->'providerResponseModel')::text) as report_text_bytes,
+      pg_column_size(runner_profile_json) - pg_column_size(runner_profile_json - 'providerResponseModel') as profile_added_bytes
+      from heartbeat_runs where id = ${task.runId}`);
+    process.stdout.write(`${JSON.stringify({ runModelStorage: size })}\n`);
+    // A successor has no observation, even when it reuses this agent and issue.
+    await ctx.db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, task.runId));
+    const nextRunId = randomUUID();
+    await ctx.db.insert(heartbeatRuns).values({ id: nextRunId, companyId: f.companyId, agentId: task.agentId,
+      issueId: task.issueId, runtimeMode: "native", status: "running", contextSnapshot: { issueId: task.issueId },
+      runnerProfileJson: { nativeExecutionInput: { provider: { model: "next-launch" } } } });
+    await ctx.db.update(issues).set({ executionRunId: nextRunId }).where(eq(issues.id, task.issueId));
+    await expectRunModel(server, f.companyId, { ...task, runId: nextRunId }, { name: "next-launch", source: "launch" });
+  });
+
+  it("keeps Pi model report order and repairs a durable receipt after projection failure on replay", async () => {
+    const f = await seedCompanyWithBoardAccess(ctx.db, "Provider model replay");
+    const task = await seedTask(f.companyId, { userId: f.userId });
+    const { port, binding, identity, usage } = await openModelPort(f.companyId, task);
+    const server = app(f.actor);
+    // Fail the real PG projection statement, after the event itself commits.
+    const failProjection = async (event: PrpEvent) => {
+      await ctx.db.execute(sql`create function fail_model_projection() returns trigger language plpgsql as $$
+        begin raise exception 'injected model projection failure'; end $$`);
+      await ctx.db.execute(sql`create trigger fail_model_projection before update on heartbeat_runs for each row
+        when ((new.runner_profile_json->'providerResponseModel') is distinct from (old.runner_profile_json->'providerResponseModel'))
+        execute function fail_model_projection()`);
+      try {
+        await expect(port.appendEvent(event)).rejects.toThrow();
+      } finally {
+        await ctx.db.execute(sql`drop trigger fail_model_projection on heartbeat_runs`);
+        await ctx.db.execute(sql`drop function fail_model_projection()`);
+      }
+    };
+    // Receipt order and response order can differ, and their projection writes
+    // can finish in the opposite order. Source sequence must win within a source.
+    await failProjection(usage(2, "response-Y"));
+    await port.appendEvent(usage(1, "response-X"));
+    await expectRunModel(server, f.companyId, task, { name: "response-X", source: "provider" });
+    const reopened = new PaperclipControlPlanePort(ctx.db, binding);
+    await reopened.openRun({ identity, backendKind: "mock", sourceInstanceId: binding.sourceInstanceId });
+    expect((await reopened.appendEvent(usage(2, "response-Y"))).disposition).toBe("duplicate");
+    expect((await reopened.appendEvent(usage(1, "response-X"))).disposition).toBe("duplicate");
+    await expectRunModel(server, f.companyId, task, { name: "response-Y", source: "provider" });
+    await failProjection(usage(3, "response-Z"));
+    const rows = await ctx.db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, task.runId));
+    expect(rows.map(row => row.sourceSeq).sort()).toEqual([1, 2, 3]);
+    await expectRunModel(server, f.companyId, task, { name: "response-Y", source: "provider" });
+    // A new port repairs the durable event before returning its replay acknowledgement.
+    expect((await reopened.appendEvent(usage(3, "response-Z"))).disposition).toBe("duplicate");
+    expect((await reopened.appendEvent(usage(2, "response-Y"))).disposition).toBe("duplicate");
+    await expectRunModel(server, f.companyId, task, { name: "response-Z", source: "provider" });
+    await expect(reopened.appendEvent(usage(3, "conflicting-replay"))).rejects.toThrow("native_event_replay_conflict");
+    await expect(reopened.appendEvent({ ...usage(4, "wrong-run"), runId: randomUUID() })).rejects.toThrow("native_event_binding_mismatch");
+    await expect(reopened.appendEvent({ ...usage(4, "wrong-session"), normalizedSessionId: randomUUID() })).rejects.toThrow("native_event_binding_mismatch");
+    await expect(reopened.appendEvent({ ...usage(4, "wrong-source"), sourceInstanceId: randomUUID() })).rejects.toThrow("native_event_source_binding_mismatch");
+    // The shared event validator accepts generic payloads; this projection must
+    // independently reject non-string models rather than treating them as reports.
+    await reopened.appendEvent({ ...usage(4, "invalid"), payload: { ...usage(4, "invalid").payload, model: 42 } });
+    await expectRunModel(server, f.companyId, task, { name: "response-Z", source: "provider" });
+  });
+
   /** The payloads the chat reads today, one request each. */
   async function singleEndpoints(server: express.Express, ref: string) {
     const get = async (path: string) => {
@@ -138,6 +272,76 @@ describeEmbeddedPostgres("task chat bootstrap", () => {
     expect(res.body.items[1].recentComments.comments).toHaveLength(7);
     expect(res.body.items[1].recentComments.oldestCommentId).toBeDefined();
     expect(res.body.items[0].recentComments).not.toHaveProperty("oldestCommentId");
+  });
+
+  // A session descriptor is a launch selection, not a provider response report.
+  // Exercise the real HTTP builders, not a mock of the projection or current agent config.
+  it("projects null before selection and the saved launch model after agent configuration changes", async () => {
+    const f = await seedCompanyWithBoardAccess(ctx.db, "Run model");
+    const task = await seedTask(f.companyId, { userId: f.userId });
+    const server = app(f.actor);
+    const expectModel = async (expected: unknown) => {
+      const live = await request(server).get(`/api/issues/${task.issueId}/live-runs`).expect(200);
+      const active = await request(server).get(`/api/issues/${task.issueId}/active-run`).expect(200);
+      const bootstrap = await request(server).get(url(f.companyId)).query({ ids: task.issueId }).expect(200);
+      expect(live.body[0].runModel).toEqual(expected);
+      expect(active.body.runModel).toEqual(expected);
+      expect(bootstrap.body.items[0].liveRuns[0].runModel).toEqual(expected);
+      expect(bootstrap.body.items[0].activeRun.runModel).toEqual(expected);
+      // The company poll shares the same required UI run type.
+      const companyLive = await request(server).get(`/api/companies/${f.companyId}/live-runs`).expect(200);
+      expect(companyLive.body.find((run: { id: string }) => run.id === task.runId).runModel).toEqual(expected);
+    };
+    await expectModel(null);
+    await ctx.db.update(heartbeatRuns).set({ status: "queued", startedAt: null }).where(eq(heartbeatRuns.id, task.runId));
+    await expectModel(null);
+    for (const model of ["", "   ", " \t\n\r ", null, 42, { name: "not a model string" }]) {
+      await ctx.db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: { provider: { model } } } })
+        .where(eq(heartbeatRuns.id, task.runId));
+      await expectModel(null);
+    }
+    await ctx.db.update(heartbeatRuns).set({
+      status: "running", startedAt: new Date("2026-11-09T11:59:00.000Z"),
+      runnerProfileJson: { nativeExecutionInput: { provider: { model: "saved-launch-model" } } },
+    }).where(eq(heartbeatRuns.id, task.runId));
+    await ctx.db.update(agents).set({ adapterConfig: { model: "new-agent-config-model" } }).where(eq(agents.id, task.agentId));
+    await expectModel({ name: "saved-launch-model", source: "launch" });
+    // Also exercise the active-run fallback through the same summary column set.
+    await ctx.db.update(issues).set({ executionRunId: null }).where(eq(issues.id, task.issueId));
+    await expectModel({ name: "saved-launch-model", source: "launch" });
+  });
+
+  it("does not confuse a session selection with a response report or leak a previous run's model", async () => {
+    const f = await seedCompanyWithBoardAccess(ctx.db, "Run-bound model");
+    const task = await seedTask(f.companyId, { userId: f.userId });
+    await ctx.db.update(heartbeatRuns).set({
+      runnerProfileJson: { nativeExecutionInput: { provider: { model: "this-run-launch" } } },
+    }).where(eq(heartbeatRuns.id, task.runId));
+    await ctx.db.insert(heartbeatRunEvents).values(["session.started", "session.resumed"].map((eventType, index) => ({
+      companyId: f.companyId, runId: task.runId, agentId: task.agentId, seq: index + 1, eventType,
+      payload: { prpEvent: { payload: { providerDescriptor: { effectiveModel: "observed-model" } } } },
+    })));
+    const server = app(f.actor);
+    const readModels = async () => {
+      const live = await request(server).get(`/api/issues/${task.issueId}/live-runs`).expect(200);
+      const active = await request(server).get(`/api/issues/${task.issueId}/active-run`).expect(200);
+      const bootstrap = await request(server).get(url(f.companyId)).query({ ids: task.issueId }).expect(200);
+      return [live.body[0].runModel, active.body.runModel,
+        bootstrap.body.items[0].liveRuns[0].runModel, bootstrap.body.items[0].activeRun.runModel];
+    };
+    expect(await readModels()).toEqual(Array(4).fill({ name: "this-run-launch", source: "launch" }));
+    await ctx.db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, task.runId));
+    const nextRunId = randomUUID();
+    await ctx.db.insert(heartbeatRuns).values({
+      id: nextRunId, companyId: f.companyId, agentId: task.agentId, issueId: task.issueId,
+      status: "running", runtimeMode: "native", contextSnapshot: { issueId: task.issueId },
+    });
+    await ctx.db.update(issues).set({ executionRunId: nextRunId }).where(eq(issues.id, task.issueId));
+    expect(await readModels()).toEqual(Array(4).fill(null));
+    await ctx.db.update(heartbeatRuns).set({
+      runnerProfileJson: { nativeExecutionInput: { provider: { model: "new-run-launch" } } },
+    }).where(eq(heartbeatRuns.id, nextRunId));
+    expect(await readModels()).toEqual(Array(4).fill({ name: "new-run-launch", source: "launch" }));
   });
 
   it("follows request order with mixed UUIDs and identifiers, and reads a task named twice once per ref", async () => {

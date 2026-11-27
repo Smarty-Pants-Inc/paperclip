@@ -1377,6 +1377,7 @@ export const storybookLiveRuns: LiveRunForIssue[] = [
   {
     id: "run-storybook",
     status: "running",
+    runModel: null,
     invocationSource: "manual",
     triggerDetail: "issue_assigned",
     startedAt: recent(28).toISOString(),

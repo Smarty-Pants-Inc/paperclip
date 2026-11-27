@@ -1,3 +1,4 @@
+import { nativeQuestionSourceCommentId } from "./native-question-source.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 
@@ -176,7 +177,7 @@ export async function projectNativeRuntimeRequest(input: {
     throw new Error("native_runtime_question_pattern_unsupported");
   }
   const idempotencyKey = `${QUESTION_KEY_PREFIX}${input.binding.runId}:${request.requestId}`;
-  const existing = await input.db.select({ id: issueThreadInteractions.id })
+  const existing = await input.db.select({ id: issueThreadInteractions.id, sourceCommentId: issueThreadInteractions.sourceCommentId })
     .from(issueThreadInteractions)
     .where(and(
       eq(issueThreadInteractions.companyId, input.binding.companyId),
@@ -191,6 +192,8 @@ export async function projectNativeRuntimeRequest(input: {
       kind: "ask_user_questions",
       idempotencyKey,
       sourceRunId: input.binding.runId,
+      sourceCommentId: existing ? existing.sourceCommentId
+        : await nativeQuestionSourceCommentId(input.db, input.binding, input.event),
       resolverPolicy: "human_only",
       continuationPolicy: "none",
       ...(questionSet.title ? { title: questionSet.title.slice(0, 240) } : {}),

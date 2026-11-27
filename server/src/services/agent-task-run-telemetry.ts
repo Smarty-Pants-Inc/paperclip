@@ -76,6 +76,8 @@ const FAILURE_CAUSE_BY_ERROR_CODE: Record<string, AgentRunFailureCause> = {
   provider_transport_failed: "provider_error",
   codex_transient_upstream: "provider_error",
   provider_failed: "provider_error",
+  native_turn_prompt_exceeds_command_bound: "waiting_for_person",
+  command_payload_too_large: "waiting_for_person",
   issue_waiting_for_response: "waiting_for_person",
   issue_continuation_waiting_on_review: "waiting_for_person",
   approval_required: "waiting_for_person",

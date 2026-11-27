@@ -1,4 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
+import { heldNativeAgentConfigurationInputs } from "./heartbeat/session-fingerprint-inputs.js";
+import { resolveSessionContinuity } from "./native-runtime/continued-session.js";
+import { requestHeldNativeConfigurationEnd } from "./native-runtime/held-native-turn.js";
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { preserveAgentInteractionPermissions } from "../lib/agent-interaction-permissions.js";
@@ -170,7 +173,7 @@ export async function completeAgentConfiguration(txDb: Db, existing: AgentConfig
   const afterConfig = isPlainRecord(updated.adapterConfig) ? updated.adapterConfig : {};
   const changedExecution = updated.adapterType !== existing.adapterType
     || (updated.adapterType === "paperclip_runner" && ["provider", "acpxAgent", "model"].some(
-      (key) => priorAdapterConfig[key] !== afterConfig[key],
+      (key) => priorAdapterConfig[key] !== afterConfig[key] && (key !== "model" || afterConfig.provider !== "pi_rpc" || resolveSessionContinuity(afterConfig.provider, afterConfig.sessionContinuity) !== "continuous"),
     ));
   if (changedExecution) {
     await notifyExternalConversationSettlement(txDb, { companyId: existing.companyId });
@@ -190,6 +193,7 @@ export async function completeAgentConfiguration(txDb: Db, existing: AgentConfig
       updated, txDb,
       existing.adapterConfig,
       options?.recordRevision,
+      publications,
     );
   }
 
@@ -220,6 +224,10 @@ export async function completeAgentConfiguration(txDb: Db, existing: AgentConfig
         afterConfig: afterConfig as unknown as Record<string, unknown>,
       });
     }
+  }
+  // The producer locks affected issues before runs; provider commands follow commit.
+  if (!options?.instructionEntryBindingOnly && !isDeepStrictEqual(heldNativeAgentConfigurationInputs(existing), heldNativeAgentConfigurationInputs(normalizedUpdated))) {
+    await requestHeldNativeConfigurationEnd(txDb, { companyId: updated.companyId, agentId: id });
   }
 }
 

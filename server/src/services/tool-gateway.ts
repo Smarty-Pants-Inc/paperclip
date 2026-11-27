@@ -61,7 +61,8 @@ import { runIdentityContexts } from "@paperclipai/db";
 import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent-tools.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
-import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { gitHubRepositoryHint, resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
 import {
   backgroundPollDelayMs,
@@ -1952,6 +1953,7 @@ export function createToolGatewayService(
           pluginApps.isAvailable(connectionSourceSlug(connection)) &&
           (!featureSettings || isConnectorFeatureEnabled(getAppDefinitionForApplicationKey(application.applicationKey), featureSettings)) &&
           !isRetiredComposioConnection(connection) &&
+          !(isGitHubAppConnection(connection) && catalogEntry.toolName === "get_me") &&
           !(nativeProviderCatalogFor(connection) && !nativeProviderCatalogFor(connection)!.isCurrentEntry(catalogEntry)) &&
           !(restConnectorFor(connection) && !restConnectorFor(connection)!.isCurrent(catalogEntry)) &&
           !(isRailwayEndpoint(connection.config.url) && (isRailwayToolBlocked(catalogEntry.toolName) || (normalizeRailwayToolName(catalogEntry.toolName).startsWith(RAILWAY_TOOL_PREFIX) && connection.config.railwayApiStatus !== "available"))) &&
@@ -3421,7 +3423,13 @@ export function createToolGatewayService(
   async function findToolForSession(
     session: ToolGatewaySession,
     toolName: string,
+    parameters?: unknown,
   ): Promise<ToolGatewayDescriptor> {
+    const args = asRecord(parameters);
+    const repo = args?.repo ?? args?.repository;
+    const repository = typeof args?.owner === "string" && typeof repo === "string"
+      ? gitHubRepositoryHint(`${args.owner}/${repo}`)
+      : typeof repo === "string" ? gitHubRepositoryHint(repo) : undefined;
     const exact = exactConnectedToolScope(toolName);
     let connectedTools = (await connectedMcpToolsForCompany(session.companyId, undefined, exact)).filter(isModelVisibleTool);
     if (exact && connectedTools.filter((candidate) => candidate.name === toolName).length > 1) {
@@ -3471,6 +3479,7 @@ export function createToolGatewayService(
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
             allowStandingDelegation: false,
+            repository,
           },
         );
         if (!selected.grant)
@@ -3514,7 +3523,7 @@ export function createToolGatewayService(
               "github_identity_unavailable",
             );
           if (attempt === 0)
-            await resolveConnectionGrant(session, selectedConnection);
+            await resolveConnectionGrant(session, selectedConnection, true, repository);
           try {
             const headers = await resolveCredentialHeaders(
               session,
@@ -3533,6 +3542,7 @@ export function createToolGatewayService(
                 responsibleUserId: session.responsibleUserId,
                 allowStandingDelegation: false,
                 excludeGrantId: original.id,
+                repository,
               },
             );
             const accountId = original.providerTenant?.github?.userId;
@@ -4799,6 +4809,9 @@ export function createToolGatewayService(
     if (isAwsMcpConnection(connection)) {
       return resolveAwsMcpHeaders(session, connection, grant, resolveOptions);
     }
+    if (isGitHubAppConnection(connection)) {
+      return { Authorization: `Bearer ${(await resolveGitHubAppCredential(db, connection, grant, resolveOptions)).token}` };
+    }
     const oauth = asRecord(asRecord(connection.config)?.oauth);
     if (
       isPaperclipCloudConnectorStrategy(oauth?.strategy) &&
@@ -5231,6 +5244,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
     allowInteraction = true,
+    repository?: string,
   ): Promise<typeof connectionGrants.$inferSelect> {
     if (!(await pluginAppCatalogFor(db, [connection])).isAvailable(connectionSourceSlug(connection))) {
       throw new ToolGatewayHttpError(
@@ -5265,12 +5279,13 @@ export function createToolGatewayService(
         connection.transportConfig?.sourceTemplateKey === "github")
     ) {
       const captured = githubOperationCredentials.get(session);
-      const selected = captured
+      const selected = captured && !repository
         ? { grant: captured.grant, error: undefined }
         : await resolveManagedGitHubIdentitySelection(db, session.companyId, {
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
             allowStandingDelegation: false,
+            repository,
           });
       if (!selected.grant || selected.grant.connectionId !== connection.id) {
         throw new ToolGatewayHttpError(
@@ -10798,7 +10813,7 @@ export function createToolGatewayService(
       session.approvedSlackInvocationId = invocation.id;
       connectionRevision = await toolApprovalConnectionRevision(db, invocation.companyId,
         invocation.connectionId, signedPayload.approvalSnapshot);
-      const tool = await findToolForSession(session, invocation.toolName);
+      const tool = await findToolForSession(session, invocation.toolName, signedPayload.arguments);
       await prepareApprovedConnectionAuthorization(session, tool, signedPayload.approvalSnapshot);
       const liveApprovalSnapshot = await connectedRemoteApprovalSnapshot(
         session,
@@ -12962,7 +12977,7 @@ export function createToolGatewayService(
             signedPayload.identityContextId,
           );
           session.approvedSlackInvocationId = invocation.id;
-          const tool = await findToolForSession(session, invocation.toolName);
+          const tool = await findToolForSession(session, invocation.toolName, signedPayload.arguments);
           const liveApprovalSnapshot = await connectedRemoteApprovalSnapshot(session, tool);
           if (!approvalSnapshotsMatch(signedPayload.approvalSnapshot, liveApprovalSnapshot))
             throw new ToolGatewayHttpError(
@@ -13124,7 +13139,7 @@ export function createToolGatewayService(
               : origin.responsibleUserId;
         }
       }
-      let tool = await findToolForSession(session, input.tool);
+      let tool = await findToolForSession(session, input.tool, input.parameters);
       if (tool.providerType === "paperclip_slack_chat") {
         const definition = SLACK_TOOLS.find(t => t.name === tool.upstreamToolName);
         const args = definition?.schema.parse(input.parameters ?? {}) as Record<string, unknown> | undefined;
@@ -13248,7 +13263,7 @@ export function createToolGatewayService(
       ) {
         const { targetToolName, targetParameters } =
           virtualRunToolInput(requestedParameters);
-        const targetTool = await findToolForSession(session, targetToolName);
+        const targetTool = await findToolForSession(session, targetToolName, targetParameters);
         if (!isOnDemandRemoteTool(targetTool)) {
           throw new ToolGatewayHttpError(
             404,

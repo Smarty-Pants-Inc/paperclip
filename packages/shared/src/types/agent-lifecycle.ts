@@ -23,6 +23,8 @@ export interface AgentLifecycleOperation {
   retryRequired?: boolean;
   /** Failed generic host verification tests for this saved configuration. */
   verificationFailures?: number;
+  /** Pre-redacted, single-line native setup diagnostic, at most 300 code points; not public action copy. */
+  failureReason?: string;
   attempts: number;
   responsibleUserId?: string | null;
   /** Why a pause started: its holds and the company's pause reason at that moment. Runs the

@@ -1200,7 +1200,7 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
       approverValues: approverValue ? [approverValue] : [],
     });
     const assigneeAdapterOverrides = settings
-      ? mergeComposerRunSettings(inheritedOverrides, assigneeAdapterType ?? undefined, settings)
+      ? mergeComposerRunSettings(inheritedOverrides, assigneeAdapterType ?? undefined, settings, false, selectedAssigneeAgent?.adapterConfig)
       : inheritedOverrides;
     const createData = {
       companyId: effectiveCompanyId,

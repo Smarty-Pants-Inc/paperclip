@@ -454,7 +454,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     queryFn: () => instanceSettingsApi.get(),
   });
 
-  const { data: environments = [] } = useQuery<Environment[]>({
+  const {
+    data: environments = [],
+    isPending: environmentsPending,
+    isFetching: environmentsFetching,
+    isError: environmentsError,
+    refetch: refetchEnvironments,
+  } = useQuery<Environment[]>({
     queryKey: selectedCompanyId ? queryKeys.environments.list(selectedCompanyId) : ["environments", "none"],
     queryFn: () => environmentsApi.list(selectedCompanyId!),
     // Load environments when the picker is enabled OR when execution is forced
@@ -649,7 +655,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const effectiveConfig = isCreate ? props.values.adapterSchemaValues ?? {} : { ...config, ...overlay.adapterConfig };
   const harnessType = agentHarnessType(adapterType, effectiveConfig);
   const isCodexHarness = harnessType === "codex_local";
-  const runnerProfile = paperclipRunnerProfileForHarness(harnessType);
+  const runnerProfile = paperclipRunnerProfileForHarness(adapterType === "paperclip_runner" && effectiveConfig.provider === "pi_rpc" ? "pi_rpc" : harnessType);
   const isRunnerHarness = Boolean(runnerProfile);
   const rawCurrentDefaultEnvironmentId = isCreate
     ? props.values.defaultEnvironmentId ?? ""
@@ -1016,11 +1022,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   const runnableEnvironments = useMemo(
     () => environments.filter((environment) => {
+      if (environment.status !== "active") return false;
       if (!supportedEnvironmentDrivers.has(environment.driver)) return false;
       if (environment.driver === "local") return false;
       if (environment.driver !== "sandbox") return true;
       const provider = typeof environment.config?.provider === "string" ? environment.config.provider : null;
-      return provider !== null && provider !== "fake";
+      // Restricted list responses redact config; an unknown provider is not a fake provider.
+      return provider !== "fake";
     }),
     [environments, supportedEnvironmentDrivers],
   );
@@ -1037,7 +1045,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const showEnvironmentOverrideControl = environmentsEnabled && (
     forcedKubernetes ||
     currentDefaultEnvironmentId.length > 0 ||
-    runnableEnvironments.length >= 1
+    runnableEnvironments.length >= 1 ||
+    environmentsPending ||
+    environmentsError
   );
   const inheritedEnvironmentLabel = instanceDefaultEnvironment
     ? environmentDisplayLabel(instanceDefaultEnvironment)
@@ -1057,8 +1067,11 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const accountBoundCatalog = isAccountBoundAcpxAgent(runnerAcpxAgent);
   const modelCacheIdentity = accountBoundCatalog ? `${modelProvider}:${runnerAcpxAgent}:${isCreate ? "new" : props.agent.id}:${JSON.stringify(modelAiBinding ?? null)}` : runnerAcpxAgent ? `${modelProvider}:${runnerAcpxAgent}` : modelProvider;
   const connectionModels = useConnectionModels(isExternalRunner || !cloudHarnessAllowed ? null : selectedCompanyId, isCreate ? undefined : modelAiBinding, aiRoutingHarness(adapterType, runnerProvider, runnerAcpxAgent));
+  // Pi RPC is a Runner provider, not an adapter with its own catalog. Its
+  // routed connection owns the model list; do not fall back while it loads.
+  const connectionOnlyCatalog = runnerProvider === "pi_rpc";
   // Fetch adapter models for the effective provider, including unsaved changes.
-  const modelAdapterType = accountBoundCatalog ? "paperclip_runner" : isRunnerHarness ? harnessType : adapterType;
+  const modelAdapterType = accountBoundCatalog || connectionOnlyCatalog ? "paperclip_runner" : isRunnerHarness ? harnessType : adapterType;
   const modelQueryKey = selectedCompanyId
     ? queryKeys.agents.adapterModels(selectedCompanyId, modelAdapterType, currentDefaultEnvironmentId || null, modelCacheIdentity)
     : ["agents", "none", "adapter-models", adapterType];
@@ -1072,7 +1085,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       agentId: isCreate ? undefined : props.agent.id,
     }),
     ...(accountBoundCatalog ? ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
-    enabled: Boolean(selectedCompanyId) && cloudHarnessAllowed && !isExternalRunner && !connectionModels,
+    enabled: Boolean(selectedCompanyId) && cloudHarnessAllowed && !isExternalRunner && !connectionOnlyCatalog && !connectionModels,
   });
   const { data: fetchedModels, error: fetchedModelsError, isLoading: fetchingModels, refetch: refreshConnectionModels } = fetchedModelsQuery;
   const fetchedModelsView = useQueryView(fetchedModelsQuery);
@@ -1782,6 +1795,16 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           <div data-agent-tile={panels ? "" : undefined} className={cn(cards ? cardBody : "px-4 pb-3 space-y-3")}>
             <Field label="Environment override">
               <div className="space-y-2">
+                {environmentsPending || environmentsFetching ? (
+                  <p role="status" className="text-sm text-muted-foreground">Loading environments…</p>
+                ) : environmentsError ? (
+                  <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                    <span>Couldn't load environments.</span>
+                    <Button type="button" variant="outline" size="xs" onClick={() => void refetchEnvironments()}>
+                      Try again
+                    </Button>
+                  </div>
+                ) : null}
                 <SelectPopover
                   aria-label="Environment override"
                   value={currentDefaultEnvironmentId}
@@ -1796,7 +1819,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                     { value: "", label: `Default: ${inheritedEnvironmentLabel}` },
                     ...environmentOptions.map((environment) => ({
                       value: environment.id,
-                      label: environmentDisplayLabel(environment),
+                      label: `${environmentDisplayLabel(environment)}${environment.status === "archived" ? " (archived)" : ""}`,
+                      disabled: environment.status !== "active",
                     })),
                   ]}
                 />
@@ -2016,7 +2040,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                       return result.data?.model ?? null;
                     }}
                 onRefreshModels={
-                  connectionModels ? connectionModels.refreshModels : accountBoundCatalog || supportsAdapterModelRefresh(adapterType)
+                  connectionModels ? connectionModels.refreshModels : !connectionOnlyCatalog && (accountBoundCatalog || supportsAdapterModelRefresh(adapterType))
                     ? handleRefreshModels
                     : undefined
                 }

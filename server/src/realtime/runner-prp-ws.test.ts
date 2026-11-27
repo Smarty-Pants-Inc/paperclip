@@ -3,6 +3,7 @@ import { createServer as createUnboundServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { NATIVE_HANDOFF_COMMAND_MAX_BYTES, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "../services/native-runtime/native-turn-budget.js";
 
 import { DurablePrpControlPlane } from "@paperclipai/paperclip-runner";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -36,7 +37,7 @@ describe("runner PRP websocket route", () => {
     const registration = await registerRunnerPrpAuthority({
       companyId: "company-1",
       runId,
-      authority: { handleUpgrade } as unknown as DurablePrpControlPlane,
+      authority: { handleUpgrade, queueCommand: vi.fn() } as unknown as DurablePrpControlPlane,
     });
 
     expect(registration.connectUrl).toBe(
@@ -91,6 +92,7 @@ describe("runner PRP websocket route", () => {
     const runId = "00000000-0000-4000-8000-000000000779";
     const authority = {
       handleUpgrade: vi.fn(),
+      queueCommand: vi.fn(),
     } as unknown as DurablePrpControlPlane;
     const first = await registerRunnerPrpAuthority({
       companyId: "company-1",
@@ -298,6 +300,10 @@ describe("runner PRP websocket route", () => {
           runId: identity.runId,
           authority,
         });
+        const commandCountBefore = authority.store.state.commands.length;
+        expect(() => authority.queueCommand("turn.start", { text: '"'.repeat(NATIVE_HANDOFF_COMMAND_MAX_BYTES) }))
+          .toThrow(NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND);
+        expect(authority.store.state.commands.length).toBe(commandCountBefore);
         // Warm attach registers the next route before rotating the same core.
         const nextRoute = await registerRunnerPrpAuthority({
           companyId: "company-1",

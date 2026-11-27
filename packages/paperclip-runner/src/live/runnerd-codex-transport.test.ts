@@ -20,6 +20,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import { PRP_PROTOCOL_VERSION } from "../protocol/replay-contract.js";
 import { redactCapabilityEvidenceData } from "./evidence-redaction.js";
+import { NativeRunnerClosedBeforeAttachmentError } from "../contracts/harness-driver.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import { parsePaperclipQuestionSet } from "../contracts/question-set.js";
 import { SANDBOX_DISK_FULL_FAILURE_CODE } from "../contracts/sandbox-disk-full.js";
@@ -31,7 +32,7 @@ import {
 import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
 import * as durableControlPlane from "../control-plane/durable-prp-control-plane.js";
 import * as codexCommandRuntime from "../drivers/codex/codex-command.js";
-import { composeNativeSystemInstructions, type NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
+import { canonicalNativeRuntimeContextDigest, composeNativeSystemInstructions, type NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
 import { CODEX_SKILLLESS_BASE_INSTRUCTIONS, createCodexTaskEnvelope } from "../contracts/codex.js";
 import { PRP_BLOCK_TOOL_DESCRIPTION, PRP_COMPLETION_TOOL_DESCRIPTION } from "../contracts/completion-result.js";
 import { CodexAppServerDriver, codexSemanticToolSpecs } from "../drivers/codex/codex-app-server-driver.js";
@@ -79,6 +80,18 @@ import {
   fakeCodexArgs,
   assignedRuntimeContext,
 } from "../../test/support/runnerd-transport.js";
+
+it("types an already-closed cached transport before any run attachment command", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "closed-before-attachment-"));
+  const bundle = createCapabilityRunnerdCodexTransport({ stateDirectory });
+  try {
+    await bundle.transport.close("the prior sandbox process is gone");
+    await expect(bundle.transport.attachRun!({ runId: "same-incoming-run", turnId: "turn", itemId: "item" }))
+      .rejects.toBeInstanceOf(NativeRunnerClosedBeforeAttachmentError);
+    // The refusal itself must not create a journal or launch a replacement.
+    expect(await readdir(stateDirectory)).toEqual([]);
+  } finally { await rm(stateDirectory, { recursive: true, force: true }); }
+});
 
 describe("committedEventWindowComplete", () => {
   const events = (...seqs: number[]) => seqs.map(sourceSeq => ({ sourceSeq }));
@@ -1032,6 +1045,31 @@ it("reopens Copilot with the current registered files after collecting the previ
     expect(seed.provider.runtimeContext).toEqual(previousContext);
     expect(seed.provider.instructions).toBe("Previous instructions.");
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+it.each(["local", "ssh"])("persists refreshed continuous Pi runtimeContext on %s rotation without changing the pinned profile", async target => {
+  const identity = { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: "next-run", normalizedSessionId: "session", turnId: "turn", itemId: "item" };
+  const root = await mkdtemp(join(tmpdir(), "pi-durable-restamp-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity,
+    expectedRunnerVersion: "fixture", expectedRunnerDigest: `sha256:${"0".repeat(64)}` });
+  try {
+    const prior = assignedRuntimeContext("/old/skills", "/old/instructions");
+    prior.instructions.bundle.digest = "1".repeat(64);
+    prior.aggregateDigest = canonicalNativeRuntimeContextDigest(prior);
+    const current = assignedRuntimeContext("/new/skills", "/new/instructions");
+    const remote = target === "ssh" ? assignedRuntimeContext("/guest/skills", "/guest/instructions") : current;
+    const provider = { kind: "pi_rpc", instructions: composeNativeSystemInstructions(prior, "Old instruction bytes"), runtimeContext: prior,
+      command: "/pinned/node", args: ["/pinned/proxy.cjs"], model: "pinned-model" };
+    const payload = runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: { provider } }, identity, null, undefined,
+      remote, { text: composeNativeSystemInstructions(current, "End every reply with BANANA."), context: current }, true);
+    core.persistRunAttachTemplate(payload);
+    const durable = JSON.parse(await readFile(join(root, "control-plane-state.json"), "utf8"));
+    expect(durable.runAttachTemplate.provider.runtimeContext.aggregateDigest).toBe(remote.aggregateDigest);
+    expect(payload.provider).toEqual({ ...provider, instructions: composeNativeSystemInstructions(remote, "End every reply with BANANA."), runtimeContext: remote });
+    expect(provider.instructions).toContain("Old instruction bytes");
+    expect(runnerdRecoveryInternals.rotatedRunAttachPayload({ runAttachTemplate: { provider } }, identity, null, undefined,
+      remote, { text: "New instructions", context: null }).provider).toEqual(provider);
+  } finally { await core.stop(); await rm(root, { recursive: true, force: true }); }
 });
 
 it("refreshes Cloud instructions on cold rotation without replacing the pinned launch profile", () => {
@@ -3779,8 +3817,39 @@ it.each(["installed", "explicit"] as const)("records the selected %s Codex comma
   }
 });
 
-it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "omitted-context", "close-attachment", "timeout-attachment"] as const)("runs an environment-prepared descriptor without Core filesystem preparation (%s)", async mode => {
+it.each([true, false])("applies current Pi instructions through local cold rotation only when continuous=%s", async continuous => {
+  const root = await mkdtemp(join(tmpdir(), "pi-local-instruction-refresh-"));
+  const proxy = join(root, "provider-proxy"), requests = join(root, "requests.jsonl");
+  const args = [fakeCodex, ...fakeCodexArgs(root, "--request-log", requests)];
+  await writeFile(proxy, `#!/bin/sh\nexec ${args.map(arg => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}\n`, { mode: 0o700 });
+  const create = (runId: string, baseInstructions?: string) => createCapabilityRunnerdCodexTransport({
+    provider: "pi_rpc", piProxyPath: proxy, stateDirectory: root, sourceCodexHome: "", baseInstructions,
+    environment: continuous ? { PAPERCLIP_PI_CONTINUOUS: "1" } : {},
+    prpIdentity: { runnerInstanceId: "runner", environmentLeaseId: "lease", runId, normalizedSessionId: "session", turnId: "turn", itemId: "item" },
+  });
+  const first = create("prior-run");
+  try {
+    const opened = await first.transport.request("thread/start", { cwd: root, model: "provider/model", baseInstructions: "Original instructions.", dynamicTools: codexSemanticToolSpecs() });
+    await first.transport.close();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const next = create("next-run", "End every reply with BANANA.");
+      try {
+        await next.transport.request("thread/read", { threadId: (opened.thread as { id: string }).id });
+        const state = JSON.parse(await readFile(join(root, "runner/codex-provider-state.json"), "utf8"));
+        const expected = continuous ? "End every reply with BANANA." : "Original instructions.";
+        expect(state.config.instructions).toBe(expected);
+        const frames = (await readFile(requests, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        expect(frames.findLast(frame => frame.method === "thread/resume").params.baseInstructions).toContain(expected);
+      } finally { await next.transport.close(); }
+    }
+  } finally { await first.transport.close(); await rm(root, { recursive: true, force: true }); }
+}, 60_000);
+
+it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "omitted-context", "close-attachment", "timeout-attachment", "pi-current-instructions", "pi-stock-current-instructions", "codex-current-instructions"] as const)("runs an environment-prepared descriptor without Core filesystem preparation (%s)", async mode => {
+  const provider = mode.startsWith("pi-") ? "pi_rpc" : "codex";
+  const changedInstructions = mode.endsWith("current-instructions");
   const root = await mkdtemp(join(tmpdir(), "runner-environment-launch-"));
+  const providerArgs = fakeCodexArgs(root, ...(changedInstructions ? ["--request-log", join(root, "provider-requests.jsonl")] : []));
   const binary = defaultCapabilityRunnerdBinary();
   const artifact = { version: "0.3.0", digest: `sha256:${createHash("sha256").update(await readFile(binary)).digest("hex")}` };
   const context = assignedRuntimeContext("/controller-only/skill", "/controller-only/instructions");
@@ -3803,11 +3872,12 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
   const checkpoint = vi.fn();
   const releaseRoute = vi.fn();
   let currentRun = () => "";
-  const create = (closeGraceMs?: number, runId = "run-prepared") => createCapabilityRunnerdCodexTransport({ provider: "codex", runnerArtifact: artifact,
+  const create = (closeGraceMs?: number, runId = "run-prepared", baseInstructions?: string) => createCapabilityRunnerdCodexTransport({ provider, runnerArtifact: artifact, baseInstructions,
     ...(closeGraceMs === undefined ? {} : { closeGraceMs }),
+    environment: mode === "pi-current-instructions" ? { PAPERCLIP_PI_CONTINUOUS: "1" } : {},
     stateDirectory: root, runtimeContext: runId === "run-prepared" ? context
       : mode === "removed-context" ? null : mode === "omitted-context" ? undefined : context,
-    ...(mode === "rotated-recovery" || mode === "removed-context" || mode === "omitted-context" ? {
+    ...(mode === "rotated-recovery" || mode === "removed-context" || mode === "omitted-context" || changedInstructions ? {
       readRunnerState: async () => JSON.parse(await readFile(join(root, "runner/runner-state.json"), "utf8")),
       prepareExternalRunnerState: async () => undefined,
       archiveExternalRunnerState: async () => {
@@ -3830,11 +3900,11 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
       if (recovery) { recovered = true; return recovery; }
       return { configurationId: `owned-${requirements.identity.runId}`,
       requirementsDigest: runnerLaunchRequirementsDigest(requirements),
-      provider: createRunnerProviderLaunch(requirements.runtimeContext === null ? requirements : bindRunnerLaunchResources(requirements, resolved), {
-        options: { codexArgs: fakeCodexArgs(root) }, root, cwd: root, codexHome: "/guest/.codex",
+      provider: { ...createRunnerProviderLaunch(requirements.runtimeContext === null ? requirements : bindRunnerLaunchResources(requirements, resolved), {
+        options: { codexArgs: providerArgs }, root, cwd: root, codexHome: "/guest/.codex",
         codexCommand: fakeCodex, providerNodeCommand: process.execPath,
-        opencodeProxyPath: "", acpxSidecarPath: "",
-      }),
+        piProxyPath: fakeCodex, opencodeProxyPath: "", acpxSidecarPath: "",
+      }), ...(provider === "pi_rpc" ? { args: providerArgs } : {}) },
     }; },
     controlPlaneRegistration: async authority => {
       configuration = authority.store.state.runAttachTemplate;
@@ -3855,7 +3925,7 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
   });
   const { transport } = create();
   try {
-    const opened = await transport.request("thread/start", { cwd: "/controller-only/workspace", model: "selected-model",
+    const opened = await transport.request("thread/start", { cwd: "/controller-only/workspace", model: provider === "pi_rpc" ? "provider/selected-model" : "selected-model",
       baseInstructions: coreInstructions, dynamicTools: codexSemanticToolSpecs() });
     expect(opened.thread).toHaveProperty("id");
     expect(configuration).toMatchObject({ provider: { command: fakeCodex, cwd: root,
@@ -3871,6 +3941,26 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
     await expect(stat(join(root, "codex-home"))).rejects.toHaveProperty("code", "ENOENT");
     await expect(stat(join(root, "runtime-context.json"))).rejects.toHaveProperty("code", "ENOENT");
     await transport.close();
+    if (changedInstructions) {
+      const previousConfig = JSON.parse(await readFile(join(root, "runner/codex-provider-state.json"), "utf8")).config;
+      const path = join(root, "launch-preparation.json");
+      const saved = JSON.parse(await readFile(path, "utf8"));
+      const next = structuredClone(saved.entries[0]);
+      next.requirements.identity.runId = "run-prepared-next";
+      next.prepared.requirementsDigest = runnerLaunchRequirementsDigest(next.requirements);
+      await writeFile(path, JSON.stringify({ ...saved, entries: [next, ...saved.entries] }), { mode: 0o600 });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const resumed = create(undefined, "run-prepared-next", composeNativeSystemInstructions(context, "End every reply with the word BANANA."));
+        try {
+          await resumed.transport.request("thread/read", { threadId: (opened.thread as { id: string }).id });
+          const state = JSON.parse(await readFile(join(root, "runner/codex-provider-state.json"), "utf8"));
+          expect(state.config).toEqual({ ...previousConfig, instructions: mode === "pi-current-instructions" ? composeNativeSystemInstructions(resolved, "End every reply with the word BANANA.") : previousConfig.instructions });
+          const frames = (await readFile(join(root, "provider-requests.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+          expect(frames.findLast(frame => frame.method === "thread/resume").params[provider === "pi_rpc" ? "baseInstructions" : "developerInstructions"]).toContain(state.config.instructions);
+        } finally { await resumed.transport.close(); }
+      }
+      return;
+    }
     if (mode === "removed-context") {
       const rotated = create(undefined, "run-prepared-removed");
       try {
@@ -6557,7 +6647,7 @@ it("cancels startup readiness before releasing the route that settles its ready 
   }
 }, 30_000);
 
-it("surfaces a runner exit while provider-ingress readiness is still pending", async () => {
+it("types a failed cached transport after a runner exit while provider-ingress readiness is pending", async () => {
   const neverReady = new Promise<void>(() => undefined);
   const bundle = createCapabilityRunnerdCodexTransport({
     // The external process launcher owns execution in this test. Point the
@@ -6603,6 +6693,10 @@ it("surfaces a runner exit while provider-ingress readiness is still pending", a
     ).rejects.toThrow(
       "runner_ingress_unavailable: runnerd exited unexpectedly with code 1: restored runner could not start",
     );
+    // #failTransport records #failure, not #closed. No explicit close has run:
+    // another attachment must still take the bounded same-run recovery door.
+    await expect(bundle.transport.attachRun!({ runId: "same-incoming-run", turnId: "turn", itemId: "item" }))
+      .rejects.toBeInstanceOf(NativeRunnerClosedBeforeAttachmentError);
   } finally {
     await bundle.transport.close();
   }
@@ -7088,6 +7182,39 @@ it.each([undefined, "medium", "minimal", "xhigh", null])("rejects non-exact Pi t
 it("rejects Pi thinking settings on a different transport provider", () => {
   expect(() => createCapabilityRunnerdCodexTransport({ provider: "codex", piThinkingLevel: "low" })).toThrow(/only supported/);
 });
+
+it("projects current Pi model and thinking level onto turn.start without changing Codex", async () => {
+  for (const provider of ["pi_rpc", "codex"] as const) {
+    const root = await mkdtemp(join(tmpdir(), "runnerd-turn-selection-"));
+    const proxy = join(root, "provider-proxy");
+    const args = [fakeCodex, ...fakeCodexArgs(root)];
+    await writeFile(proxy, `#!/bin/sh\nexec ${args.map(arg => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}\n`, { mode: 0o700 });
+    let core!: DurablePrpControlPlane;
+    const bundle = createCapabilityRunnerdCodexTransport({
+      provider, stateDirectory: root, runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: fakeCodex, codexArgs: fakeCodexArgs(root), piProxyPath: proxy,
+      piRpcModel: "example/model-b", piRpcThinkingLevel: "medium",
+      controlPlaneRegistration: async authority => {
+        core = authority;
+        await authority.start();
+        return { release: () => undefined };
+      },
+    });
+    try {
+      await bundle.transport.request("thread/start", { cwd: root, model: "example/model-a", dynamicTools: [] });
+      await bundle.transport.request("turn/start", { input: [{ type: "text", text: "Continue." }], effort: "low" });
+      const payload = core.store.state.commands.find(command => command.type === "turn.start")!.payload;
+      expect(payload).toEqual({ text: "Continue.", ...(provider === "pi_rpc"
+        ? { model: "example/model-b", effort: "medium" } : { effort: "low" }), turnId: expect.any(String) });
+      if (provider === "codex") {
+        expect(JSON.stringify(payload)).toBe(JSON.stringify({ text: "Continue.", effort: "low", turnId: payload.turnId }));
+      }
+    } finally {
+      await bundle.transport.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
 
 describe("runnerd compaction turn payload", () => {
   it("asks Codex for its own compaction and Claude for its /compact command", async () => {

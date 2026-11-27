@@ -15,7 +15,7 @@ describe("IssueStatusBadge", () => {
       const html = renderToStaticMarkup(<IssueStatusBadge status={status} />);
       expect(html).toContain("status-chip");
       expect(html).toContain("border");
-      expect(html).toContain(`var(${cssVar})`);
+      expect(html).toContain(`var(${status === "blocked" ? "--status-task-in_progress" : cssVar})`);
       expect(html).toContain('viewBox="0 0 24 24"'); // unified glyph
     }
   });

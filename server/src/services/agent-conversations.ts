@@ -1,3 +1,4 @@
+import { PI_MODEL_PROVIDER_REQUIRED } from "../adapters/pi-model-selection.js";
 import { RESPONSIBILITIES_OFF_GUIDANCE } from "./responsibilities-disabled.js";
 import { isContextCompactionRun } from "./context-compaction.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
@@ -30,6 +31,7 @@ import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { HttpError } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import { ONBOARDING_CHAT_GREETING_REASON } from "./onboarding-chat-prompt.js";
 
 import { isConversation, isWaitingConversation, type ConversationIdentity } from "../lib/conversation-wake-policy.js";
@@ -326,12 +328,13 @@ export async function prepareConversationTurn(
   return result;
 }
 
-/** Finalizers only park a turn with a durable response, interaction, or processed /new. */
+/** Park a turn with a durable response, interaction, /new, or terminal model-selection refusal. */
 export async function settleConversationTurn(
   db: Db,
-  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "contextSnapshot">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "contextSnapshot"> & { errorCode?: string | null },
 ) {
-  if (run.status !== "succeeded") return false;
+  const modelSelectionFailed = run.status === "failed" && run.errorCode === PI_MODEL_PROVIDER_REQUIRED;
+  if (run.status !== "succeeded" && !modelSelectionFailed) return false;
   const context = run.contextSnapshot ?? {};
   const issueId = typeof context.issueId === "string" ? context.issueId : null;
   if (!issueId) return false;
@@ -360,7 +363,8 @@ export async function settleConversationTurn(
           eq(issueComments.issueId, issueId),
           eq(issueComments.createdByRunId, run.id),
           eq(issueComments.origin, "comment"),
-          eq(issueComments.authorAgentId, issue.conversationAgentId!),
+          modelSelectionFailed ? eq(issueComments.authorType, "system")
+            : eq(issueComments.authorAgentId, issue.conversationAgentId!),
           isNull(issueComments.deletedAt),
         ),
       )
@@ -379,7 +383,10 @@ export async function settleConversationTurn(
           ))
           .limit(1)
       : [];
-    if (!response && !interaction && context.conversationReset !== true) return false;
+    // A deterministic model refusal already committed on the run. Its system
+    // notice can be repaired independently; a failed insert must not strand
+    // this turn or prevent claim cleanup.
+    if (!response && !interaction && context.conversationReset !== true && !modelSelectionFailed) return false;
     if (
       context.conversationSessionGeneration !==
       issue.conversationSessionGeneration
@@ -471,7 +478,7 @@ export async function settleConversationTurnForRun(
   runId: string,
 ) {
   const [run] = await db.select({
-    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, status: heartbeatRuns.status,
+    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
     contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
       then jsonb_build_object(
         'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
@@ -524,6 +531,7 @@ export async function conversationReplay(
         eq(issueComments.companyId, companyId),
         eq(issueComments.issueId, issueId),
         isNull(issueComments.deletedAt),
+        isNull(issueComments.conversationSessionGeneration),
         boundary
           ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (select cursor.created_at, cursor.id from issue_comments cursor where cursor.id = ${boundary.id}::uuid)`
           : undefined,
@@ -723,7 +731,27 @@ export async function deliverConversationComments(
       }
       return "delivered" as const;
     });
-    if (delivered !== "retry") return delivered;
+    if (delivered !== "retry") {
+      // Admission may have parked messages while Pi was preparing. Once held,
+      // drain the same FIFO before a later person message can remain behind it.
+      // Outside the outbox transaction: steering owns its own ISSUE/ACK locks.
+      if (delivered === "delivered") {
+        const [current] = await db.select({ runId: issues.executionRunId }).from(issues).where(and(
+          eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
+        ));
+        if (current?.runId) {
+          const { drainContinuousPersonMessages } = await import("./native-runtime/native-continuous-drain.js");
+          try { await drainContinuousPersonMessages(db, { companyId: issue.companyId, issueId: issue.id,
+            runId: current.runId, agentId: issue.conversationAgentId }); }
+          catch (error) { logger.warn({ error, issueId: issue.id }, "held-run person-message drain deferred"); }
+        }
+        // Drain first; it leaves a /new head queued. Only then ask the driver
+        // to end an idle hold. The reset remains stock fresh-session input.
+        const { closeConversationResetHold } = await import("../modules/wake-queue/index.js");
+        await closeConversationResetHold(db, { companyId: issue.companyId, issueId: issue.id });
+      }
+      return delivered;
+    }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }

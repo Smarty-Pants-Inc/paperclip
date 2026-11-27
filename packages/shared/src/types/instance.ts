@@ -47,6 +47,8 @@ export interface InstanceExperimentalSettings {
    */
   enableNativeRunner: boolean;
   enableAiConnectionRouters: boolean;
+  /** Opt in to one automatic fresh session per refused continuous-Pi task incident. */
+  autoFreshSessionOnRecovery: boolean;
   /**
    * Hide the local environment and run all agents in the platform-managed
    * sandbox environment. Run selection refuses local while this is on.
@@ -132,6 +134,7 @@ export interface InstanceExperimentalSettings {
    * flipping it later does not change an existing first task.
    */
   enableFirstTaskPlanProposal: boolean;
+  enableQueuedMessageSteerCountdown: boolean;
   autoRestartDevServerWhenIdle: boolean;
   enableWorkspaceBranchReconcileForward: boolean;
   enableWorkspaceDirtyQuarantineRepair: boolean;

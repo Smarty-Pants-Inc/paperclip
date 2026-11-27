@@ -55,6 +55,11 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     description: "Allow experimental plugin connections to choose task-pinned accounts and harnesses.",
     tier: "managed", cloudDefault: false, selfHostedDefault: false,
   },
+  autoFreshSessionOnRecovery: {
+    title: "Automatic fresh-session recovery",
+    description: "When ON, try one new session per incident only when a continuous Pi task's saved session can never resume: native_provider_state_incompatible or native_controller_recovery_missing_evidence:retained_sandbox_binding. Warm owner not idle, run not admitted, prior owner indeterminate and controller recovery unsupported keep retrying the saved session, with ON or OFF. OFF keeps stock automatic recovery. For an incident opened while ON, boundaries, receipts and authorized-newer selection remain active after switching OFF. The person sees the New session divider; a notice appears only if the fresh session is refused again. Explicit Retry and independent stock resets are unchanged.",
+    tier: "managed", cloudDefault: false, selfHostedDefault: false,
+  },
   enableNativeRunner: {
     title: "Paperclip Runner",
     description:
@@ -430,6 +435,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     description:
       "Let the scheduler execute runs inside an isolated git-worktree preview instance for tasks created after activation.",
     tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  enableQueuedMessageSteerCountdown: {
+    title: "Steer countdown",
+    description:
+      "Wait five seconds, with Edit and Cancel, before a message sent while the agent works is steered into it. Off: it is steered at once.",
+    tier: "preference",
     cloudDefault: false,
     selfHostedDefault: false,
   },

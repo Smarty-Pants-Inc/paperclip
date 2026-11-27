@@ -168,6 +168,21 @@ describe("Codex app-server Codex driver", () => {
     await session.close({ reason: "test complete" });
   });
 
+  it.each(["updated", "omitted", "failed"])("admits only the retained run catalog after %s attachment", async mode => {
+    const transport = new WarmAttachTransport();
+    const names = ["call_api", "search_api", "get_identity", "report_progress"], dynamicTools = names.map(name => ({ name }));
+    const session = await makeDriver([transport], { dynamicTools: [{ name: "resolve_review" }], dynamicToolHandler: async ({ tool }: { tool: string }) => `authority:${tool}` }).openSession({ runId: "R1", normalizedSessionId: "catalog", workingDirectory: WORKSPACE });
+    try {
+      if (mode === "failed") transport.attachRun = vi.fn().mockRejectedValue(new Error("attach failed"));
+      const attaching = session.attachRun!({ runId: "R2", ...(mode === "omitted" ? {} : { dynamicTools }) });
+      if (mode === "failed") await expect(attaching).rejects.toThrow("attach failed"); else await attaching;
+      if (mode === "updated") expect(transport.attachments[0]).toMatchObject({ dynamicTools: names.map(name => ({ name })) });
+      dynamicTools[0]!.name = "mutated_after_attach"; await session.startTurn({ message: { role: "user", text: "exercise retained admission" } });
+      for (const tool of [...names, "resolve_review"]) { const admitted = mode === "updated" ? names.includes(tool) : tool === "resolve_review";
+        await expect(transport.handler({ id: tool, method: "item/tool/call", params: { tool, threadId: "thread-1", turnId: "turn-1", callId: tool, arguments: {} } })).resolves.toEqual({ success: admitted, contentItems: [{ type: "inputText", text: admitted ? `authority:${tool}` : "Unsupported tool." }] });
+      }
+    } finally { await session.close({ reason: "test complete" }); }
+  });
   it("does not create a transport for a pre-aborted session open", async () => {
     const transportFactory = vi.fn(() => new FakeCodexTransport());
     const driver = makeDriver([], { transportFactory });

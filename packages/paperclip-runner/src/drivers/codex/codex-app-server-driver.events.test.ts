@@ -44,8 +44,94 @@ import {
 } from "./codex-app-server-driver.test-support.js";
 
 import { RUNNERD_RUNTIME_ACTIVITY } from "./codex-driver-values.js";
+import { rehydrateRunnerdItemNotification } from "../../live/runnerd-codex-transport.js";
 
 describe("Codex app-server Codex driver", () => {
+  it.each([70_000, 300_000].flatMap(size => ["prose", "unbroken"].map(form => ({ size, form }))))("keeps complete redacted text envelopes outside diagnostic bounds ($size chars, $form)", async ({ size, form }) => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "large-answer", normalizedSessionId: "large-answer-session", workingDirectory: WORKSPACE,
+    });
+    try {
+      const turn = await session.startTurn({ message: { role: "user", text: "Answer once." } });
+      const body = form === "unbroken" ? "x".repeat(size) : "word ".repeat(size / 5);
+      const raw = body + " password=do-not-save";
+      const redacted = body + " password=[REDACTED]";
+      transport.push("turn/started", { threadId: "thread-1", turn: { id: turn.turnId, status: "inProgress" } });
+      for (const method of ["item/started", "item/completed"]) transport.push(method, {
+        threadId: "thread-1", turnId: turn.turnId,
+        item: { id: "large-final", type: "agentMessage", phase: "final_answer", text: raw, answers: [], diagnostic: "d".repeat(size) },
+      });
+      transport.push("item/agentMessage/delta", { threadId: "thread-1", turnId: turn.turnId, itemId: "large-delta", delta: raw, answers: ["person-1"] });
+      transport.push("paperclip/runResult", { threadId: "thread-1", turnId: turn.turnId, result });
+      transport.push("turn/completed", { threadId: "thread-1", turn: { id: turn.turnId, status: "completed", items: [] } });
+      const events = await collectUntilTerminal(session.events());
+      const items = events.filter(event => event.itemId === "large-final" || event.itemId === "large-delta");
+      expect(items).toHaveLength(3);
+      for (const event of items) {
+        expect(event.payload).toMatchObject({ kind: "agentMessage", text: redacted });
+        expect(event.turnId).toBe(turn.turnId);
+        expect(validatePrpEvent(event).ok).toBe(true);
+        expect(JSON.stringify(event)).not.toContain("do-not-save");
+        const diagnostic = event.payload.item ?? event.payload.update;
+        expect(Buffer.byteLength(JSON.stringify(diagnostic))).toBeLessThan(65_536);
+        expect(diagnostic).not.toHaveProperty("text");
+        expect(diagnostic).not.toHaveProperty("delta");
+      }
+      expect(items[0].payload).toMatchObject({ channel: "final", providerPhase: "final_answer", answers: [] });
+      expect(items[1].payload).toMatchObject({ channel: "final", providerPhase: "final_answer", answers: [] });
+      expect(items[2].payload.answers).toEqual(["person-1"]);
+    } finally { await session.close({ reason: "fixture complete" }); }
+  });
+
+  it.each([undefined, [], ["person-1", "person-2"], Array.from({ length: 129 }, (_, index) => `person-${index}`)].flatMap(answers =>
+    ["provider-item", "canonical"].map(form => ({ form, answers }))))("preserves optional final answers in the runtime payload ($form, $answers)", async ({ form, answers }) => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "answer-mapping", normalizedSessionId: "answer-mapping-session", workingDirectory: WORKSPACE,
+    });
+    try {
+      const turn = await session.startTurn({ message: { role: "user", text: "Answer the person." } });
+      transport.push("turn/started", { threadId: "thread-1", turn: { id: turn.turnId, status: "inProgress" } });
+      const answerFields = answers === undefined ? {} : { answers };
+      transport.push("item/completed", form === "canonical"
+        ? rehydrateRunnerdItemNotification({ itemId: "answer-final", kind: "agentMessage", channel: "final", text: "Answered.", ...answerFields }, "thread-1", turn.turnId)
+        : { threadId: "thread-1", turnId: turn.turnId,
+          item: { id: "answer-final", type: "agentMessage", phase: "final_answer", text: "Answered.", ...answerFields } });
+      transport.push("paperclip/runResult", { threadId: "thread-1", turnId: turn.turnId, result });
+      transport.push("turn/completed", { threadId: "thread-1", turn: { id: turn.turnId, status: "completed", items: [] } });
+      const events = await collectUntilTerminal(session.events());
+      const final = events.find(event => event.eventType === "item.completed" && event.itemId === "answer-final");
+      expect(final?.payload).toMatchObject({ kind: "agentMessage", channel: "final", text: "Answered." });
+      if (answers === undefined) expect(final?.payload).not.toHaveProperty("answers");
+      else expect(final?.payload.answers).toEqual(answers);
+      expect(validatePrpEvent(final).ok).toBe(true);
+    } finally {
+      await session.close({ reason: "fixture complete" });
+    }
+  });
+
+  it("sanitizes provider phase and answer ids outside the diagnostic text cap", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "safe-envelope", normalizedSessionId: "safe-envelope-session", workingDirectory: WORKSPACE,
+    });
+    try {
+      const turn = await session.startTurn({ message: { role: "user", text: "Answer." } });
+      transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId,
+        item: { id: "safe-final", type: "agentMessage", phase: "token=phase-secret", text: "Visible prose.",
+          answers: ["password=answer-secret", "person-1"] } });
+      transport.push("paperclip/runResult", { threadId: "thread-1", turnId: turn.turnId, result });
+      transport.push("turn/completed", { threadId: "thread-1", turn: { id: turn.turnId, status: "completed", items: [] } });
+      const events = await collectUntilTerminal(session.events());
+      const item = events.find(event => event.itemId === "safe-final");
+      expect(item?.payload.providerPhase).toBe("token=[REDACTED]");
+      expect(item?.payload.answers).toEqual(["password=[REDACTED]", "person-1"]);
+      expect(JSON.stringify(events)).not.toContain("phase-secret");
+      expect(JSON.stringify(events)).not.toContain("answer-secret");
+    } finally { await session.close({ reason: "fixture complete" }); }
+  });
+
   it("binds a semantic result that arrives before its pending turn start settles", async () => {
     // Runnerd can deliver the new turn's semantic result before turn/start's
     // response binds the turn (as after a restart continuation). Like a

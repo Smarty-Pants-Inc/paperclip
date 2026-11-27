@@ -1,7 +1,8 @@
 import { readAiConnectionConfigurationFailure } from "../../../lib/ai-connection-configuration-failure.js";
 import type { LifecycleFailure } from "./ports.js";
+import { redactDiagnosticText } from "@paperclipai/adapter-utils";
 
-// Only fixed text may leave this boundary. Provider errors can contain secrets.
+// Public copy stays fixed. Provider errors can contain secrets.
 const connectionReasons = {
   ai_connection_responsible_user_missing: "Set the responsible user before selecting this agent's AI connection.",
   ai_connection_default_missing: "Connect an AI account and choose the responsible user's personal default for this provider.",
@@ -25,6 +26,35 @@ const reasons = {
   invalid_lifecycle_result: "A required plugin returned an invalid result. Check the plugin's status in Settings. Paperclip will retry automatically.",
 } as const;
 
+const setupFailures = {
+  no_ai_connection: ["No AI connection attached", "Attach an AI connection in the agent's settings, then retry verification."],
+  ai_connection_unavailable: ["AI connection needs attention", "Check the selected AI connection and its access in the agent's settings, then retry verification."],
+  authentication_failed: ["AI authentication failed", "Reconnect the agent's AI connection or sign in to its execution tool, then retry verification."],
+  model_unavailable: ["Selected AI model unavailable", "Choose a model supported by the agent's AI connection, then retry verification."],
+  environment_unavailable: ["Agent environment unavailable", "Choose an available environment supported by the agent's runner, then retry verification."],
+  command_unavailable: ["Agent execution command unavailable", "Install or correct the execution command in the agent's environment, then retry verification."],
+  working_directory_unavailable: ["Agent working directory unavailable", "Correct the working directory in the agent's settings, then retry verification."],
+  verification_failed: ["Agent verification failed", "Run the agent test in Harness / Runtime settings to inspect the failed checks, then retry verification."],
+  setup_failed: ["Agent setup failed", "Open the agent's Harness / Runtime settings to repair its configuration, then retry verification."],
+} as const;
+const publicSetupCodes = {
+  ai_connection_required: "ai_connection_unavailable", ai_connection_default_missing: "no_ai_connection",
+  ai_connection_responsible_user_missing: "ai_connection_unavailable", ai_connection_missing: "ai_connection_unavailable",
+  ai_connection_incompatible: "ai_connection_unavailable", ai_connection_unavailable: "ai_connection_unavailable",
+  ai_connection_credential_not_shared: "ai_connection_unavailable", harness_auth_failed: "authentication_failed",
+  harness_model_unavailable: "model_unavailable", test_environment_unavailable: "environment_unavailable",
+  harness_command_unavailable: "command_unavailable", harness_cwd_invalid: "working_directory_unavailable",
+  harness_test_failed: "verification_failed", harness_probe_unexpected_output: "verification_failed",
+} as const;
+
+/** Public setup presentation is fixed copy, never persisted provider prose. */
+export function lifecycleSetupFailure(storedCode: unknown) {
+  const code = typeof storedCode === "string" && Object.hasOwn(publicSetupCodes, storedCode)
+    ? publicSetupCodes[storedCode as keyof typeof publicSetupCodes] : "setup_failed";
+  const [title, nextAction] = setupFailures[code];
+  return { code, title, nextAction: storedCode === "ai_connection_required" ? reasons.ai_connection_required : nextAction };
+}
+
 const transientCodes = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "40001", "40P01", "53300", "57P01"]);
 const configurationFailures = new Set([
   "ai_connection_required", "harness_auth_failed", "harness_model_unavailable",
@@ -44,6 +74,15 @@ export function lifecycleFailureCode(error: unknown): string | undefined {
   const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
   return [candidate?.code, candidate?.cause?.code].find((code): code is string =>
     typeof code === "string" && (Object.hasOwn(reasons, code) || transientCodes.has(code)));
+}
+
+/** Private setup diagnostic from an already-redacted native probe, never public action copy. */
+export function lifecycleFailureReason(error: unknown): string | undefined {
+  const reason = (error as { redactedNativeProbeReason?: unknown } | null)?.redactedNativeProbeReason;
+  if (typeof reason !== "string" || !lifecycleFailureCode(error)?.startsWith("harness_")) return undefined;
+  const redacted = redactDiagnosticText(reason, "[REDACTED]")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/]*@/gi, "$1[REDACTED]@");
+  return Array.from(redacted.split(/[\r\n\u2028\u2029]/u, 1)[0] ?? "").slice(0, 300).join("") || undefined;
 }
 
 export function lifecycleFailureMessage(context: LifecycleFailure, error: unknown): string {

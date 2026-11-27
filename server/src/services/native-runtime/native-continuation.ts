@@ -1,12 +1,14 @@
 import { isPaperclipExternalChatContractTurn, normalizePaperclipWakePayload, PAPERCLIP_EARLIER_READ_COMMENT_NOTE } from "@paperclipai/adapter-utils/server-utils";
 import type { CaseExecutionContext, projectCaseContinuation } from "../case-context.js";
 import { caseInstructionAlreadyRepresented } from "../case-context.js";
+import { nativeStatusRetryPrompt } from "./continued-session.js";
 
 /** Only new, authorized events belong in an already retained provider conversation.
  * Full bootstrap input is kept separately for an actual provider resume failure.
  */
 export function buildNativeContinuationPrompt(input: {
   wakePayload: unknown;
+  promptOnly?: boolean;
   previousRunId: string;
   issue: { title: string; description: string | null };
   previousIssue: { title: string; description: string | null };
@@ -17,12 +19,24 @@ export function buildNativeContinuationPrompt(input: {
   previousGitHubReviewConfigurationKeys?: readonly string[];
 }): string | null {
   const wake = normalizePaperclipWakePayload(input.wakePayload);
+  if (input.promptOnly && wake) {
+    const retryPrompt = nativeStatusRetryPrompt(input.wakePayload, input.previousRunId);
+    if (retryPrompt) {
+      // The failed run's own history is already present, but person messages
+      // arriving since its coverage cursor have not been read by that turn.
+      const unseen = wake.executionContinuation?.resumeDelta?.messages.filter(message => message.authorType === "user") ?? [];
+      return [retryPrompt, ...unseen.map(message => message.body)].join("\n\n");
+    }
+    const messages = [...(wake.executionContinuation?.messages ?? wake.executionContinuation?.resumeDelta?.messages ?? []), ...wake.comments];
+    return wake.commentIds.map(id => wake.comments.find(comment => comment.id === id)?.fullBody ?? messages.find(message => message.id === id)!.body).join("\n\n");
+  }
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
   if (input.caseContext && !input.workflowCase) return null;
   const rawWake = input.wakePayload && typeof input.wakePayload === "object"
     ? input.wakePayload as Record<string, unknown> : {};
+  const unclaimedTask = wake.reason === "issue_continuation_needed" && rawWake.nativeTaskUnclaimed === true;
   // Attachment descriptors are intentionally omitted by the generic normalizer.
   // Retain the complete bootstrap framing whenever current input needs them or
   // an omission notice. The compact path never guesses an unavailable file.
@@ -52,7 +66,7 @@ export function buildNativeContinuationPrompt(input: {
   // Other provider, attachment, question, approval, and recovery paths keep
   // their specialized framing. A matching prior run still gates every delta.
   if (rawWake.chatCompletionUpdates || (wake.externalChatProvider && !externalChat) ||
-    (!['issue_commented', 'issue_children_completed'].includes(wake.reason ?? '') && !caseHandoff &&
+    (!['issue_commented', 'issue_children_completed'].includes(wake.reason ?? '') && !caseHandoff && !unclaimedTask &&
       !(externalChat && wake.reason === "External chat message received")) ||
     wake.fallbackFetchNeeded || wake.truncated || wake.recovery || continuation?.interruptedRunId ||
     (wake.externalChatExecutionBound && !externalChat) || wake.externalChatQuestionResponse ||
@@ -91,6 +105,10 @@ export function buildNativeContinuationPrompt(input: {
   const earlierRead = wake.comments.filter((comment) => comment.readByEarlierTurn && comment.id
     && events.messages.some((message) => message.id === comment.id)).map((comment) => comment.id!);
   if (earlierRead.length > 0) Object.assign(events, { readByEarlierTurn: { messageIds: earlierRead, note: PAPERCLIP_EARLIER_READ_COMMENT_NOTE } });
+  if (unclaimedTask) return [
+    "You are continuing the same conversation. The previous task turn ended without an accepted completion report. Do NOT repeat commands, scripts, or other work already done in this task, or re-answer consumed messages. If the work is complete, file your result against the current contract now. Otherwise finish only what remains, then file your result.",
+    ...(events.messages.length || Object.keys(events).length > 1 ? [JSON.stringify(events)] : []),
+  ].join("\n\n");
   if (!events.messages.length && !humanResponses.length && !wake.childIssueSummaries.length && !Object.keys(taskChanges).length && !input.workflowCase) return null;
   return JSON.stringify(events);
 }

@@ -1,5 +1,5 @@
-import type { PaperclipQuestion, PaperclipQuestionResponse, PaperclipQuestionSet, TranscriptEntry } from "@paperclipai/adapter-utils";
-import type { UIAdapterModule } from "../types";
+import type { PaperclipQuestion, PaperclipQuestionResponse, PaperclipQuestionSet } from "@paperclipai/adapter-utils";
+import type { TranscriptContentVersion, TranscriptEntry, UIAdapterModule } from "../types";
 import { parseCodexStdoutLine, buildPaperclipRunnerConfig } from "@paperclipai/adapter-codex-local/ui";
 import { CodexLocalConfigFields } from "../codex-local/config-fields";
 import { isRunLogOnlyProviderEvent } from "@/components/transcript/run-log-only-events";
@@ -15,16 +15,28 @@ interface PaperclipRunnerParserState {
   structuredFinalItemIds: Set<string>;
   runtimeRequests: Map<string, Extract<TranscriptEntry, { kind: "runtime_request" }>>;
   previousPiRuntimeFailure: string | null;
+  firstSeenAtByItem: Map<string, string>;
 }
 
-function itemChannel(payload: JsonRecord): "progress" | "final" | "summary" | "detail" | "unknown" {
-  const channel = text(payload.channel);
-  return channel === "progress" || channel === "final" || channel === "summary" || channel === "detail"
+type RunnerItemChannel = "progress" | "final" | "summary" | "detail" | "unknown";
+
+// PRP permits channel on either the payload or its nested item. Both readers
+// must also retain the last channel when a partial update omits it.
+export function canonicalRunnerChannel(payload: JsonRecord, fallback: RunnerItemChannel = "unknown"): RunnerItemChannel {
+  const channel = text(payload.channel) || text(record(payload.item).channel);
+  if ((!channel || channel === "unknown") && record(payload.update).channel === "progress") return "progress";
+  return channel === "progress" || channel === "final" || channel === "summary" || channel === "detail" || channel === "unknown"
     ? channel
-    : "unknown";
+    : fallback;
 }
 
-function structuredResultSummary(value: string): string | null {
+export function suppressStructuredFinalDelta(value: string, channel: RunnerItemChannel, id: string, structuredIds: Set<string>): boolean {
+  if (channel !== "final" || (!structuredIds.has(id) && !value.trimStart().startsWith("{"))) return false;
+  structuredIds.add(id);
+  return true;
+}
+
+export function structuredResultSummary(value: string): string | null {
   if (!value.trimStart().startsWith("{")) return null;
   try {
     const parsed = record(JSON.parse(value));
@@ -60,7 +72,8 @@ function stringify(value: unknown): string {
   }
 }
 
-function itemText(item: JsonRecord, payload: JsonRecord): string {
+export function canonicalRunnerItemText(payload: JsonRecord): string {
+  const item = record(payload.item ?? payload);
   const direct = text(item.text, text(payload.text));
   if (direct) return direct;
   const summary = Array.isArray(item.summary) ? item.summary : [];
@@ -74,8 +87,45 @@ function normalizedItemType(item: JsonRecord, payload: JsonRecord): string {
   return text(item.type, text(payload.kind)).replaceAll("_", "").toLowerCase();
 }
 
+// Both native history and PRP log projection use this identity precedence.
+// A source event can identify an unkeyed snapshot; prose and receipt time cannot.
+export function canonicalRunnerItemId(event: JsonRecord, payload: JsonRecord, sourceEventId?: unknown): string | null {
+  const item = record(payload.item ?? payload);
+  // A result's own id identifies the receipt, not the call it completes.
+  const callId = normalizedItemType(item, payload) === "toolresult" ? text(item.tool_use_id) : "";
+  return text(event.itemId) || text(payload.itemId) || callId || text(item.id) || text(event.sourceEventId) || text(sourceEventId) || null;
+}
+
+export function canonicalRunnerToolResult(item: JsonRecord): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(item, "result")) {
+    const content = item.content ?? item.output ?? item.error;
+    return content === undefined ? undefined : stringify(content);
+  }
+  try { return JSON.stringify(item.result) ?? ""; }
+  catch { return "Tool result could not be serialized"; }
+}
+
+// Use the PRP identity, never the native/log transport cursor or receipt time.
+export function canonicalRunnerEventId(event: JsonRecord, ts: string): string {
+  return JSON.stringify([event.turnId ?? null, event.sequence ?? event.sourceEventId ?? event.emittedAt ?? ts]);
+}
+
+// Content freshness is independent of first-painted placement and log receipt time.
+// Source sequences are comparable only within their producer (legacy: turn).
+export function canonicalRunnerContentVersion(event: JsonRecord): TranscriptContentVersion | undefined {
+  const at = text(event.emittedAt);
+  const sequence = event.sourceSeq ?? event.sequence;
+  const sequenced = typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence >= 0;
+  if (!at && !sequenced) return undefined;
+  return {
+    at,
+    ...(sequenced ? { sequence, scope: JSON.stringify([event.sourceInstanceId ?? event.normalizedSessionId ?? null, event.sourceSeq === undefined ? event.turnId ?? null : null]) } : {}),
+    completed: /\.(completed|failed|cancelled|interrupted|closed)$/.test(text(event.eventType)),
+  };
+}
+
 function itemId(event: JsonRecord, item: JsonRecord): string {
-  return text(event.itemId, text(item.id, "paperclip-runner-item"));
+  return canonicalRunnerItemId(event, { item }) ?? "";
 }
 
 function toolFailure(item: JsonRecord): boolean {
@@ -200,9 +250,9 @@ function genericToolEntries(
   return [{
     kind: "tool_result",
     ts,
-    toolUseId: text(item.tool_use_id, id),
+    toolUseId: id || text(item.tool_use_id),
     toolName: name,
-    content: stringify(item.content ?? item.result ?? item.output ?? item.error) || `${name} completed`,
+    content: canonicalRunnerToolResult(item) ?? `${name} completed`,
     isError: toolFailure(item),
   }];
 }
@@ -217,13 +267,12 @@ function parseItemEvent(
   const item = record(payload.item);
   const type = normalizedItemType(item, payload);
   const id = itemId(event, item);
-  const channel = itemChannel(payload);
-  if (phase === "started") state.itemChannels.set(id, channel);
-  const resolvedChannel = channel === "unknown" ? state.itemChannels.get(id) ?? "unknown" : channel;
-  if (type === "agentmessage") {
-    const value = itemText(item, payload);
+  const resolvedChannel = canonicalRunnerChannel(payload, state.itemChannels.get(id));
+  if (phase === "started") state.itemChannels.set(id, resolvedChannel);
+  if (type === "agentmessage" || type === "assistantmessage") {
+    const value = canonicalRunnerItemText(payload);
     if (phase === "completed") state.itemChannels.delete(id);
-    if (!value || state.assistantDeltaItemIds.has(id)) return [];
+    if (!value || (phase !== "completed" && state.assistantDeltaItemIds.has(id))) return [];
     if (resolvedChannel === "final") {
       const summary = structuredResultSummary(value);
       if (summary) {
@@ -234,12 +283,12 @@ function parseItemEvent(
     return [{ kind: "assistant", ts, text: value, channel: resolvedChannel === "final" ? "final" : resolvedChannel === "progress" ? "progress" : "unknown", itemId: id }];
   }
   if (type === "reasoning") {
-    const value = itemText(item, payload);
+    const value = canonicalRunnerItemText(payload);
     if (phase === "completed") state.itemChannels.delete(id);
     return [{
       kind: "thinking",
       ts,
-      text: value && !state.reasoningDeltaItemIds.has(id) ? value : "",
+      text: value,
       lifecycle: phase,
       channel: resolvedChannel === "detail" ? "detail" : resolvedChannel === "summary" ? "summary" : "unknown",
       itemId: id,
@@ -260,7 +309,7 @@ function parseItemEvent(
   }
   if (type === "usage") return [];
   if (type === "usermessage") return [];
-  const detail = itemText(item, payload);
+  const detail = canonicalRunnerItemText(payload);
   return detail ? [{ kind: "system", ts, text: detail }] : [];
 }
 
@@ -272,16 +321,14 @@ function parseDeltaEvent(
 ): TranscriptEntry[] {
   const kind = text(payload.kind).replaceAll("_", "").toLowerCase();
   const value = text(payload.text);
-  const id = text(event.itemId, `${kind || "item"}-delta`);
-  const explicitChannel = itemChannel(payload);
-  const channel = explicitChannel === "unknown" ? state.itemChannels.get(id) ?? "unknown" : explicitChannel;
+  const id = canonicalRunnerItemId(event, payload);
+  if (!id) return [];
+  const channel = canonicalRunnerChannel(payload, state.itemChannels.get(id));
+  state.itemChannels.set(id, channel);
   if (!value) return [];
-  if (kind === "agentmessage") {
+  if (kind === "agentmessage" || kind === "assistantmessage") {
     state.assistantDeltaItemIds.add(id);
-    if (channel === "final" && (state.structuredFinalItemIds.has(id) || value.trimStart().startsWith("{"))) {
-      state.structuredFinalItemIds.add(id);
-      return [];
-    }
+    if (suppressStructuredFinalDelta(value, channel, id, state.structuredFinalItemIds)) return [];
     return [{ kind: "assistant", ts, text: value, delta: true, channel: channel === "final" ? "final" : channel === "progress" ? "progress" : "unknown", itemId: id }];
   }
   if (kind === "reasoning") {
@@ -690,6 +737,8 @@ function parsePrpEvent(
 ): TranscriptEntry[] {
   const eventType = text(event.eventType);
   const payload = record(event.payload);
+  const canonicalId = canonicalRunnerItemId(event, payload);
+  if (canonicalId) event = { ...event, itemId: canonicalId };
   if (isRunLogOnlyProviderEvent(eventType, payload)) return [];
   const failure = piRuntimeFailureKey(event, payload);
   if (failure !== null && failure === state.previousPiRuntimeFailure) return [];
@@ -719,7 +768,7 @@ function parsePrpEvent(
     const summary = family === "model_identity"
       ? text(payload.summary, text(payload.effectiveModel, text(payload.requestedModel, text(payload.provider, eventType))))
       : text(payload.summary, text(payload.name, text(payload.query, eventType)));
-    return [{ kind: "provider_activity", ts, family, eventType, status, title, summary, payload }];
+    return [{ kind: "provider_activity", ts, providerEventId: canonicalRunnerEventId(event, ts), family, eventType, status, title, summary, payload }];
   }
   if (eventType === "workspace.change.updated" || eventType === "workspace.diff.recorded") {
     return [workspaceChangeEntry(payload, ts)];
@@ -793,6 +842,7 @@ function createParserState(): PaperclipRunnerParserState {
     structuredFinalItemIds: new Set(),
     runtimeRequests: new Map(),
     previousPiRuntimeFailure: null,
+    firstSeenAtByItem: new Map(),
   };
 }
 
@@ -810,7 +860,22 @@ function parsePaperclipRunnerLine(line: string, ts: string, state: PaperclipRunn
     return parseCodexStdoutLine(line, ts);
   }
   const event = record(envelope.event);
-  if (Object.keys(event).length > 0) return parsePrpEvent(event, ts, state);
+  if (Object.keys(event).length > 0) {
+    const id = canonicalRunnerItemId(event, record(event.payload));
+    const authoredAt = text(event.emittedAt);
+    const entries = parsePrpEvent(event, ts, state);
+    const contentVersion = canonicalRunnerContentVersion(event);
+    // An empty assistant start has no painted row in either projection.
+    if (entries.length && authoredAt && id && !state.firstSeenAtByItem.has(id)) state.firstSeenAtByItem.set(id, authoredAt);
+    return entries.map(entry => {
+      const firstSeenAt = entry.kind === "assistant" || entry.kind === "thinking"
+        ? (id ? state.firstSeenAtByItem.get(id) : authoredAt) : authoredAt;
+      return { ...entry, ...(firstSeenAt ? { firstSeenAt } : {}),
+        ...(contentVersion ? { contentVersion } : {}),
+        ...(event.eventType === "item.completed" && authoredAt ? { completedAt: authoredAt } : {}),
+        ...((entry.kind === "assistant" || entry.kind === "thinking") && !id ? { itemId: undefined } : {}) };
+    });
+  }
   state.previousPiRuntimeFailure = null;
   return [];
 }
@@ -832,4 +897,5 @@ export const paperclipRunnerUIAdapter: UIAdapterModule = {
   },
   ConfigFields: CodexLocalConfigFields,
   buildAdapterConfig: buildPaperclipRunnerConfig,
+  transcriptPresentation: { liveReasoningView: "inline" },
 };

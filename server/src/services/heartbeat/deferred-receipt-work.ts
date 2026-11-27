@@ -75,6 +75,7 @@ export function registerDeferredReceiptWork(
         const eligible = and(
           scope ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
           scope?.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
+          sql`coalesce(${agentWakeupRequests.payload}->'preDispatchInputOnly', 'false'::jsonb) <> 'true'::jsonb`,
           kind === "native" ? and(
             eq(agentWakeupRequests.requestedByActorType, "system"),
             eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),

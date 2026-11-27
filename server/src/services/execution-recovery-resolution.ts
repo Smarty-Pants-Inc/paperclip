@@ -1,3 +1,4 @@
+import { hasUnchangedNativeInputRefusal, latestTaskRunIsNativeInputSizeRefusal } from "./native-input-refusal.js";
 import { settleOperatorContainedNativeOwner } from "./native-runtime/native-failed-run-owner-release.js";
 import { notifyRoutineExecutionStatus } from "./routine-execution-status-notifications.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
@@ -52,6 +53,10 @@ import { parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
 import { RECOVERY_CONTINUATIONS_PER_COMPANY_PER_PASS, RECOVERY_CONTINUATION_BACKLOG_SHARE_PER_PASS, RECOVERY_CONTINUATION_MAX_HOLD_MS,
   recoveryContinuationHeldSince } from "./recovery-continuation-pacing.js";
 import { emitSystemTaskBlockedAfterCommit } from "./product-telemetry.js";
+import { parseObject } from "../adapters/utils.js";
+import { queuedCommentIdsFromRunContext, withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../lib/queued-comment-context.js";
+import { readFirstTurnQueuedInputReceipt } from "./native-runtime/first-turn-queued-input.js";
+import { answeredContinuousHeldRun } from "./native-runtime/continuous-session-input.js";
 
 export { RECOVERY_CONTINUATIONS_PER_COMPANY_PER_PASS, RECOVERY_CONTINUATION_DELIVERY_BOUND_MS,
   RECOVERY_CONTINUATION_MAX_HOLD_MS } from "./recovery-continuation-pacing.js";
@@ -523,6 +528,25 @@ export async function deliverReconciledExecutions(
           await settleCoalescedFreshContinuationHolds(db, { companyId: action.companyId, primaryId: action.id, delivery: "invalidated" });
           continue;
         }
+        // Older builds may already have restored this action. Close it without
+        // a wake when the held Pi conversation owes no answer; a later person's
+        // message remains on the ordinary admission path. No provider I/O here.
+        const answeredHeld = await db.transaction(async tx => {
+          await tx.select({ id: issues.id }).from(issues).where(and(
+            eq(issues.companyId, action.companyId), eq(issues.id, task.id))).for("update");
+          if (!await answeredContinuousHeldRun(tx as unknown as Db, {
+            companyId: action.companyId, issueId: task.id, runId: decision.runId,
+          })) return false;
+          await tx.update(issueRecoveryActions).set({ outcome: "cancelled", wakePolicy: null, monitorPolicy: null,
+            resolutionNote: "continuous_held_input_already_answered",
+            evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
+          }).where(pendingDecision);
+          await settleCoalescedFreshContinuationHolds(tx as unknown as Db, {
+            companyId: action.companyId, primaryId: action.id, delivery: "invalidated",
+          });
+          return true;
+        });
+        if (answeredHeld) continue;
         // A fresh continuation is the task's next run only while nothing else
         // started one: a person's Retry or saved input that ran since it was
         // recorded already continues the task, so it is never a second run.
@@ -548,11 +572,41 @@ export async function deliverReconciledExecutions(
             continue;
           }
         }
+        if (await latestTaskRunIsNativeInputSizeRefusal(db, { companyId: action.companyId, issueId: task.id })
+          && await hasUnchangedNativeInputRefusal(db, { companyId: action.companyId, issueId: task.id })) continue;
         if (await deferForUnwakeableAssignee(db, action)) { seenAgents.add(action.returnOwnerAgentId); continue; }
         if (!await agentHasRoom(action, action.returnOwnerAgentId, kind)) {
           seenAgents.add(action.returnOwnerAgentId);
           continue;
         }
+        // A retry owns the predecessor's unanswered input, not its sealed receipt.
+        const [retried] = await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, action.companyId), eq(heartbeatRuns.id, decision.runId),
+          eq(heartbeatRuns.agentId, action.returnOwnerAgentId),
+          sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.issueId}::text,
+            ${heartbeatRuns.contextSnapshot}->>'issueId') = ${task.id}`,
+          task.conversationAgentId ? sql`${heartbeatRuns.contextSnapshot}->>'conversationSessionGeneration'
+            = ${String(task.conversationSessionGeneration)}` : undefined,
+        ));
+        const result = parseObject(retried?.resultJson);
+        const answered = new Set(Object.values(parseObject(result.continuousReplies)).flatMap(reply => {
+          const ids = parseObject(reply).questionCommentIds;
+          return Array.isArray(ids) ? ids : [];
+        }));
+        const returned = parseObject(result.personStop).returned;
+        const settled = new Set([...answered, ...(Array.isArray(returned) ? returned : [])]);
+        const wakeId = retried?.contextSnapshot?.wakeCommentId;
+        const inherited = parseObject(result.continuedSessionInput);
+        const inheritedIds = inherited.runId === retried?.id && inherited.sessionId === retried?.nativeSessionId && Array.isArray(inherited.commentIds)
+          ? inherited.commentIds.filter((id): id is string => typeof id === "string") : [];
+        const inputIds = [...new Set([
+          ...queuedCommentIdsFromRunContext(retried?.contextSnapshot),
+          ...(typeof wakeId === "string" ? [wakeId] : []),
+          ...(retried ? readFirstTurnQueuedInputReceipt(retried)?.commentIds ?? [] : []),
+          ...Object.entries(parseObject(result.queuedSteeringAcknowledgements))
+            .filter(([, receipt]) => parseObject(receipt).status === "acknowledged").map(([id]) => id),
+          ...inheritedIds,
+        ])].filter(id => !settled.has(id));
         const slot = await reserveAutomaticRunCreation(db, action.companyId, { issueId: task.id, sourceRunId: decision.runId });
         if (slot.heldUntil) { await deferRefusedContinuation(action); continue; }
         const run = await wake(action.returnOwnerAgentId, {
@@ -560,10 +614,10 @@ export async function deliverReconciledExecutions(
           triggerDetail: "system",
           reason: "issue_recovery_action_restored",
           idempotencyKey: `execution-reconciliation:${action.id}`,
-          payload: { issueId: task.id, recoveryActionId: action.id },
+          payload: withQueuedCommentIdsInWakePayload({ issueId: task.id, recoveryActionId: action.id }, inputIds),
           requestedByActorType: "system",
           requestedByActorId: "execution-recovery",
-          contextSnapshot: {
+          contextSnapshot: withQueuedCommentIdsInRunContext({
             issueId: task.id,
             taskId: task.id,
             recoveryActionId: action.id,
@@ -574,7 +628,7 @@ export async function deliverReconciledExecutions(
             source: "execution.reconciled",
             ...((action.evidence.freshContinuation as { isolation?: unknown } | undefined)?.isolation === "fresh_isolated_workspace"
               ? { freshContinuationIsolation: action.id } : {}),
-          },
+          }, inputIds),
         }).catch(async error => { await slot.release(); throw error; });
         seenAgents.add(action.returnOwnerAgentId);
         if (!run) {
@@ -884,6 +938,13 @@ export async function settleUnrecoverableExecutions(
         if (current && !isInterruptedNativePreparationCandidate(run)) {
           const fresh = await continueFreshInTransaction(tx as unknown as Db, { companyId: task.companyId, runId: run.id,
             trigger: "recovery_refused", now });
+          if (fresh.kind === "person_owned" && fresh.reason === "continuous_held_input_already_answered") {
+            await tx.update(issueRecoveryActions).set({ status: "resolved", outcome: "cancelled", resolvedAt: now, updatedAt: now,
+              wakePolicy: null, monitorPolicy: null, resolutionNote: fresh.reason,
+              evidence: { ...action.evidence, continuationDelivery: "invalidated" },
+            }).where(eq(issueRecoveryActions.id, action.id));
+            return;
+          }
           if (["continued", "already_continued", "successor_exists"].includes(fresh.kind)) return;
           if (fresh.kind === "backoff" || fresh.kind === "exact_recovery_pending") {
             await recordFreshContinuationCheck(tx as unknown as Db, { companyId: task.companyId, actionId: action.id }, fresh, now);

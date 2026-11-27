@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, assets, chatTaskHandoffs, companies, companyMemberships, createDb, applyPendingMigrations, decisionRetention, decisionTriage, documentRevisions, documents, heartbeatRuns,
-  inboxDismissals, issueAttachments, issueComments, issueDocuments, issues, issueThreadInteractions } from "@paperclipai/db";
+  inboxDismissals, issueAttachments, issueComments, issueDocuments, issueRelations, issues, issueThreadInteractions } from "@paperclipai/db";
 import { requestConfirmationTargetSchema, suggestedTaskDraftSchema } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
@@ -487,6 +487,125 @@ const support = externalDatabase ? { supported: true } : await getEmbeddedPostgr
       await expect(service.listCreatedTasks(f.companyId, f.conversationId, { ...options, cursor: malformed }))
         .rejects.toMatchObject({ status: 400, message: "Invalid chat handoff cursor" });
     }
+  });
+
+  // These projections cross task privacy and cursor/limit boundaries; use real
+  // PostgreSQL rather than mocks that could hide filtering after pagination.
+  it.each([undefined, "tray"] as const)("projects current status evidence and reassignment in view %s", async (view) => {
+    const f = await seed();
+    const { task } = await f.handoff();
+    const updatedAt = new Date("2026-11-26T08:00:00.000Z");
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: null, assigneeUserId: f.userId, updatedAt })
+      .where(eq(issues.id, task.id));
+    const page = await conversationDecisionReceiptsService(db).listCreatedTasks(f.companyId, f.conversationId, {
+      actor: { type: "board", userId: f.userId, source: "session", ignoreInstanceAdmin: true }, userId: f.userId, view,
+    });
+    expect(page.items).toMatchObject([{
+      issueId: task.id, status: "in_progress", displayStatus: "in_progress", externalConversationState: null,
+      blockerAttention: undefined, unblockDescriptor: null, interruption: null, blockedInboxAttention: null,
+      assigneeAgentId: null, assigneeUserId: f.userId, updatedAt: updatedAt.toISOString(),
+    }]);
+    // Match the task-summary contract: absent coverage is omitted, not null.
+    expect(JSON.parse(JSON.stringify(page.items[0]))).not.toHaveProperty("blockerAttention");
+    expect(page.items[0]).not.toHaveProperty("actionRequired");
+    expect(page.items[0]).not.toHaveProperty("projectId");
+    // Canonical in_progress without a live agent run must not pretend to work.
+    await db.update(issues).set({ assigneeAgentId: f.agentId, assigneeUserId: null }).where(eq(issues.id, task.id));
+    const reassigned = await conversationDecisionReceiptsService(db).listCreatedTasks(f.companyId, f.conversationId, {
+      actor: { type: "board", userId: f.userId, source: "session", ignoreInstanceAdmin: true }, userId: f.userId, view,
+    });
+    expect(reassigned.items).toMatchObject([{ issueId: task.id, status: "in_progress", displayStatus: "todo",
+      assigneeAgentId: f.agentId, assigneeUserId: null }]);
+  });
+
+  it.each([undefined, "tray"] as const)("carries covered running-child evidence and person unblock ownership in view %s", async (view) => {
+    const f = await seed();
+    const { task: parent } = await f.handoff();
+    const { task: person } = await f.handoff();
+    const unblockDescriptor = { owner: { userId: f.userId }, action: "Approve the launch" };
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, parent.id));
+    await db.update(issues).set({ status: "blocked", unblockDescriptor }).where(eq(issues.id, person.id));
+    await f.ask(person);
+    const [child] = await db.insert(issues).values({ companyId: f.companyId, title: "Running child", identifier: `TRAY-${f.companyId}`,
+      parentId: parent.id, status: "in_progress", assigneeAgentId: f.agentId }).returning();
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: child.id, relatedIssueId: parent.id, type: "blocks" });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running",
+      issueId: child.id, contextSnapshot: { issueId: child.id } }).returning();
+    await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, child.id));
+    const list = () => conversationDecisionReceiptsService(db).listCreatedTasks(f.companyId, f.conversationId, {
+      actor: { type: "board", userId: f.userId, source: "session", ignoreInstanceAdmin: true }, userId: f.userId, view,
+    });
+    const page = await list();
+    expect(page.items.find(item => item.issueId === parent.id)).toMatchObject({
+      status: "blocked", displayStatus: "blocked", unblockDescriptor: null,
+      blockerAttention: { state: "covered", reason: "active_child", coveredBlockerCount: 1, sampleBlockerIdentifier: child.identifier },
+    });
+    expect(page.items.find(item => item.issueId === person.id)).toMatchObject({
+      unblockDescriptor, interruption: { responsibility: "user", state: "waiting_for_user", userAction: "question" },
+    });
+    // State/counts may survive a private blocker, never its identifier or title.
+    await db.update(issues).set({ parentId: null, visibility: "private", privacyRootIssueId: child.id,
+      responsibleUserId: "another-person", createdByUserId: "another-person" }).where(eq(issues.id, child.id));
+    const redacted = (await list()).items.find(item => item.issueId === parent.id)!;
+    expect(redacted.blockerAttention).toMatchObject({ state: "covered", sampleBlockerIdentifier: null, sampleStalledBlockerIdentifier: null });
+    expect(JSON.stringify(redacted)).not.toContain(child.identifier!);
+    expect(JSON.stringify(redacted)).not.toContain(child.id);
+  });
+
+  it("filters more than 100 finished handoffs before tray cursors and limits, preserving default history", async () => {
+    const f = await seed();
+    const tasks = await db.insert(issues).values(Array.from({ length: 112 }, (_, index) => ({
+      companyId: f.companyId, title: `Task ${index}`, status: index < 105 ? (index % 2 ? "done" : "cancelled") : "todo",
+    }))).returning();
+    const at = new Date("2026-11-26T08:00:00Z");
+    await db.insert(chatTaskHandoffs).values(tasks.map((task, index) => ({ companyId: f.companyId, conversationId: f.conversationId,
+      taskId: task.id, agentId: f.agentId, sessionGeneration: 0,
+      // Finished handoffs precede every open one; open ties exercise the ID cursor.
+      createdAt: index < 105 ? new Date(at.getTime() + 1000) : at,
+    })));
+    const service = conversationDecisionReceiptsService(db);
+    const options = { actor: { type: "board" as const, userId: f.userId, source: "session" as const, ignoreInstanceAdmin: true }, userId: f.userId };
+    const history = await service.listCreatedTasks(f.companyId, f.conversationId, { ...options, limit: 100 });
+    expect(history.items).toHaveLength(100);
+    expect(history.items.every(item => ["done", "cancelled"].includes(item.status))).toBe(true);
+    expect(history.nextCursor).not.toBeNull();
+    const openIds: string[] = [];
+    let cursor: string | undefined;
+    for (let index = 0; index < 3; index++) {
+      const page = await service.listCreatedTasks(f.companyId, f.conversationId, { ...options, view: "tray", limit: 3, cursor });
+      expect(page.items).toHaveLength(index < 2 ? 3 : 1);
+      expect(page.items.every(item => item.status === "todo")).toBe(true);
+      openIds.push(...page.items.map(item => item.issueId));
+      expect(page.nextCursor === null).toBe(index === 2);
+      cursor = page.nextCursor ?? undefined;
+    }
+    expect(openIds).toEqual(tasks.slice(105).map(task => task.id).sort().reverse());
+    await db.update(issues).set({ status: "done" }).where(and(eq(issues.companyId, f.companyId), eq(issues.status, "todo")));
+    expect(await service.listCreatedTasks(f.companyId, f.conversationId, { ...options, view: "tray" })).toEqual({ items: [], nextCursor: null });
+  });
+
+  it.each([undefined, "tray"] as const)("keeps handoff membership scoped to readable tasks, owner, company, agent and generation in view %s", async (view) => {
+    const f = await seed(), other = await seed();
+    const { task: old } = await f.handoff();
+    const options = { actor: { type: "board" as const, userId: f.userId, source: "session" as const, ignoreInstanceAdmin: true }, userId: f.userId, view };
+    const service = conversationDecisionReceiptsService(db);
+    await db.update(issues).set({ conversationSessionGeneration: 1 }).where(eq(issues.id, f.conversationId));
+    const { task: current } = await f.handoff();
+    const { task: unreadable } = await f.handoff();
+    const { task: wrongAgent } = await f.handoff();
+    await f.direct(); // Not a chat-created task.
+    await db.update(issues).set({ visibility: "private", privacyParentIssueId: null, privacyRootIssueId: unreadable.id,
+      responsibleUserId: "another-person", createdByUserId: "another-person" }).where(eq(issues.id, unreadable.id));
+    const [agent] = await db.insert(agents).values({ companyId: f.companyId, name: "Other", adapterType: "process" }).returning();
+    await db.update(chatTaskHandoffs).set({ agentId: agent.id }).where(eq(chatTaskHandoffs.taskId, wrongAgent.id));
+    const page = await service.listCreatedTasks(f.companyId, f.conversationId, options);
+    expect(page.items.map(item => item.issueId)).toEqual([current.id]);
+    expect(page.items.map(item => item.issueId)).not.toContain(old.id);
+    await expect(service.listCreatedTasks(f.companyId, f.conversationId, { ...options,
+      actor: { type: "board", userId: "another-person", source: "local_implicit" }, userId: "another-person",
+    })).rejects.toMatchObject({ status: 404, message: "Conversation not found" });
+    await expect(service.listCreatedTasks(other.companyId, f.conversationId, options))
+      .rejects.toMatchObject({ status: 404, message: "Conversation not found" });
   });
 
   async function attach(f: Awaited<ReturnType<typeof seed>>, taskId: string) {

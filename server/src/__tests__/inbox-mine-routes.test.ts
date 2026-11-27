@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
-import { agents, authUsers, companyMemberships, heartbeatRuns, issueInboxArchives, issues } from "@paperclipai/db";
+import { agents, authUsers, companyMemberships, heartbeatRuns, issueAccessGrants, issueInboxArchives, issueRelations, issues } from "@paperclipai/db";
 import { INBOX_MINE_ISSUE_STATUS_FILTER, type CompactIssue, type InboxMineSnapshot } from "@paperclipai/shared";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -155,6 +155,51 @@ describeEmbeddedPostgres("Mine inbox snapshot routes", () => {
     const legacy = await request(app).get(`/api/companies/${f.companyId}/heartbeat-runs`)
       .query({ summary: true, latestFailuresOnly: true, limit: 200 }).expect(200);
     expect(snapshot.failureRuns).toEqual(legacy.body);
+  });
+
+  async function nestedAttentionFixture() {
+    const f = await seed("Nested inbox attention"), agent = await addAgent(f.companyId);
+    const hiddenId = randomUUID(), owner = `hidden-owner-${randomUUID()}`;
+    const root = await addTask(f.companyId, f.userId, { title: "Readable blocked root", status: "blocked", assigneeAgentId: agent.id });
+    const bridge = await addTask(f.companyId, owner, { title: "Readable bridge", status: "blocked" });
+    const hidden = await addTask(f.companyId, owner, { id: hiddenId, identifier: `HIDDEN-${randomUUID()}`, title: "HIDDEN_NESTED_LEAF", visibility: "private", privacyRootIssueId: hiddenId, responsibleUserId: owner, status: "backlog" });
+    await ctx.db.insert(issueRelations).values([
+      { companyId: f.companyId, issueId: bridge.id, relatedIssueId: root.id, type: "blocks" },
+      { companyId: f.companyId, issueId: hidden.id, relatedIssueId: bridge.id, type: "blocks" },
+    ]);
+    return { ...f, agent, root, hidden };
+  }
+
+  it("redacts hidden nested attention in board Mine failed-run context and retains readable leaves", async () => {
+    const f = await nestedAttentionFixture();
+    await ctx.db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agent.id, issueId: f.root.id, status: "failed", contextSnapshot: { issueId: f.root.id } });
+    for (const readable of [false, true]) {
+      if (readable) await ctx.db.insert(issueAccessGrants).values({ issueId: f.hidden.id, subjectType: "user", subjectId: f.userId, source: "explicit" });
+      const res = await request(appFor(f.userId)).get(`/api/companies/${f.companyId}/inbox/mine`).expect(200);
+      const row = res.body.contextIssues.find((issue: CompactIssue) => issue.id === f.root.id);
+      expect(row.listProjection).toBe("rows");
+      expect(row.blockerAttention.state).toBe("needs_attention");
+      const json = JSON.stringify(res.body);
+      for (const secret of [f.hidden.id, f.hidden.identifier!, f.hidden.title]) {
+        if (readable) expect(json).toContain(secret); else expect(json).not.toContain(secret);
+      }
+    }
+  });
+
+  it("redacts agent Mine attention using the agent, never the selected inbox user's private access", async () => {
+    const f = await nestedAttentionFixture();
+    await ctx.db.insert(issueAccessGrants).values({ issueId: f.hidden.id, subjectType: "user", subjectId: f.userId, source: "explicit" });
+    const actor = { type: "agent" as const, agentId: f.agent.id, companyId: f.companyId, source: "agent_key" as const };
+    for (const readable of [false, true]) {
+      if (readable) await ctx.db.insert(issueAccessGrants).values({ issueId: f.hidden.id, subjectType: "agent", subjectId: f.agent.id, source: "explicit" });
+      const res = await request(appFor(null, {}, actor)).get("/api/agents/me/inbox/mine").query({ userId: f.userId }).expect(200);
+      expect(res.body.map((row: CompactIssue) => row.id)).toContain(f.root.id);
+      expect(res.body[0].blockerAttention.state).toBe("needs_attention");
+      const json = JSON.stringify(res.body);
+      for (const secret of [f.hidden.id, f.hidden.identifier!, f.hidden.title]) {
+        if (readable) expect(json).toContain(secret); else expect(json).not.toContain(secret);
+      }
+    }
   });
 
   it("limits an agent's Mine read to tasks the agent may open", async () => {

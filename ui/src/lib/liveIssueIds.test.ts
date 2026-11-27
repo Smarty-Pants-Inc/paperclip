@@ -6,6 +6,7 @@ function liveRun(overrides: Partial<LiveRunForIssue>): LiveRunForIssue {
   return {
     id: "run",
     status: "running",
+    runModel: null,
     invocationSource: "scheduler",
     triggerDetail: null,
     startedAt: "2026-04-20T10:00:00.000Z",
@@ -24,6 +25,7 @@ describe("collectLiveIssueIds", () => {
     const liveRuns: LiveRunForIssue[] = [
       {
         id: "run-1",
+        runModel: null,
         status: "running",
         invocationSource: "scheduler",
         triggerDetail: null,
@@ -37,6 +39,7 @@ describe("collectLiveIssueIds", () => {
       },
       {
         id: "run-2",
+        runModel: null,
         status: "queued",
         invocationSource: "scheduler",
         triggerDetail: null,
@@ -50,6 +53,7 @@ describe("collectLiveIssueIds", () => {
       },
       {
         id: "run-3",
+        runModel: null,
         status: "running",
         invocationSource: "scheduler",
         triggerDetail: null,
@@ -63,6 +67,7 @@ describe("collectLiveIssueIds", () => {
       },
       {
         id: "run-4",
+        runModel: null,
         status: "running",
         invocationSource: "scheduler",
         triggerDetail: null,
@@ -77,6 +82,7 @@ describe("collectLiveIssueIds", () => {
       {
         id: "run-5",
         status: "succeeded",
+        runModel: null,
         invocationSource: "scheduler",
         triggerDetail: null,
         startedAt: "2026-04-20T10:04:00.000Z",
@@ -96,6 +102,7 @@ describe("collectLiveIssueIds", () => {
     const liveRuns: LiveRunForIssue[] = [
       {
         id: "run-terminal",
+        runModel: null,
         status: "running",
         invocationSource: "scheduler",
         triggerDetail: null,
@@ -109,6 +116,7 @@ describe("collectLiveIssueIds", () => {
       },
       {
         id: "run-live",
+        runModel: null,
         status: "queued",
         invocationSource: "scheduler",
         triggerDetail: null,

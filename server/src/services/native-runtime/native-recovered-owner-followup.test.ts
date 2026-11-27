@@ -5,9 +5,11 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { buildExecutionContinuation } from "../execution-continuation.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
+  agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations,
   nativeRunnerCheckpoints, nativeRunResults,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
@@ -16,12 +18,12 @@ import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-ho
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
-import { createNativeControllerRecovery } from "./native-controller-recovery.js";
+import { createNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import {
-  buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
+  buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeRunHasNoProviderWork, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
@@ -686,18 +688,84 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await next.start()).toBe(ADMITTED);
   }, 60_000);
 
-  it.each(["process identity", "provider event", "controller checkpoint", "provider work receipt", "claimed coordinator",
+  // A failed startup may own a process and controller without having committed
+  // a turn. These are the gate's live-adoption / transport / sync-timeout shapes.
+  it.each([
+    { count: 1, status: "failed" as const, error: "remote_warm_session_not_idle" },
+    { count: 2, status: "failed" as const, error: "remote_warm_session_not_idle" },
+    { count: 1, status: "cancelled" as const, error: "provider transport closed during startup" },
+    { count: 1, status: "failed" as const, error: "environmentSyncIn timed out after 30000ms" },
+  ])("skips $count $status startup(s) with a claimed controller: $error", async ({ count, status, error }) => {
+    const prior = await seedRecoveredPriorRun();
+    for (let index = 0; index < count; index++) {
+      const failed = await failUnstartedFollowUp(prior);
+      await db.update(heartbeatRuns).set({ status, processPid: 7, processGroupId: 7, processStartedAt: new Date(),
+        error, usageJson: { budgetDispatch: { handedOffAt: new Date().toISOString() } } })
+        .where(eq(heartbeatRuns.id, failed));
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", controllerPid: 7,
+        controllerBootId: randomUUID(), controllerGeneration: 1, leaseOwner: "startup-controller" })
+        .where(eq(nativeRunFinalizations.runId, failed));
+      // Source selection alone may disregard startup ownership; Stop must not.
+      expect(await nativeRunHasNoProviderWork(db, { companyId, agentId, issueId: prior.issueId }, failed)).toBe(false);
+    }
+    const retry = await admitFollowUp(prior);
+    expect(retry.selectedRunId).toBe(prior.runId);
+    expect(retry.native.normalizedSessionId).toBe(prior.native.normalizedSessionId);
+    const recovery = await resolveNativeControllerRecovery(db, { companyId, agentId, issueId: prior.issueId,
+      normalizedSessionId: prior.native.normalizedSessionId, currentRunId: retry.runId });
+    expect(recovery.kind).toBe("recoverable");
+    if (recovery.kind === "recoverable") expect(recovery.snapshot.identity?.runId).toBe(prior.runId);
+    expect(await retry.start()).toBe(ADMITTED);
+  }, 60_000);
+
+  it("carries the skipped startup's unanswered wake exactly once without replaying the committed owner's input", async () => {
+    const prior = await seedRecoveredPriorRun();
+    const [oldComment] = await db.insert(issueComments).values({ companyId, issueId: prior.issueId,
+      authorType: "user", authorUserId: "board", body: "ALREADY_COMMITTED_WAKE" }).returning();
+    const delivered = { id: oldComment.id, authorType: "user", authorId: "board", createdByRunId: null,
+      body: oldComment.body, createdAt: oldComment.createdAt.toISOString(), updatedAt: oldComment.updatedAt.toISOString(),
+      deleted: false, sourceTrust: oldComment.sourceTrust };
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: prior.issueId,
+      executionContinuation: { messages: [delivered] } } }).where(eq(heartbeatRuns.id, prior.runId));
+    const failed = await failUnstartedFollowUp(prior);
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId: prior.issueId,
+      authorType: "user", authorUserId: "board", body: "UNANSWERED_STARTUP_WAKE" }).returning();
+    await db.update(heartbeatRuns).set({ processPid: 7, contextSnapshot: { issueId: prior.issueId,
+      wakeReason: "issue_commented", wakeCommentId: comment.id, commentIds: [comment.id] } }).where(eq(heartbeatRuns.id, failed));
+    await db.update(nativeRunFinalizations).set({ controllerPid: 7 }).where(eq(nativeRunFinalizations.runId, failed));
+    const retry = await admitFollowUp(prior);
+    expect(retry.selectedRunId).toBe(prior.runId);
+    const continuation = await buildExecutionContinuation({ db, companyId, issueId: prior.issueId, agentId,
+      context: { retryOfRunId: failed, wakeReason: "retry_failed_run" }, previousContextRunId: retry.selectedRunId,
+      runId: retry.runId, summary: null, exposeLowTrustRaw: true });
+    expect(continuation.originCommentIds).toEqual([comment.id]);
+    expect(continuation.resumeDelta?.messages.map(message => message.id)).toEqual([comment.id]);
+    const prompt = renderPaperclipWakePrompt({ executionContinuation: continuation }, { resumedSession: true });
+    const previousRun = await findNativeSessionResumeRun(db, { companyId, agentId, issueId: prior.issueId,
+      normalizedSessionId: prior.native.normalizedSessionId, currentRunId: retry.runId, beforeCreatedAt: new Date() });
+    const execution = prior.executionFor(retry.runId);
+    const resumed = buildNativeExecutionWithCheckpoint({ previousRun, normalizedSessionId: prior.native.normalizedSessionId,
+      executionTargetKind: "remote", buildExecution: () => ({ ...execution, task: { ...execution.task, prompt } }) });
+    expect(resumed.checkpoint).not.toBeNull();
+    // The renderer also states the objective; delivery identity, not repeated
+    // contextual prose, proves that this is one unanswered input.
+    expect(resumed.execution.task.prompt).toContain(comment.body);
+    expect(resumed.execution.task.prompt).not.toContain(oldComment.body);
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, failed))).toHaveLength(0);
+  }, 60_000);
+
+  it.each(["session.started", "turn.started", "item.started", "item.delta", "item.completed", "turn.completed",
+    "controller checkpoint", "provider work receipt", "provider phase", "result pointer", "active turn", "pending request",
     "run result", "different provider session", "own progress cursor"] as const)(
     "keeps a failed follow-up as the source with %s", async scenario => {
       const prior = await seedRecoveredPriorRun();
       const failed = await failUnstartedFollowUp(prior);
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
       const checkpoint = run.runnerProfileJson!.sessionCheckpoint as Record<string, unknown>;
-      if (scenario === "process identity") {
-        await db.update(heartbeatRuns).set({ processPid: 4_242 }).where(eq(heartbeatRuns.id, failed));
-      }
-      if (scenario === "provider event") {
-        await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed, seq: 100, eventType: "session.started",
+      await db.update(heartbeatRuns).set({ processPid: 7 }).where(eq(heartbeatRuns.id, failed));
+      await db.update(nativeRunFinalizations).set({ controllerPid: 7 }).where(eq(nativeRunFinalizations.runId, failed));
+      if (scenario === "session.started" || scenario.startsWith("turn.") || scenario.startsWith("item.")) {
+        await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed, seq: 100, eventType: scenario,
           stream: "system", payload: {} });
       }
       if (scenario === "controller checkpoint") {
@@ -707,13 +775,22 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         await db.update(heartbeatRuns).set({ resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true } } })
           .where(eq(heartbeatRuns.id, failed));
       }
-      if (scenario === "claimed coordinator") {
-        await db.update(nativeRunFinalizations).set({ controllerPid: 4_242 }).where(eq(nativeRunFinalizations.runId, failed));
+      if (scenario === "provider phase") {
+        await db.update(nativeRunFinalizations).set({ phase: "provider_session_started" }).where(eq(nativeRunFinalizations.runId, failed));
       }
-      if (scenario === "run result") {
-        await db.insert(nativeRunResults).values({ companyId, issueId: prior.issueId, runId: failed,
+      if (["active turn", "pending request"].includes(scenario)) {
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run.runnerProfileJson, sessionCheckpoint: {
+          ...checkpoint,
+          ...(scenario === "active turn" ? { activeTurnId: "started" } : {}),
+          ...(scenario === "pending request" ? { pendingRuntimeRequests: [{ requestId: "pending" }] } : {}),
+        } } }).where(eq(heartbeatRuns.id, failed));
+      }
+      if (scenario === "run result" || scenario === "result pointer") {
+        const [result] = await db.insert(nativeRunResults).values({ companyId, issueId: prior.issueId, runId: failed,
           completionContractId: run.completionContractId!, serverFingerprint: "fixture", schemaStatus: "rejected",
-          resultJson: {}, canonicalSha256: "fixture" });
+          resultJson: {}, canonicalSha256: "fixture" }).returning();
+        if (scenario === "result pointer") await db.update(nativeRunFinalizations).set({ resultId: result.id })
+          .where(eq(nativeRunFinalizations.runId, failed));
       }
       if (scenario === "different provider session" || scenario === "own progress cursor") {
         await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run.runnerProfileJson, sessionCheckpoint: {

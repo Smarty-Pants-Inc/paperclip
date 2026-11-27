@@ -15,13 +15,13 @@ const created = (overrides: Partial<Issue>): Issue => ({
 describe("task created chat card (BUG-07)", () => {
   it("keeps the presentation fields so the chip matches the task pane", () => {
     const [item] = taskCreatedItems([created({
-      status: "blocked",
+      status: "blocked", unblockDescriptor: null,
       blockerAttention: { state: "covered", reason: "active_child", unresolvedBlockerCount: 1, coveredBlockerCount: 1,
         attentionBlockerCount: 0, stalledBlockerCount: 0, sampleBlockerIdentifier: "ONB-3", sampleStalledBlockerIdentifier: null },
     })], "parent", "company", new Set());
     const html = renderToStaticMarkup(<TaskChatTaskCreatedCard item={item!} />);
     expect(html).toContain("var(--status-task-icon-in_queue)");
-    expect(html).toContain("Blocked · waiting on active sub-task ONB-3");
+    expect(html).toContain("Blocked · waiting on sub-task ONB-3");
   });
 
   it("shows a waiting review as Idle, like the task pane", () => {

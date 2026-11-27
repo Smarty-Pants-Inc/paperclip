@@ -23,10 +23,11 @@ describe("StatusIcon", () => {
     expect(html).toContain("var(--status-task-icon-todo)");
   });
 
-  it("maps covered-blocked → In queue (blue in_queue var, no cyan markers)", () => {
+  it("maps known non-person covered-blocked → In queue (blue, no cyan markers)", () => {
     const html = renderToStaticMarkup(
       <StatusIcon
         status="blocked"
+        unblockDescriptor={null}
         blockerAttention={{
           state: "covered",
           reason: "active_child",
@@ -42,14 +43,15 @@ describe("StatusIcon", () => {
     expect(html).toContain("var(--status-task-icon-in_queue)");
     expect(html).not.toContain("bg-cyan");
     expect(html).not.toContain("border-cyan");
-    // Full blocked reason still rides on the accessible label.
-    expect(html).toContain("Blocked · waiting on active sub-task PAP-9");
+    // The known wait still rides on the accessible label.
+    expect(html).toContain("Blocked · waiting on sub-task PAP-9");
   });
 
-  it("surfaces attention-required blocked copy and keeps the blocked glyph", () => {
+  it("does not turn known non-person attention into a red task", () => {
     const html = renderToStaticMarkup(
       <StatusIcon
         status="blocked"
+        unblockDescriptor={null}
         blockerAttention={{
           state: "needs_attention",
           reason: "attention_required",
@@ -62,16 +64,17 @@ describe("StatusIcon", () => {
         }}
       />,
     );
-    expect(html).toContain("Blocked · 3 blockers need attention; 2 covered by active work");
-    // needs_attention is not "covered", so it keeps the blocked glyph (not in_queue).
-    expect(html).toContain("var(--status-task-icon-blocked)");
-    expect(html).not.toContain("var(--status-task-icon-in_queue)");
+    expect(html).toContain("Blocked · waiting on PAP-3541");
+    // needs_attention alone is not proof of a human action.
+    expect(html).not.toContain("var(--status-task-icon-blocked)");
+    expect(html).toContain("var(--status-task-icon-in_queue)");
   });
 
   it("surfaces stalled-review blocked copy on the accessible label", () => {
     const html = renderToStaticMarkup(
       <StatusIcon
         status="blocked"
+        unblockDescriptor={null}
         blockerAttention={{
           state: "stalled",
           reason: "stalled_review",
@@ -84,7 +87,7 @@ describe("StatusIcon", () => {
         }}
       />,
     );
-    expect(html).toContain("Blocked · review stalled on PAP-2279");
+    expect(html).toContain("Blocked · waiting on review");
   });
 
   it("uses an accessible native button for the icon-only picker trigger", () => {

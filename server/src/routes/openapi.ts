@@ -1500,7 +1500,6 @@ const BOARD_ONLY_OPERATIONS = new Set([
   // Cancelling a question is board-only (routes/issues.ts rejects agent actors). Withdraw is not listed here: its
   // route admits the card's creator agent and the task's assignee, so agents withdraw their own pending card there.
   "POST /api/issues/{id}/interactions/{interactionId}/cancel",
-  "POST /api/issues/{id}/retry",
   "GET /api/companies/{companyId}/prompt-injection-prevention",
   "PUT /api/companies/{companyId}/prompt-injection-prevention",
   "GET /api/companies/{companyId}/prompt-injection-prevention/models",
@@ -1593,6 +1592,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{issueId}/file-resources/content",
   "GET /api/issues/{issueId}/file-resources/list",
   "GET /api/issues/{issueId}/file-resources/resolve",
+  "POST /api/issues/{id}/interactions/{interactionId}/resume_review",
   "POST /api/issues/{id}/interactions/{interactionId}/accept",
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
@@ -8760,10 +8760,11 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List tasks created from your conversation",
   description:
-    "Requires a board user who owns the conversation and has current issue read access. Returns a ConversationTaskHandoffPage for the current conversation session, newest first, omitting tasks the user can no longer read. Accepts only cursor and limit; the default page size is 40. This read does not create tasks or wake agents.",
+    "Requires a board user who owns the conversation and has current issue read access. Returns a ConversationTaskHandoffPage (items and nextCursor) for the current conversation session, ordered by handoff createdAt descending then task ID descending, omitting tasks the user can no longer read. Accepts cursor, limit and optional view=tray; the default page size is 40 (maximum 100). The default view retains finished tasks; tray excludes canonical done and cancelled tasks before cursor and limit. Both views include displayStatus (Issue.displayStatus or null), externalConversationState (active, waiting or null), blockerAttention (IssueBlockerAttention or null, with unreadable blocker identifiers redacted), unblockDescriptor (Issue.unblockDescriptor or null), interruption (Issue.interruption or null), blockedInboxAttention (currently null; reserved for the shared blocked-inbox projection), assigneeAgentId and assigneeUserId (string or null), and updatedAt (ISO task last-change time). These fields are optional in the shared type for older-server compatibility; current responses always send the keys, including unblockDescriptor: null when absent. No actionRequired field is added. Unknown view values return 400. This read does not create tasks or wake agents.",
   request: {
     params: z.object({ id: z.string() }),
     query: z.object({
+      view: z.literal("tray").optional().describe("Open tasks only; excludes canonical done and cancelled before cursor and limit. Omit for the full handoff history."),
       cursor: z.string().max(1000).optional(),
       limit: z.coerce.number().int().min(1).max(100).optional(),
     }).strict(),
@@ -8813,6 +8814,17 @@ registry.registerPath({
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
     409: { description: "Stale or conflicting decision" }, 422: { description: "Invalid answer evidence or selection" } },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/resume_review",
+  tags: ["issues"],
+  summary: "Resume a pending native completion review after a person's Stop",
+  description: "Board-only action with the card's existing resolver permissions. Requires a pending native completion review whose latest reviewer run succeeded with personStop and no live or queued reviewer attempt. Reuses the same review interaction and decision through the durable native wake/claim path. Concurrent presses create at most one wake/run for that Stop. The interaction projection exposes canResumeReview for eligible people.",
+  request: { params: z.object({ id: z.string(), interactionId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound,
+    409: { description: "Review is not resumable or an attempt is already queued" } },
 });
 
 registry.registerPath({
@@ -11687,7 +11699,7 @@ registerCurrentRoute({
   tags: ["issues"],
   summary: "Request one durable task retry from current input and preserved results",
   body: taskRetrySchema,
-  responses: { 200: r.ok(), 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+  responses: { 200: r.ok(), 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 429: r.tooManyRequests },
 });
 
 registerCurrentRoute({

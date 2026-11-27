@@ -14,6 +14,8 @@ interface StatusIconProps extends TaskStatusPresentationInput {
   /** Optional layout wrapper around the glyph. Does not change glyph dimensions. */
   glyphContainerClassName?: string;
   showLabel?: boolean;
+  /** Lifecycle options and lanes have no task-specific human-action evidence. */
+  lifecycle?: boolean;
   /** Glyph size (PAP-243a). Default `md` (16px); lists/detail/mentions use `lg` (20px). */
   size?: StatusGlyphSize;
 }
@@ -31,14 +33,13 @@ export function getStatusIconLabel(status: string, externalConversationState?: "
  * sub-task / blocked-by pills, blocked inbox, quicklook, sibling nav, filters,
  * search, columns, dashboard.
  *
- * A "covered" blocked task (waiting on active work) maps to the `in_queue`
- * glyph — the blocked shape recoloured blue — while the full blocked reason
- * still rides on the accessible label.
+ * Only an evidenced human action is red. Other blocked tasks wait in blue,
+ * including sparse ownership reads. Labels and colours are resolved together.
  */
-export function StatusIcon({ status, displayStatus: presentationStatus, externalConversationState, blockerAttention, onChange, className, glyphContainerClassName, showLabel, size = "md" }: StatusIconProps) {
+export function StatusIcon({ onChange, className, glyphContainerClassName, showLabel, lifecycle = false, size = "md", ...presentation }: StatusIconProps) {
   const [open, setOpen] = useState(false);
-  const presentation = { status, displayStatus: presentationStatus, externalConversationState, blockerAttention };
-  const { glyphStatus, label, ariaLabel } = resolveTaskStatusPresentation(presentation);
+  const { status } = presentation;
+  const { glyphStatus, label, ariaLabel } = resolveTaskStatusPresentation(presentation, lifecycle ? "lifecycle" : "task");
 
   const glyphIcon = (
     <StatusGlyph
@@ -100,8 +101,7 @@ export function StatusIcon({ status, displayStatus: presentationStatus, external
               setOpen(false);
             }}
           >
-            {/* The current row is the task's state: draw it exactly like the trigger. */}
-            <StatusIcon {...(s === status ? presentation : { status: s })} size="lg" />
+            <StatusIcon status={s} lifecycle size="lg" />
             {taskStatusLabel(s)}
           </Button>
         ))}

@@ -524,7 +524,10 @@ export function shouldRenderComposerHandoffPreview(
 
 export interface IssueChatComposerHandle {
   focus: () => void;
-  restoreDraft: (submittedBody: string) => void;
+  /** false when the text could not be kept in the draft store (the caller must not delete its source). */
+  restoreDraft: (submittedBody: string) => boolean | void;
+  /** IDs whose own copies were written and read back from durable storage. */
+  restoreStoppedMessages?: (comments: readonly { id: string; body: string }[]) => readonly string[];
 }
 
 interface IssueChatComposerProps {
@@ -691,7 +694,7 @@ interface IssueChatThreadProps {
   onInterruptQueued?: (runId: string | null) => Promise<IssueQueuedCommentQueue | void>;
   onCancelQueued?: (commentId: string) => void;
   /** Authoritative PRP queue. The classic thread intentionally ignores it. */
-  queuedCommentQueue?: IssueQueuedCommentQueue | null;
+  queuedCommentQueue?: import("@/lib/issue-queued-comment-queue").DisplayIssueQueuedCommentQueue | null;
   onEditQueuedComment?: (
     commentId: string,
     body: string,
@@ -5999,6 +6002,7 @@ export function IssueChatThread({
       deduped.set(activeRun.id, {
         id: activeRun.id,
         status: activeRun.status,
+        runModel: activeRun.runModel,
         invocationSource: activeRun.invocationSource,
         triggerDetail: activeRun.triggerDetail,
         contextCommentId: activeRun.contextCommentId,

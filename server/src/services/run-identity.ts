@@ -426,8 +426,11 @@ export async function prepareSteeredIdentity(
     eq(issueThreadInteractions.issueId, input.issueId),
     inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"]),
   )) : [];
-  const responsibleUserId = interaction?.resolvedByUserId ?? comment?.authorUserId;
-  if (!run || !responsibleUserId)
+  // An agent message is input, not a transfer of human authority. Preserve
+  // the receiving execution's identity instead of treating the sender as a user.
+  const agentAuthored = comment?.authorType === "agent" && Boolean(comment.authorAgentId);
+  const responsibleUserId = agentAuthored ? run?.responsibleUserId ?? null : interaction?.resolvedByUserId ?? comment?.authorUserId;
+  if (!run || (!agentAuthored && !responsibleUserId))
     throw forbidden("Steering requires an authenticated message author");
   if (
     run.status !== "running" ||
@@ -438,7 +441,7 @@ export async function prepareSteeredIdentity(
   return append(executor, {
     companyId: input.companyId,
     runId: input.runId,
-    responsibleUserId,
+    responsibleUserId: responsibleUserId ?? null,
     messageId: input.messageId,
     parentContextId: run.activeIdentityContextId,
     cause: "steering",
@@ -762,7 +765,7 @@ export async function storedSteeringAcknowledgement(
 ) {
   if (!context.messageId) return null;
   const [receipt] = await executor
-    .select({ payload: heartbeatRunEvents.payload })
+    .select({ payload: heartbeatRunEvents.payload, seq: heartbeatRunEvents.seq })
     .from(heartbeatRunEvents)
     .where(
       and(
@@ -776,5 +779,5 @@ export async function storedSteeringAcknowledgement(
     )
     .limit(1);
   const event = receipt?.payload?.prpEvent as { turnId?: string } | undefined;
-  return typeof event?.turnId === "string" ? { turnId: event.turnId } : null;
+  return typeof event?.turnId === "string" ? { turnId: event.turnId, afterEventSeq: receipt!.seq } : null;
 }

@@ -1,3 +1,4 @@
+import { nativeQuestionSourceCommentId } from "./native-question-source.js";
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
 import { authorizationDeniedDetails } from "../authorization.js";
 import { budgetServiceInTransaction } from "../budgets.js";
@@ -1096,7 +1097,7 @@ export class PaperclipRunnerToolAuthority {
         return { comments: comments.reverse().map(({ updatedAt: _updatedAt, ...comment }) => {
           const visible = isLowTrustQuarantined(readerSourceTrust) ? comment : sanitizeQuarantinedCommentForHigherTrust(comment);
           return { ...visible, body: fastResponseHistoryBody(visible) };
-        }), ...taskHistoryHandlingGuidance(arrived) };
+        }), ...taskHistoryHandlingGuidance(arrived, context.run) };
       }
       case "search_tasks": {
         const tasks = await issueService(this.db).list(this.binding.companyId, { readCondition: await issueReadSqlCondition(this.db, this.#privacyActor(context.run)) });
@@ -3307,7 +3308,7 @@ export class PaperclipRunnerToolAuthority {
     // Match identity activation and queue mutations before locking the run.
     await tx.select({ id: issues.id }).from(issues).where(and(
       eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId),
-    )).for("update");
+    )).for("no key update");
     // Authorization for writes is intentionally re-read only after the
     // transaction starts. Locking the run and issue in the same statement
     // closes the gap between the discovery-time check and the mutation: a
@@ -3328,7 +3329,7 @@ export class PaperclipRunnerToolAuthority {
         eq(issues.executionRunId, this.binding.runId),
         eq(agents.companyId, this.binding.companyId),
       ))
-      .for("update")
+      .for("no key update")
       .limit(1);
     if (
       !context
@@ -3426,6 +3427,7 @@ export class PaperclipRunnerToolAuthority {
           kind,
           idempotencyKey,
           sourceRunId: this.binding.runId,
+          ...(kind === "ask_user_questions" ? { sourceCommentId: await nativeQuestionSourceCommentId(tx, this.binding) } : {}),
           title: requiredString(input.title),
           summary: prompt,
           ...(input.resolverPolicy === undefined ? {} : { resolverPolicy: input.resolverPolicy }),

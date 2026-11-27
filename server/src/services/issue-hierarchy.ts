@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { issues, type Db } from "@paperclipai/db";
 import { MAX_AGENT_TASK_HIERARCHY_DEPTH, type IssueParentAdjustment } from "@paperclipai/shared";
+import { readLimitFromEnv } from "./env-limits.js";
 
 /**
  * `flatten` (the default) applies the agent hierarchy limit: a new parent edge
@@ -43,7 +44,7 @@ export function placeTaskParent(chain: ParentChainRow[], policy: IssueParentDept
     return { effectiveParentId: requested?.id ?? null, adjustment: null };
   }
   // A parent at depth d (root = 1) gives the new task depth d + 1.
-  const maxParentDepth = MAX_AGENT_TASK_HIERARCHY_DEPTH - 1;
+  const maxParentDepth = readLimitFromEnv("PAPERCLIP_MAX_AGENT_TASK_DEPTH", MAX_AGENT_TASK_HIERARCHY_DEPTH) - 1;
   if (chain.length <= maxParentDepth) return { effectiveParentId: requested.id, adjustment: null };
   const targetIndex = chain.length - maxParentDepth;
   // Low-trust boundaries are subtrees. Never move a task above the root of a

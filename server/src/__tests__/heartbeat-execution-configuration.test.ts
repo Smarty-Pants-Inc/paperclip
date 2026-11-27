@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, companySkills, companySkillTestRuns, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, projects, plugins, environments } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, companySkills, companySkillTestRuns, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issues, projects, plugins, environments } from "@paperclipai/db";
 import { companySkillService } from "../services/company-skills.js";
 import { skillVersionCachePaths, withSkillVersionCacheLock } from "../services/skill-version-cache.js";
 import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
@@ -40,6 +40,18 @@ function deferred<T>() {
 
 const skillFailures = vi.hoisted(() => new Map<string, string>());
 const skillWaits = vi.hoisted(() => new Map<string, () => Promise<void>>());
+const commentFailures = vi.hoisted(() => new Map<string, () => Promise<void>>());
+
+vi.mock("../services/issues.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/issues.js")>();
+  return { ...actual, issueService: (...args: Parameters<typeof actual.issueService>) => {
+    const service = actual.issueService(...args);
+    return { ...service, addComment: async (...input: Parameters<typeof service.addComment>) => {
+      await commentFailures.get(input[0])?.();
+      return service.addComment(...input);
+    } };
+  } };
+});
 
 describe("SSH authentication before account routing", () => {
   it.each([
@@ -161,7 +173,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
   }, 60_000);
-  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); skillFailures.clear(); skillWaits.clear(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); skillFailures.clear(); skillWaits.clear(); commentFailures.clear(); });
   afterAll(async () => {
     await heartbeat?.drainActiveRunExecutions();
     unregisterServerAdapter(adapterType);
@@ -203,6 +215,103 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     return { finished, input: captured.get(run!.id) };
   }
 
+  it.each(["piRpcThinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort"].flatMap(key =>
+    [5, "ultra"].map(level => ({ key, level })),
+  ))("fails a real run with stored invalid Pi thinking $key=$level before provider dispatch", async ({ key, level }) => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model: "example/model", piRpcThinkingLevel: "medium", [key]: level,
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ assigneeAdapterOverrides: null }).where(eq(issues.id, f.issueId));
+    const { finished, input } = await execute(f);
+    expect(finished).toMatchObject({ status: "failed" });
+    expect(finished.error).toContain(`pi_thinking_level_invalid: ${JSON.stringify(level)}`);
+    expect(input).toBeUndefined();
+    expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0].adapterConfig[key]).toBe(level);
+  });
+
+  it.each([
+    { model: undefined, policy: {}, workMode: "standard" },
+    { model: "gpt-6.1-sol", policy: {}, workMode: "standard" },
+  ] as const)("stops invalid Pi selection once, visibly, without poisoning the agent: %j", async ({ model, policy, workMode }) => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model, homeMode: "preconfigured", ...policy,
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "in_progress", workMode, conversationAgentId: f.agentId,
+      conversationUserId: f.userId, conversationState: "active",
+      assigneeAdapterOverrides: { adapterConfig: { model: "gpt-6.2-sol" } },
+    }).where(eq(issues.id, f.issueId));
+    const { finished } = await execute(f);
+    expect(finished).toMatchObject({ status: "failed", errorCode: "pi_model_provider_required",
+      scheduledRetryAt: null, resultJson: { modelSelection: { retryability: "requires_action",
+        model: model?.includes("/") ? "paperclip/gpt-6.2-sol" : "gpt-6.2-sol" } } });
+    expect(finished.error).toContain("pick a provider/model, or clear the chat's model");
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(agent.status).toBe("idle");
+    expect(issue).toMatchObject({ status: "in_review", conversationState: "waiting", executionRunId: null });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.createdByRunId, finished.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ authorType: "system", body: finished.error });
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+    expect(runs).toHaveLength(1);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("in_review");
+  });
+
+  it("fails an old stored ultra override before session setup with the plain Pi error", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model: "paperclip/gpt-6.1-sol", piRpcThinkingLevel: "high",
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ assigneeAdapterOverrides: { adapterConfig: { piRpcThinkingLevel: "ultra" } } })
+      .where(eq(issues.id, f.issueId));
+    const { finished, input } = await execute(f);
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toContain('pi_thinking_level_invalid: "ultra"');
+    expect(input).toBeUndefined();
+    expect(finished.nativeSessionId).toBeNull();
+  });
+
+  // Regression: a notice insert failure after the terminal commit must not strand a plain turn.
+  it("cleans up after a committed Pi failure even when addComment fails, and repairs its notice exactly once", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", model: "bare-model", homeMode: "preconfigured",
+    } }).where(eq(agents.id, f.agentId));
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: f.agentId,
+      conversationUserId: f.userId, conversationState: "active",
+      assigneeAdapterOverrides: { adapterConfig: { model: "gpt-6.2-sol" } },
+    }).where(eq(issues.id, f.issueId));
+    let terminalRunId: string | undefined;
+    commentFailures.set(f.issueId, async () => {
+      const [terminal] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      expect(terminal).toMatchObject({ status: "failed", errorCode: "pi_model_provider_required" });
+      terminalRunId = terminal.id;
+      throw new Error("injected addComment failure after terminal commit");
+    });
+    const { finished } = await execute(f);
+    expect(terminalRunId).toBe(finished.id);
+    expect((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0].status).toBe("idle");
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "in_review", conversationState: "waiting", executionRunId: null, checkoutRunId: null });
+    expect(await db.select().from(issueComments).where(eq(issueComments.createdByRunId, finished.id))).toHaveLength(0);
+    commentFailures.delete(f.issueId);
+    // Both contenders can read the same missing notice; the issue lock fences the insert.
+    await Promise.all([
+      heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId }),
+      heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId }),
+    ]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.createdByRunId, finished.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ authorType: "system", body: finished.error });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0])
+      .toMatchObject({ status: "in_review", conversationState: "waiting", executionRunId: null });
+  });
+
   it.each([
     { saved: "isolated", managed: true, failure: "saved managed login required" },
     { saved: "isolated", managed: false, failure: "saved isolated skills required" },
@@ -232,7 +341,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       policy: { trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} },
         useIsolatedTaskDirectory: false, explicitTaskDirectory: false, requestedExecutionWorkspaceMode: "shared_workspace" },
       environment: { selectedEnvironmentId: localEnvironment.id, selectedEnvironmentForConfig: localEnvironment,
-        resolvedInstanceSettings: await instanceSettingsService(db).get(), persistedNativeExecutionInput: persisted },
+        environmentSelectionSnapshot: null, resolvedInstanceSettings: await instanceSettingsService(db).get(), persistedNativeExecutionInput: persisted },
       services: { secretsSvc: secretService(db), companySkills: companySkillService(db), appendRunEvent: vi.fn(), finalizeAiConnectionBusyDeferral: vi.fn() },
       onFailureSecretsResolved: vi.fn(), onManagedAiRuntimeAcquired: vi.fn(), onIdentityRedactorPrepared: vi.fn(),
     });
@@ -328,7 +437,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       policy: { trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} },
         useIsolatedTaskDirectory: false, explicitTaskDirectory: false, requestedExecutionWorkspaceMode: "shared_workspace" },
       environment: { selectedEnvironmentId: environment.id, selectedEnvironmentForConfig: environment,
-        resolvedInstanceSettings: await instanceSettingsService(db).get(),
+        environmentSelectionSnapshot: null, resolvedInstanceSettings: await instanceSettingsService(db).get(),
         persistedNativeExecutionInput: persisted ? { schema: "paperclip.native-execution-input.v5" } as unknown as HeartbeatExecutionConfigurationInput["environment"]["persistedNativeExecutionInput"] : null },
       services: { secretsSvc: secretService(db), companySkills: companySkillService(db), appendRunEvent: vi.fn(), finalizeAiConnectionBusyDeferral: vi.fn() },
       onFailureSecretsResolved: secretsResolved, onManagedAiRuntimeAcquired: vi.fn(), onIdentityRedactorPrepared: redactorPrepared,
@@ -362,7 +471,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
       config: { sourceWorkspaceConfig: config, aiBinding },
       policy: { trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} }, useIsolatedTaskDirectory: false, explicitTaskDirectory, requestedExecutionWorkspaceMode },
       environment: { selectedEnvironmentId: environment.id, selectedEnvironmentForConfig: environment,
-        resolvedInstanceSettings, persistedNativeExecutionInput: adoptingLiveRunner
+        environmentSelectionSnapshot: null, resolvedInstanceSettings, persistedNativeExecutionInput: adoptingLiveRunner
           // Preparation reads only whether the admitted input carries its runtime context.
           ? { schema: "paperclip.native-execution-input.v7", runtimeContext: {} } as unknown as HeartbeatExecutionConfigurationInput["environment"]["persistedNativeExecutionInput"]
           : null },
@@ -371,9 +480,17 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     }) };
   }
 
+  async function savedSshEnvironment(config: Record<string, unknown>): Promise<Environment> {
+    // Selection now certifies persisted content. A local row relabelled only
+    // in memory is stale by construction, not an SSH configuration fixture.
+    const [environment] = await db.insert(environments).values({ name: `SSH fixture ${randomUUID()}`,
+      driver: "ssh", config }).returning();
+    return environment as Environment;
+  }
+
   it.each([undefined, true, false])("defaults existing SSH environments to remote authentication and honors the saved choice (saved=%s)", async useHostAuth => {
     const f = await seed(true);
-    const environment = { ...await environmentService(db).ensureLocalEnvironment(), driver: "ssh", config: { ...(useHostAuth !== undefined ? { useHostAuth } : {}), host: "fixture.invalid", username: "fixture", remoteWorkspacePath: "/workspace" } } as Environment;
+    const environment = await savedSshEnvironment({ ...(useHostAuth !== undefined ? { useHostAuth } : {}), host: "fixture.invalid", username: "fixture", remoteWorkspacePath: "/workspace" });
     const binding = aiConnectionBindingSchema.parse((await db.select().from(agents).where(eq(agents.id, f.agentId)))[0]!.runtimeConfig!.aiConnection);
     const prepare = vi.spyOn(aiRuntime, "prepareManagedAiRuntime").mockRejectedValue(new Error("fixture managed account reached"));
     const opening = await configuration(f, { provider: "codex" }, {}, "paperclip_runner", false, "shared_workspace", environment, undefined, false, binding);
@@ -395,9 +512,9 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     { provider: "acpx", acpxAgent: "claude", model: "claude-sonnet-4-6", acpxPermissionMode: "approve-reads" },
   ])("keeps native SSH provider home support during preparation: $provider $acpxAgent", async config => {
     const f = await seed();
-    const environment = { ...await environmentService(db).ensureLocalEnvironment(), driver: "ssh", config: {
+    const environment = await savedSshEnvironment({
       host: "fixture.invalid", username: "fixture", remoteWorkspacePath: "/workspace",
-    } } as Environment;
+    });
     const opening = await configuration(f, config, {}, "paperclip_runner", false, "shared_workspace", environment);
     const result = await opening.prepare();
     if (!result.prepared) throw new Error("SSH preparation failed");
@@ -406,7 +523,7 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
 
   it("requires an agent AI account for a new SSH environment when remote authentication is off", async () => {
     const f = await seed();
-    const environment = { ...await environmentService(db).ensureLocalEnvironment(), driver: "ssh", config: { useHostAuth: false } } as Environment;
+    const environment = await savedSshEnvironment({ useHostAuth: false });
     const opening = await configuration(f, { provider: "codex" }, {}, "paperclip_runner", false, "shared_workspace", environment);
     await expect(opening.prepare()).rejects.toMatchObject({ resultJson: { configurationIncomplete: { reason: "ssh_ai_connection_required" } } });
   });

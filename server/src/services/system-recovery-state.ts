@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { ENVIRONMENT_LEASE_POLICIES, WORKSPACE_SOURCE_VERIFICATION_REASONS,
+import { ENVIRONMENT_LEASE_POLICIES, WORKSPACE_SOURCE_VERIFICATION_REASONS, UNRECOVERED_FILES_NOTICE_PREFIX,
   type WorkspaceSourceVerificationFailure } from "@paperclipai/shared";
 import { REMOTE_WORKSPACE_CAPTURE_POLICY_VERSION } from "./remote-workspace-snapshot-archive.js";
 
@@ -109,7 +109,7 @@ export function reserveSystemRecoveryAttempt(state: SystemRecoveryState, now = D
 /** The caller persists this timestamp. A restart must not recalculate jitter. */
 export function failSystemRecovery(
   state: SystemRecoveryState, failure: SystemRecoveryFailure,
-  options: { now?: number; retryAfterAt?: number; evidenceFingerprint?: string; cause?: RecoveryFailureCause } = {},
+  options: { now?: number; retryAfterAt?: number; immediate?: boolean; evidenceFingerprint?: string; cause?: RecoveryFailureCause } = {},
 ): SystemRecoveryState {
   const now = options.now ?? Date.now();
   const firstFailureAt = state.firstFailureAt ?? now;
@@ -117,7 +117,7 @@ export function failSystemRecovery(
   const retryNumber = state.retriesUsed + 1;
   const entropy = createHash("sha256").update(`${state.generationId}:${retryNumber}`).digest().readUInt32BE(0) / 0xffffffff;
   const delay = infrastructureRetryDelayMs(retryNumber, entropy);
-  const nextAttemptAt = Math.max(now + delay, options.retryAfterAt ?? 0);
+  const nextAttemptAt = options.immediate ? now : Math.max(now + delay, options.retryAfterAt ?? 0);
   const retryable = ["retry_transient", "recheck_evidence"].includes(failure.retryClass);
   const retry = retryable && retryNumber <= SYSTEM_RECOVERY_MAX_RETRIES && nextAttemptAt < deadlineAt;
   const sourceVerification = workspaceSourceVerificationFailureSchema.safeParse(failure.sourceVerification);
@@ -238,11 +238,11 @@ export function savedFilesUnrecoverable(state: SystemRecoveryState | null | unde
 }
 
 function unrecoverableSavedFilesReason(failure: RecoveryFailure) {
-  return recoveryRefusalReasons[failure.code] ?? "a safety check on the saved files did not pass";
+  return recoveryRefusalReasons[failure.code] ?? "your earlier saved files could not be checked safely";
 }
 
 export function unrecoverableSavedFilesNotice(failure: RecoveryFailure) {
-  return `Paperclip could not recover the unsaved files from the previous run: ${unrecoverableSavedFilesReason(failure)}. `
+  return `${UNRECOVERED_FILES_NOTICE_PREFIX} ${unrecoverableSavedFilesReason(failure)}. `
     + "Retry continued this task in a new workspace from its recorded work: comments, documents, attachments and pushed commits. "
     + "Files that run did not save or push are not included. Its completed actions stay recorded and are not repeated.";
 }
@@ -252,10 +252,10 @@ export function isDeterministicRecoveryRefusal(state: Pick<SystemRecoveryState, 
 }
 
 const recoveryRefusalReasons: Partial<Record<RecoveryFailureCode, string>> = {
-  allocation_ownership_ambiguous: "Paperclip cannot prove which runs used the sandbox that holds the saved files",
-  source_binding_invalid: "the recorded source of the saved files does not match the run that saved them",
-  snapshot_verification_failed: "the saved snapshot of the files did not pass verification",
-  archive_unsafe: "the saved file archive contains entries that are not safe to apply",
-  source_unavailable: "the saved files are no longer available where the run recorded them",
-  historical_source_missing: "Paperclip has no record of where the run kept the saved files",
+  allocation_ownership_ambiguous: "your earlier work in this task's sandbox could not be recovered",
+  source_binding_invalid: "the saved files could not be matched safely to your earlier work",
+  snapshot_verification_failed: "the saved copy of your files could not be checked reliably",
+  archive_unsafe: "the saved copy contains files that cannot be opened safely",
+  source_unavailable: "your earlier saved files could not be found in their recorded location",
+  historical_source_missing: "the location of your earlier saved files was not recorded",
 };

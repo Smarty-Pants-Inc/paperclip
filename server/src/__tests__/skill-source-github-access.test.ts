@@ -195,6 +195,23 @@ describe('GitHub source authorization', () => {
     await expect(skillSourceGitHubReader(db, 'other-company', run, 'allowed')('/repos/acme/private')).rejects.toThrow(/authenticated agent run/);
     expect(fetch).toHaveBeenCalledTimes(1);
   });
+  // Never acquire a default identity for an explicit repository request.
+  it.each(['/repos/second-org/other?per_page=100', '/repos/%73econd-org/other', '/repos//second-org///other?per_page=100'])('binds normalized API paths to the requested owner: %s', async apiPath => {
+    mocks.managed.mockImplementation(async (_db, input) => ({ status: 'available', connectionId: 'allowed', env: { GH_TOKEN: `token-${input.repository ?? 'default'}` } }));
+    const fetch = vi.fn().mockResolvedValue(Response.json({ id: 42 })); vi.stubGlobal('fetch', fetch);
+    const run = actor({ type: 'agent', agentId: 'agent', companyId: 'company', runId: 'run' });
+    await skillSourceGitHubReader(db, 'company', run, 'allowed')(apiPath);
+    expect(new Headers(fetch.mock.calls[0][1].headers).get('authorization')).toBe('Bearer token-second-org/other');
+    expect(mocks.managed).toHaveBeenCalledWith(db, expect.objectContaining({ repository: 'second-org/other' }));
+  });
+  it.each(['/repos/second-org', '/repos/%zz/other', '/repos/second-org/..', '/repos/second-org/%2e%2e/other', '/orgs/second-org/repos'])('refuses unresolved API paths before acquisition or fetch: %s', async apiPath => {
+    mocks.managed.mockResolvedValue({ status: 'available', env: { GH_TOKEN: 'default-must-not-export' } });
+    const fetch = vi.fn().mockResolvedValue(Response.json({})); vi.stubGlobal('fetch', fetch);
+    const run = actor({ type: 'agent', agentId: 'agent', companyId: 'company', runId: 'run' });
+    await expect(skillSourceGitHubReader(db, 'company', run, null)(apiPath)).rejects.toThrow('Invalid GitHub repository request');
+    expect(mocks.managed).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
   it('reports retryable failures without returning provider bodies or credentials', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('sensitive provider text', { status: 503 })));
     const read = skillSourceGitHubReader(db, 'company', actor({ type: 'board' }), null);

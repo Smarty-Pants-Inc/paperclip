@@ -19,6 +19,14 @@ const eligible = {
 } as const;
 
 describe("resolveNativeRuntimeMode", () => {
+  it.each(["piRpcThinkingLevel", "modelReasoningEffort", "reasoningEffort", "effort"])("refuses legacy invalid Pi %s before runtime allocation", key => {
+    for (const value of [5, "ultra", false, {}, []]) {
+      expect(() => resolveNativeRuntimeMode({ ...eligible,
+        adapterConfig: { provider: "pi_rpc", model: "example/model", piRpcThinkingLevel: "medium", [key]: value },
+      })).toThrow(expect.objectContaining({ code: "pi_thinking_level_invalid", message: expect.stringContaining(`pi_thinking_level_invalid: ${JSON.stringify(value)}`) }));
+    }
+  });
+
   it("requires experimental opt-in and a local controller for Cursor Cloud while retaining its backend on recovery", () => {
     const adapterConfig = { provider: "cursor_cloud", model: "caller-model", repoUrl: "https://github.com/acme/repo" };
     expect(resolveNativeRuntimeMode({ ...eligible, adapterConfig })).toMatchObject({ kind: "native", profile: { backend: "cursor_cloud_api" } });

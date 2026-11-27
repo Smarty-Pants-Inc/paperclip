@@ -139,7 +139,7 @@ async function runReleaseDrain(
   input: ReleaseIssueExecutionInput,
 ): Promise<ReleaseTransactionResult> {
   const { run } = locked;
-  const issue = locked.primaryIssue;
+  let issue = locked.primaryIssue;
   const postCommitEffects: PostCommitEffect[] = [];
 
   if (locked.recoveryOnly) {
@@ -173,6 +173,56 @@ async function runReleaseDrain(
     if (locked.handoffAssigneeAgentId && candidate.agentId !== locked.handoffAssigneeAgentId) {
       preservedWakeIds.push(candidate.id);
       continue;
+    }
+
+    // Settle only the exact response this successful live run already read.
+    // Completion of the task is independent of delivery of its answer. Keep
+    // unrelated input coalesced into the receipt, and explicit resume intent.
+    // A card read is not delivery proof for its person's source comment.
+    const sourceCommentId = readNonEmptyString(candidate.payload.sourceCommentId);
+    const interactionIds = candidate.payload.interactionIds;
+    if (
+      run.status === "succeeded" &&
+      run.agentId === issue.assigneeAgentId && candidate.agentId === run.agentId &&
+      run.contextSnapshot.issueId === issue.id && !candidate.authorizedFailedChatRetry &&
+      candidate.payload.mutation === "interaction" &&
+      candidate.payload.resumeIntent !== true && candidate.deferredContextSeed.resumeIntent !== true &&
+      (!Array.isArray(interactionIds) || interactionIds.every(id => id === candidate.payload.interactionId)) &&
+      [...candidate.queuedCommentIds, ...candidate.deferredCommentIds].every(id => id === sourceCommentId) &&
+      await ports.transaction.hasConsumedInteractionResponse({ companyId: run.companyId, issueId: issue.id,
+        runId: run.id, agentId: run.agentId, payload: candidate.payload })
+    ) {
+      const commentIds = [...new Set([
+        ...(sourceCommentId ? [sourceCommentId] : []), ...candidate.queuedCommentIds, ...candidate.deferredCommentIds,
+      ])];
+      const sourceDelivery = commentIds.length ? await ports.transaction.getQueuedCommentLiveness({
+        companyId: run.companyId,
+        issueId: issue.id,
+        wakeAgentId: candidate.agentId,
+        finishingRunId: run.id,
+        finishingRunAgentId: run.agentId,
+        queuedCommentIds: commentIds,
+        retainDeliveredCommentBindings: true,
+      }) : null;
+      if (commentIds.every(id => sourceDelivery?.deliveredCommentIds?.includes(id))) {
+        // Consuming the answer replaces its continuation's checkout as well as
+        // its delivery. Otherwise the answered card leaves a false review wait.
+        if (issue.status === "in_review") {
+          let resumed;
+          try {
+            resumed = await ports.transaction.resumeConsumedInteractionIssue({ companyId: run.companyId, issueId: issue.id, agentId: run.agentId });
+          } catch {
+            // A checkout refusal must not wedge release or discard the continuation.
+            preservedWakeIds.push(candidate.id);
+            continue;
+          }
+          if (!resumed) throw new Error("Consumed interaction issue disappeared under its execution lock");
+          issue = resumed;
+        }
+        await ports.transaction.cancelDeferredWake({ companyId: run.companyId, wakeId: candidate.id, agentId: candidate.agentId,
+          reason: "Interaction response consumed by the successful live run", now: input.now });
+        continue;
+      }
     }
 
     // An earlier reply in this conversation already reported this wake's

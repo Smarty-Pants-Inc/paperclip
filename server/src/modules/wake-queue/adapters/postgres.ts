@@ -27,6 +27,7 @@ import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
 import { freshContinuationIsolatesRun } from "../../../services/fresh-continuation-fallback.js";
+import { answeredContinuousHeldRun } from "../../../services/native-runtime/continuous-session-input.js";
 import type { Db } from "@paperclipai/db";
 import { deliveredQueuedCommentIds, EXTERNAL_CHAT_MESSAGE_WAKE_MUTATION, EXTERNAL_CHAT_MESSAGE_WAKE_REASON } from "../../../services/queued-comment-delivery.js";
 import { extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
@@ -43,7 +44,7 @@ import {
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
-import { readQueuedInteractionResponse } from "../../../services/queued-interaction-response.js";
+import { hasConsumedInteractionResponse, readQueuedInteractionResponse } from "../../../services/queued-interaction-response.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../../../services/legacy-execution-recovery.js";
 import {
   authorizeFailedChatRunRetryWake,
@@ -289,6 +290,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              // Pending input does not authorize another automatic attempt.
+              // The bounded retry/user-admitted successor claims it at turn start.
+              sql`coalesce(${agentWakeupRequests.payload}->'preDispatchInputOnly', 'false'::jsonb) <> 'true'::jsonb`,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
@@ -476,6 +480,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       };
     },
 
+    async hasConsumedInteractionResponse(input) {
+      return hasConsumedInteractionResponse(tx, input);
+    },
+
     async owedInteractionAnswer({ companyId, issueId, payload }) {
       const response = await readQueuedInteractionResponse(tx as unknown as Db, companyId, issueId, payload);
       if (!response || response.toolActionOutcome || !response.comment.authorUserId) return null;
@@ -587,6 +595,15 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
 
     async isCompletedOnboardingHandoffWake(input) {
       return isCompletedOnboardingHandoffWake(tx, input);
+    },
+
+    async resumeConsumedInteractionIssue({ companyId, issueId, agentId }) {
+      const [issue] = await tx.select({ id: issues.id }).from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)));
+      if (!issue) return null;
+      // Match answer-continuation admission without reclaiming a terminal run.
+      const updated = await issuesSvc.checkout(issueId, agentId, ["in_review"], null);
+      return toIssueSnapshot(updated as unknown as IssueRow);
     },
 
     async reopenIssue({ companyId, issueId, status = "todo" }) {
@@ -900,6 +917,10 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
     issue.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(issue.status);
   if (!applies || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)) return false;
+  // The caller holds the issue lock. A held Pi conversation that already
+  // answered every input owes no continuation: do not block it or open an
+  // active_run_watchdog incident for the fresh-continuation sweep to restore.
+  if (await answeredContinuousHeldRun(tx, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) return true;
   // A pause's stop is intentional: the task keeps its status and resuming
   // continues it. It is never a reconciliation incident with no control. A
   // termination that replaced the pause shares its stop reason, so the agent
@@ -1056,6 +1077,9 @@ export function createWakeAdmissionReader(rawTx: IssueAdmissionDbTransaction, ad
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            // A passive handback cannot absorb a newly authorized request:
+            // it joins that request's first turn instead of inheriting its start.
+            sql`coalesce(${agentWakeupRequests.payload}->'preDispatchInputOnly', 'false'::jsonb) <> 'true'::jsonb`,
             // A saved card response (interaction receipt) never absorbs user
             // input. Skip it so a later message joins the existing message
             // wake instead of starting another one behind the receipt.

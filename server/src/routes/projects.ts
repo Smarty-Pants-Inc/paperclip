@@ -1,3 +1,5 @@
+import { privateRequestActor } from "./private-request-actor.js";
+import { requestHeldNativeConfigurationEndForTargets } from "../services/native-runtime/held-native-turn.js";
 import { projectEnvironmentOptions } from "../services/project-environments.js";
 import { listProtectedEnvironmentKeyHolders, protectedEnvironmentKeyWarnings } from "../services/protected-environment-keys.js";
 import { projectGitAuthorizationService } from "../services/project-git-authorization.js";
@@ -188,8 +190,7 @@ export function projectRoutes(db: Db) {
 
   async function assertCanManageProjectPrivacy(req: Request, res: Response, project: {
     companyId: string; privacyOwnerUserId?: string | null; personalOwnerUserId?: string | null;
-  }) {
-    const actor = req.actor;
+  }, actor = req.actor) {
     if (actor.type === "board" && actor.userId) {
       if (actor.source === "local_implicit" || actor.isInstanceAdmin) return true;
       if (actor.userId === project.privacyOwnerUserId || actor.userId === project.personalOwnerUserId) return true;
@@ -391,6 +392,9 @@ export function projectRoutes(db: Db) {
   router.post("/companies/:companyId/projects", validate(createProjectSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    // Check before creation, principal grants, or idempotent receipt replay.
+    const privacyActor = req.body.visibility === "private"
+      ? await privateRequestActor(db, req.actor, companyId, "project") : null;
     type CreateProjectPayload = Parameters<typeof svc.create>[1] & {
       workspace?: Parameters<typeof svc.createWorkspace>[1];
       repositoryIds?: string[];
@@ -401,7 +405,7 @@ export function projectRoutes(db: Db) {
     const { workspace, repositoryIds, repositoryUrls, idempotencyKey, environmentId, expectedStorageProviderPluginId, ...projectData } = req.body as CreateProjectPayload & { idempotencyKey?: string; repositoryUrls?: string[] };
     const receiptOnly = req.get("X-Paperclip-Receipt-Only") === "true";
     if (receiptOnly && !idempotencyKey) throw unprocessable("Project receipt recovery requires an idempotency key");
-    projectData.privacyOwnerUserId = req.actor.type === "board" ? req.actor.userId ?? null : req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : null;
+    projectData.privacyOwnerUserId = privacyActor?.userId ?? (req.actor.type === "board" ? req.actor.userId ?? null : req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : null);
     const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
       ? await projectToolContext(db, req.actor, true) : null;
     await assertProjectDecisionOwner(req, companyId, projectData.decisionOwnerUserId);
@@ -525,9 +529,13 @@ export function projectRoutes(db: Db) {
     if (!(await assertProjectReadAllowed(req, res, existing))) return;
     const body = { ...req.body };
     if (body.visibility !== undefined) {
-      if (!(await assertCanManageProjectPrivacy(req, res, existing))) return;
+      // Publishing still requires the existing privacy-owner/admin authority.
+      const privacyActor = body.visibility === "private"
+        ? await privateRequestActor(db, req.actor, existing.companyId, "project") : req.actor;
+      if (!(await assertCanManageProjectPrivacy(req, res, existing, privacyActor))) return;
+      if (body.visibility === "private" && !existing.privacyOwnerUserId) body.privacyOwnerUserId = privacyActor.userId ?? null;
     }
-    if (body.visibility === "private") await addActorAsPrivateProjectPrincipal(req, existing);
+    if (body.visibility === "private") await addActorAsPrivateProjectPrincipal(req, { ...existing, privacyOwnerUserId: body.privacyOwnerUserId ?? existing.privacyOwnerUserId });
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectProjectExecutionWorkspaceCommandPaths(body.executionWorkspacePolicy),
@@ -544,17 +552,21 @@ export function projectRoutes(db: Db) {
     }
     const configurationWarnings = body.env !== undefined
       ? protectedEnvironmentKeyWarnings(await listProtectedEnvironmentKeyHolders(db), body.env, "env") : [];
-    const project = await svc.update(id, body);
+    const project = body.env === undefined ? await svc.update(id, body) : await db.transaction(async tx => {
+      const targetDb = tx as unknown as Db;
+      const updated = await projectService(targetDb).update(id, body);
+      if (!updated) return null;
+      await secretService(targetDb).syncEnvBindingsForTarget(
+        updated.companyId, { targetType: "project", targetId: updated.id }, updated.env,
+      );
+      await requestHeldNativeConfigurationEndForTargets(targetDb, [
+        { companyId: updated.companyId, targetType: "project", targetId: updated.id },
+      ]);
+      return updated;
+    });
     if (!project) {
       res.status(404).json({ error: "Project not found" });
       return;
-    }
-    if (body.env !== undefined) {
-      await secretsSvc.syncEnvBindingsForTarget?.(
-        project.companyId,
-        { targetType: "project", targetId: project.id },
-        project.env,
-      );
     }
 
     const actor = getActorInfo(req);

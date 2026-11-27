@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { nativeInputRevision } from "../native-runtime/native-turn-budget.js";
 import { eq } from "drizzle-orm";
 import { companies } from "@paperclipai/db";
 import type { Db, agents, agentTaskSessions, heartbeatRuns } from "@paperclipai/db";
@@ -32,14 +33,14 @@ type IssueContext = NonNullable<Awaited<ReturnType<RunPreparation["getIssueExecu
 
 export interface HeartbeatTaskContextInput {
   run: Pick<typeof heartbeatRuns.$inferSelect, "id">;
-  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType">;
+  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType"> & Partial<Pick<typeof agents.$inferSelect, "adapterConfig">>;
   task: {
     issueRef: Pick<IssueContext,
       "id" | "identifier" | "title" | "status" | "priority" | "workMode" |
       "conversationAgentId" | "description" | "projectId"> | null;
     issueContext: IssueContext | null;
     context: Record<string, unknown>;
-    taskSession: Pick<typeof agentTaskSessions.$inferSelect, "lastRunId"> | null;
+    taskSession: Pick<typeof agentTaskSessions.$inferSelect, "lastRunId"> & Partial<Pick<typeof agentTaskSessions.$inferSelect, "sessionParamsJson" | "sessionDisplayId">> | null;
   };
   policy: {
     recovering?: boolean;
@@ -59,6 +60,7 @@ function readNonEmptyString(value: unknown): string | null {
 /** Rebuilds task prompt fields on the run's context; acquires no execution resources. */
 export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskContextInput) {
   const { run, agent } = input;
+  const adapterConfig = parseObject(agent.adapterConfig);
   const { issueRef, issueContext, context, taskSession } = input.task;
   const { trustPreset, experimentalInstanceSettings } = input.policy;
   const { issuesSvc, getPinnedSkillTestContext } = input.services;
@@ -139,6 +141,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
   } else {
     delete context.paperclipSkillTest;
   }
+  delete context.nativeContinuationReadState;
   const executionContinuation =
     issueRef && !isConversation(issueContext) && issueContext?.assigneeAgentId === agent.id
       ? await buildExecutionContinuation({
@@ -149,11 +152,18 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
           runId: run.id,
           context,
           previousContextRunId: taskSession?.lastRunId,
+          nativeSessionId: agent.adapterType === "paperclip_runner" ? readNonEmptyString(parseObject(taskSession?.sessionParamsJson).sessionId) : null,
+          nativeProviderSessionId: agent.adapterType === "paperclip_runner" ? taskSession?.sessionDisplayId : null,
           summary: safeContinuationSummary?.body ?? null,
           exposeLowTrustRaw,
+          ...(agent.adapterType === "paperclip_runner" ? { onNativeReadState: state => { context.nativeContinuationReadState = state; } } : {}),
         })
       : null;
   context.executionContinuation = executionContinuation;
+  // Server-owned canonical revisions, before provider/review projections.
+  // Always replace caller context; no message body goes into the fingerprint.
+  context.nativeInputRevision = agent.adapterType === "paperclip_runner" && issueRef && executionContinuation
+    ? nativeInputRevision(issueRef, executionContinuation.messages) : undefined;
   const paperclipWakePayload = await buildPaperclipWakePayload({
     db,
     companyId: agent.companyId,
@@ -161,6 +171,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     runId: run.id,
     contextSnapshot: context,
     wakeCommentRows,
+    retainFullCommentBodies: agent.adapterType === "paperclip_runner" && (adapterConfig.sessionContinuity === "continuous" || (adapterConfig.sessionContinuity !== "paperclip" && adapterConfig.provider === "pi_rpc")),
     continuationSummary,
     issueSummary: issueRef
       ? {

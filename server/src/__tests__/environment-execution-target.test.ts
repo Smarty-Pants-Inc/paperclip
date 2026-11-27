@@ -115,6 +115,23 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect(task).toHaveBeenCalledWith({ companyId: "company", leaseId: "lease", operation: { kind: "stop" }, expectedTaskId: "physical-task" });
   });
 
+  it.each(["restoredFromSnapshotAt", "rebootedAt"] as const)("filters a handled %s even from a stale nested acquisition receipt", async marker => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox",
+      config: { provider: "fake-plugin", reuseLease: true, timeoutMs: 30_000 } });
+    const first = "2026-11-25T12:00:00.000Z";
+    const handledProcessRestartKey = JSON.stringify(marker === "rebootedAt" ? [null, first] : [first, null]);
+    const metadata = { handledProcessRestartKey,
+      sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box", [marker]: first } };
+    const resolve = () => resolveEnvironmentExecutionTarget({ db: {} as never, companyId: "company-1", adapterType: "paperclip_runner",
+      environment: { id: "env-1", driver: "sandbox", config: { provider: "fake-plugin" } },
+      leaseId: "lease-1", leaseMetadata: metadata,
+      lease: { providerLeaseId: "same-box", metadata } as never, environmentRuntime: null });
+    expect(await resolve()).toMatchObject({ sandboxLeaseAcquisition: { outcome: "resumed", handledProcessRestartKey } });
+    expect((await resolve()) as object).not.toHaveProperty(`sandboxLeaseAcquisition.${marker}`);
+    metadata.sandboxLeaseAcquisition[marker] = "2026-11-25T13:00:00.000Z";
+    expect(await resolve()).toMatchObject({ sandboxLeaseAcquisition: { [marker]: "2026-11-25T13:00:00.000Z" } });
+  });
+
   it("uses a bounded default cwd for sandbox targets when lease metadata omits remoteCwd", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",

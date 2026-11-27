@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,7 +6,7 @@ import { RunnerdTraceFrameIndex } from "./runnerd-trace-frame-index.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>();
-  return { ...fs, readSync: vi.fn(fs.readSync) };
+  return { ...fs, readSync: vi.fn(fs.readSync), statSync: vi.fn(fs.statSync) };
 });
 
 type PositionalRead = [fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null];
@@ -25,6 +25,7 @@ describe("runnerd trace frame index", () => {
     path = join(directory, "trace.ndjson");
     index = new RunnerdTraceFrameIndex();
     vi.mocked(readSync).mockClear();
+    vi.mocked(statSync).mockClear();
   });
   afterEach(() => {
     index.clear();
@@ -45,6 +46,36 @@ describe("runnerd trace frame index", () => {
     expect(index.locate(path, "missing")).toEqual({ frameId: null, nativeChannelSettled: true });
     expect(readSync).toHaveBeenCalledTimes(2);
     expect(readPosition(1)).toBe(Buffer.byteLength(first));
+  });
+
+  it("stats an empty native file once per pass, regardless of pending correlation count", () => {
+    writeFileSync(path, "");
+    expect(index.refresh(path)).toBe(true);
+    for (let i = 0; i < 4096; i++) {
+      expect(index.lookup(`pending-${i}`)).toEqual({ frameId: null, nativeChannelSettled: false });
+    }
+    expect(statSync).toHaveBeenCalledTimes(1);
+    expect(index.refresh(path)).toBe(false);
+    expect(statSync).toHaveBeenCalledTimes(2);
+    expect(readSync).not.toHaveBeenCalled();
+    appendFileSync(path, interpretation(7, "pending-1"));
+    expect(index.refresh(path)).toBe(true);
+    expect(index.lookup("pending-1").frameId).toBe(7);
+    expect(statSync).toHaveBeenCalledTimes(3);
+  });
+
+  it("recognizes native capture only from the runner's rust_native channel", () => {
+    writeFileSync(path, JSON.stringify({
+      kind: "interpretation", debugChannel: "typescript_codex_driver",
+      frameId: 1, emittedEventIds: ["driver"],
+    }) + "\n");
+    index.refresh(path);
+    expect(index.nativeChannelCaptured).toBe(false);
+    appendFileSync(path, JSON.stringify({ kind: "frame", debugChannel: "rust_native", frameId: 2 }) + "\n");
+    index.refresh(path);
+    expect(index.nativeChannelCaptured).toBe(true);
+    index.clear();
+    expect(index.nativeChannelCaptured).toBe(false);
   });
 
   it("retains partial lines and split UTF-8 until the append is complete", () => {

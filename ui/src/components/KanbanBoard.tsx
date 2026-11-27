@@ -19,6 +19,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { StatusIcon } from "./StatusIcon";
+import { taskStatusIconProps } from "../lib/task-status-presentation";
 import { PriorityIcon } from "./PriorityIcon";
 import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { Identity } from "./Identity";
@@ -60,9 +61,8 @@ const defaultKanbanColumnTone = {
   card: "",
 };
 
-// Every column carries a status-hued tint (matching the app-wide status
-// vocabulary: gray backlog, amber todo, blue in-progress, violet review,
-// red blocked, green done) so no column reads as accidentally unstyled.
+// Columns describe lifecycle, not urgency. Blocked stays neutral; only a
+// card's resolved task evidence can say that a person must act.
 export const kanbanColumnTones: Partial<Record<IssueDisplayStatus, typeof defaultKanbanColumnTone>> = {
   backlog: {
     rail: "border-border bg-muted/30",
@@ -91,15 +91,7 @@ export const kanbanColumnTones: Partial<Record<IssueDisplayStatus, typeof defaul
     bodyOver: "bg-blue-100/70 ring-1 ring-inset ring-blue-500/25 dark:bg-blue-950/30",
     card: "",
   },
-  blocked: {
-    rail: "border-red-500/25 bg-red-50/60 dark:bg-red-950/20",
-    railOver: "bg-red-100/70 ring-1 ring-red-500/25 dark:bg-red-950/35",
-    header: "text-red-700 dark:text-red-300",
-    count: "text-red-700/65 dark:text-red-300/65",
-    body: "bg-red-50/45 ring-1 ring-inset ring-red-500/15 dark:bg-red-950/15",
-    bodyOver: "bg-red-100/70 ring-1 ring-inset ring-red-500/25 dark:bg-red-950/30",
-    card: "",
-  },
+  blocked: defaultKanbanColumnTone,
   in_review: {
     rail: "border-violet-500/25 bg-violet-50/60 dark:bg-violet-950/20",
     railOver: "bg-violet-100/70 ring-1 ring-violet-500/25 dark:bg-violet-950/35",
@@ -207,7 +199,7 @@ function KanbanColumn({
         )}
         title={`${statusLabel(status)}: ${issues.length}`}
       >
-        <StatusIcon status={status} />
+        <StatusIcon status={status} lifecycle />
         <span className={cn("mt-2 [writing-mode:vertical-rl] rotate-180 text-(length:--text-nano) font-semibold uppercase tracking-wide", tone.header)}>
           {statusLabel(status)}
         </span>
@@ -221,7 +213,7 @@ function KanbanColumn({
   return (
     <div className="flex flex-col shrink-0 min-w-(--sz-260px) w-(--sz-260px)">
       <div className="flex items-center gap-2 px-3 py-2 mb-1">
-        <StatusIcon status={status} />
+        <StatusIcon status={status} lifecycle />
         <span className={cn("text-xs font-semibold uppercase tracking-wide", tone.header)}>
           {statusLabel(status)}
         </span>
@@ -335,6 +327,7 @@ function KanbanCard({
         }}
       >
         <div className={`flex items-start gap-1.5 ${compact ? "mb-1" : "mb-1.5"}`}>
+          <StatusIcon {...taskStatusIconProps(issue)} size="sm" />
           <span className="text-xs text-muted-foreground font-mono shrink-0">
             {issue.identifier ?? issue.id.slice(0, 8)}
           </span>

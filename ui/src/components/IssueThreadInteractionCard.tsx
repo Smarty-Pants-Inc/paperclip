@@ -1,5 +1,6 @@
 import { Children, createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Agent } from "@paperclipai/shared";
+import { ResumeReviewAction } from "./ResumeReviewAction";
 import { AlertTriangle, ArrowUpRight, Bot, Check, CheckCircle2, ChevronDown, ChevronRight, CircleDashed, Clock, ExternalLink, FileText, GitBranch, ImagePlus, KeyRound, Loader2, Lock, MessageSquareQuote, MinusCircle, ShieldAlert, ThumbsUp, TriangleAlert, Wrench, X, XCircle } from "lucide-react";
 import { Link } from "@/lib/router";
 import { appTabHref } from "@/pages/apps/app-tabs";
@@ -3307,6 +3308,9 @@ function RequestConfirmationCard({
       ) : (
         <RequestConfirmationResolution interaction={interaction} />
       )}
+      {/* ConfirmationActionRow can draw its footer twice while revising. This
+          card-owned slot is mounted once and remains reserved when unavailable. */}
+      <ResumeReviewAction interaction={interaction} disabled={working !== null} />
     </div>
   );
 }

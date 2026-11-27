@@ -326,7 +326,7 @@ export function IssueFiltersPopover({
                         checked={state.statuses.includes(status)}
                         onCheckedChange={() => onChange({ statuses: toggleIssueFilterValue(state.statuses, status) })}
                       />
-                      <StatusIcon status={status} />
+                      <StatusIcon status={status} lifecycle />
                       <span className="text-sm">{issueFilterLabel(status)}</span>
                     </label>
                   ))}

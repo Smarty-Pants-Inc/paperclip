@@ -1,5 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { companies, companyMemberships, companySecrets, connectionGrants, connectionGrantMembers, toolApplications, toolConnections, createDb, projects as projectTable, userSecretDefinitions } from "@paperclipai/db";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { projectRoutes } from "../routes/projects.js";
+import { errorHandler } from "../middleware/index.js";
+import { agents, companies, companyMemberships, companySecrets, connectionGrants, connectionGrantMembers, toolApplications, toolConnections, toolConnectionInstalls, createDb, projects as projectTable, userSecretDefinitions } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { toolAccessService } from "../services/tool-access.js";
 import { projectService } from "../services/projects.js";
@@ -147,6 +152,74 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await toolAccessService(db).githubReadConnectionIds(companyId, "alice")).toEqual([]);
     expect((await toolAccessService(db).listProjectRepositories(companyId, "alice")).repositories).toEqual([]);
     expect(request).toHaveBeenCalledTimes(3);
+  });
+
+  it("lists only installed App connections, keeps PAT and OAuth discovery, and attaches an agent-installed private repository", async () => {
+    const [company] = await db.insert(companies).values({ name: "App repositories", issuePrefix: "APPREPO" }).returning();
+    const owner = randomUUID();
+    await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: owner, membershipRole: "admin" });
+    const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const connectionIds = new Map<string, string>();
+    for (const [index, name] of ["example-org", "second-org", "pat", "oauth"].entries()) {
+      const app = index < 2;
+      const [application] = await db.insert(toolApplications).values({ companyId: company.id, name, type: "mcp_http" }).returning();
+      const [definition] = await db.insert(userSecretDefinitions).values({ companyId: company.id, name, key: name }).returning();
+      const [secret] = await db.insert(companySecrets).values({ companyId: company.id, name, key: name, scope: "user", ownerUserId: owner, userSecretDefinitionId: definition.id }).returning();
+      personalTokens.set(definition.id, app ? privateKey : `${name}-token`);
+      const [connection] = await db.insert(toolConnections).values({ companyId: company.id, applicationId: application.id,
+        uid: randomUUID(), name, status: "active", enabled: true, transport: "mcp_remote", authKind: app || name === "oauth" ? "oauth" : "api_key", credentialPolicy: "per_user",
+        config: { sourceTemplateKey: "github", ...(app ? { connectionMethodKey: "app-installation", methodConfig: {
+          appId: "123", installationId: String(index + 1), repositories: `${name}/private`, permissionProfile: "read",
+        } } : {}) } }).returning();
+      await db.insert(connectionGrants).values({ companyId: company.id, connectionId: connection.id, kind: "user", subjectUserId: owner,
+        credentialSecretRefs: [{ secretId: secret.id, configPath: app ? "credentials.privateKey" : name === "oauth" ? "oauth.access_token" : "credentials.authorization", versionSelector: "latest" }] });
+      connectionIds.set(name, connection.id);
+    }
+    await db.insert(toolConnectionInstalls).values({ companyId: company.id, connectionId: connectionIds.get("example-org")!, targetType: "company", targetId: company.id });
+    const calls: Array<{ path: string; token: string }> = [];
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (url, init) => {
+      const parsed = new URL(String(url));
+      const token = new Headers(init?.headers).get("authorization")?.replace("Bearer ", "") ?? "";
+      calls.push({ path: parsed.pathname, token });
+      const installation = parsed.pathname.match(/^\/app\/installations\/([12])(\/access_tokens)?$/);
+      if (installation) return Response.json(installation[2]
+        ? { token: `installation-${installation[1]}`, expires_at: new Date(Date.now() + 3600_000).toISOString() }
+        : { account: { login: installation[1] === "1" ? "example-org" : "second-org" }, repository_selection: "selected", suspended_at: null });
+      if (parsed.pathname === "/user/repos") {
+        if (token.startsWith("installation-")) return Response.json({ message: "Resource not accessible by integration" }, { status: 403 });
+        expect(["pat-token", "oauth-token"]).toContain(token);
+        return Response.json([{ id: token === "pat-token" ? 30 : 40, full_name: `${token === "pat-token" ? "pat" : "oauth"}/repo`, private: false }]);
+      }
+      expect(parsed.pathname).toBe("/installation/repositories");
+      expect(parsed.searchParams.get("per_page")).toBe("100");
+      expect(["installation-1", "installation-2"]).toContain(token);
+      const name = token === "installation-1" ? "example-org" : "second-org";
+      return Response.json({ total_count: 1, repositories: [{ id: token === "installation-1" ? 10 : 20, full_name: `${name}/private`, private: true, owner: { type: "Organization" } }] });
+    }));
+    const beforeAgentInstall = await toolAccessService(db).listProjectRepositories(company.id, owner);
+    expect(beforeAgentInstall.repositories.map(repository => repository.fullName)).toEqual(["example-org/private", "oauth/repo", "pat/repo"]);
+    expect(beforeAgentInstall).toMatchObject({ connectionCount: 3, failedConnectionCount: 0 });
+    expect(beforeAgentInstall.connections.map(connection => connection.name).sort()).toEqual(["example-org", "oauth", "pat"]);
+    expect(calls.some(call => call.path.startsWith("/app/installations/2") || call.token === "installation-2")).toBe(false);
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Repository reader", adapterType: "process" }).returning();
+    await db.insert(toolConnectionInstalls).values({ companyId: company.id, connectionId: connectionIds.get("second-org")!, targetType: "agent", targetId: agent.id });
+    const catalog = await toolAccessService(db).listGitHubRepositories(company.id, owner, false, { requiredRepositoryIds: ["20"] });
+    expect(catalog).toMatchObject({ connectionCount: 4, failedConnectionCount: 0 });
+    expect(catalog.repositories.map(repository => repository.fullName).sort()).toEqual(["example-org/private", "oauth/repo", "pat/repo", "second-org/private"]);
+    expect(catalog.repositories.filter(repository => repository.private)).toHaveLength(2);
+    const project = await projectService(db).create(company.id, { name: "Private attachment" });
+    const api = express();
+    api.use(express.json());
+    api.use((req, _res, next) => { req.actor = { type: "board", userId: owner, companyIds: [company.id], source: "local_implicit", isInstanceAdmin: false }; next(); });
+    api.use("/api", projectRoutes(db));
+    api.use(errorHandler);
+    const attached = await request(api).put(`/api/projects/${project.id}/repositories`).send({ repositoryIds: ["20"] });
+    expect(attached.status, JSON.stringify(attached.body)).toBe(200);
+    expect((await projectService(db).getById(project.id))?.workspaces).toEqual([expect.objectContaining({
+      repoUrl: "https://github.com/second-org/private", metadata: expect.objectContaining({ githubRepositoryId: "20", githubRepositoryPrivate: true }),
+    })]);
+    expect(calls.filter(call => call.token.startsWith("installation-")).every(call => call.path === "/installation/repositories")).toBe(true);
+    for (const token of ["pat-token", "oauth-token"]) expect(calls.filter(call => call.token === token).map(call => call.path)).toEqual(["/user/repos", "/user/repos", "/user/repos"]);
   });
 
   it("rolls back the project if a later repository insert fails", async () => {

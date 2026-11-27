@@ -6,6 +6,7 @@
  * only showing a response after the turn settles.
  */
 import { foldApprovedAutoReviews } from "./fold-auto-reviews";
+import { isUnrecoveredFilesNotice } from "./adjacent-errors";
 import { isFatalProviderError, isStatusNotice, isStatusNoticePayload, statusNoticeCategory } from "./status-notice-presentation";
 import type { TranscriptEntry } from "@/adapters";
 import { formatContextTokens } from "@/lib/context-tokens";
@@ -50,6 +51,59 @@ export function isTerminalRunStatus(
   return status != null && TERMINAL_STATUSES.has(status);
 }
 
+/** ACK identifies an input; only a session read can open its output slot. */
+export function steeringDeliveryPoints(entries: readonly TranscriptEntry[]) {
+  type Point = { atMs: number; afterEventSeq?: number };
+  type Turn = {
+    inputSeen: boolean;
+    acks: string[]; ackHead: number;
+    reads: { point: Point; generation: number }[]; readHead: number;
+  };
+  const byQuestion = new Map<string, Point>();
+  const turns = new Map<string | null, Turn>();
+  const seen = new Set<string>();
+  let generation = 0;
+  let hasInputs = false;
+  let opening: Point | undefined;
+  for (const entry of entries) {
+    const event = entry.steeringEvent;
+    if (!event || event.kind === "end") {
+      // Never hold a suffix waiting for an identity. Once output is drawable,
+      // an unnamed read cannot retroactively claim it. A later ACK consumes
+      // that read's FIFO position but does not move those words. This decision
+      // uses the durable stream prefix, not mount-local memory or a timeout.
+      generation++;
+      continue;
+    }
+    let turn = turns.get(event.turnId);
+    if (!turn) {
+      turn = { inputSeen: false, acks: [], ackHead: 0, reads: [], readHead: 0 };
+      turns.set(event.turnId, turn);
+    }
+    if (event.kind === "ack") {
+      if (!event.commentId || seen.has(event.commentId)) continue;
+      seen.add(event.commentId);
+      const read = turn.reads[turn.readHead];
+      if (read) {
+        turn.readHead++;
+        if (read.generation === generation) byQuestion.set(event.commentId, read.point);
+      } else turn.acks.push(event.commentId);
+      continue;
+    }
+    hasInputs = true;
+    const point = { atMs: Date.parse(entry.ts), afterEventSeq: entry.eventSeq };
+    // The first userMessage is the turn's own starting input, NOT a steer.
+    // Its actual read position also puts the opening work below comments
+    // folded into that input, even if the polled fold receipt arrives later.
+    opening ??= point;
+    if (!turn.inputSeen) { turn.inputSeen = true; continue; }
+    const id = turn.acks[turn.ackHead];
+    if (id) { turn.ackHead++; byQuestion.set(id, point); }
+    else turn.reads.push({ point, generation });
+  }
+  return { byQuestion, hasInputs, opening };
+}
+
 export interface TranscriptTimeSegment {
   startMs: number;
   endMs: number;
@@ -57,41 +111,64 @@ export interface TranscriptTimeSegment {
 }
 
 /**
- * Split one provider run at durable in-turn input timestamps. Each boundary
- * belongs to the segment after it, so a steering acknowledgement can stay in
- * the thread between the work produced before and after the steer. Live and
- * settled renderers share this projector to avoid re-sorting at handoff.
+ * Split at session-read cursors, never ACK time. A final keeps its first
+ * output position; saved attribution cannot move it. Tool updates keep their
+ * call even when the result arrives after a read. Live and reload agree.
  */
 export function splitTranscriptAtAnchors(
   entries: readonly TranscriptEntry[],
   startMs: number,
   rawAnchors: readonly number[],
+  _replySegments?: ReadonlyMap<string, number>,
+  anchorCursors?: readonly (number | undefined)[],
 ): TranscriptTimeSegment[] {
-  const anchors = [...new Set(rawAnchors.filter(Number.isFinite))].sort(
-    (a, b) => a - b,
-  );
+  // Callers supply ordered question slots, not unique clock values. Equal
+  // timestamps still represent distinct inputs; Infinity reserves a reply
+  // slot with no session-read point, without splitting activity speculatively.
+  const anchors = rawAnchors;
   if (anchors.length === 0) {
     return [
       {
         startMs,
         endMs: Number.POSITIVE_INFINITY,
-        entries: [...entries],
+        entries: entries.filter(entry => !entry.steeringEvent),
       },
     ];
   }
-  return [startMs, ...anchors].map((segmentStartMs, index) => {
-    const segmentEndMs = anchors[index] ?? Number.POSITIVE_INFINITY;
-    return {
-      startMs: segmentStartMs,
-      endMs: segmentEndMs,
-      entries: entries.filter((entry) => {
-        const parsed = Date.parse(entry.ts);
-        const entryMs = Number.isFinite(parsed) ? parsed : 0;
-        const afterStart = index === 0 || entryMs >= segmentStartMs;
-        return afterStart && entryMs < segmentEndMs;
-      }),
-    };
-  });
+  const segments: TranscriptTimeSegment[] = [startMs, ...anchors].map((segmentStartMs, index) => ({
+    startMs: segmentStartMs,
+    endMs: anchors[index] ?? Number.POSITIVE_INFINITY,
+    entries: [],
+  }));
+  const toolSegments = new Map<string, number>();
+  const authoredSegments = new Map<string, number>();
+  // Finals have one owner. Reasoning/progress do not inherit that owner:
+  // their deltas on either side of a read are different visible groups.
+  for (const entry of entries) {
+    if (entry.steeringEvent) continue;
+    const parsed = Date.parse(entry.ts);
+    const entryMs = Number.isFinite(parsed) ? parsed : 0;
+    let low = 0, high = anchors.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      const cursor = anchorCursors?.[middle];
+      const before = cursor !== undefined && entry.eventSeq !== undefined
+        ? entry.eventSeq <= cursor : entryMs < anchors[middle]!;
+      if (before) high = middle;
+      else low = middle + 1;
+    }
+    let index = low;
+    if (entry.kind === "assistant" && entry.channel === "final" && entry.itemId) {
+      index = authoredSegments.get(entry.itemId) ?? index;
+      authoredSegments.set(entry.itemId, index);
+    }
+    if ((entry.kind === "tool_call" || entry.kind === "tool_result" || entry.kind === "diff") && entry.toolUseId) {
+      index = toolSegments.get(entry.toolUseId) ?? index;
+      toolSegments.set(entry.toolUseId, index);
+    }
+    segments[index]!.entries.push(entry);
+  }
+  return segments;
 }
 
 /**
@@ -406,9 +483,12 @@ const PROVIDER_DETAIL_KEYS: Record<
   ],
 };
 
-function providerActivityKey(
+export function providerActivityKey(
   entry: Extract<TranscriptEntry, { kind: "provider_activity" }>,
+  occurrence = entry.family === "hook" || entry.eventType === "context.compacted" ||
+    (entry.family === "provider_notice" && entry.payload.category === "provider_retry"),
 ): string {
+  const occurrenceId = occurrence ? `:${entry.providerEventId ?? entry.firstSeenAt ?? entry.ts}` : "";
   const idKeys = [
     "planId",
     "proposalId",
@@ -427,9 +507,9 @@ function providerActivityKey(
   ];
   for (const key of idKeys) {
     const value = stringValue(entry.payload[key]);
-    if (value) return `${entry.family}:${value}`;
+    if (value) return `${entry.family}:${value}${occurrenceId}`;
   }
-  return `${entry.family}:${entry.eventType}:${entry.ts}`;
+  return `${entry.family}:${entry.eventType}:${occurrenceId || entry.ts}`;
 }
 
 function providerActivityItem(
@@ -558,7 +638,7 @@ function providerActivityItem(
         stringValue(entry.payload.summary));
 
   return {
-    id: `${runId}:provider:${providerActivityKey(entry)}:${index}`,
+    id: `${runId}:provider:${providerActivityKey(entry)}${!entry.providerEventId && entry.family === "provider_notice" && entry.payload.category === "provider_retry" ? `:${index}` : ""}`,
     kind: "protocol",
     surface: "provider_activity",
     family: entry.family,
@@ -830,7 +910,9 @@ export function transcriptToTaskChatItems(
           // waiting for one leaves every earlier brain blue and shimmering.
           finishThinking();
           items.push({
-            id: `${runId}:think:${i}`,
+            // One protocol item can resume after a tool or other surface.
+            // Each visible burst needs its own stable key, not the shared ID.
+            id: `${runId}:think:${entry.itemId ?? "anonymous"}:${entry.eventSeq ?? i}`,
             kind: "thinking",
             lines: entry.text ? entry.text.split("\n") : [],
             streaming: running && entry.lifecycle !== "completed",
@@ -873,9 +955,9 @@ export function transcriptToTaskChatItems(
           }
         } else {
           finishThinking();
-          const atMs = Date.parse(entry.ts);
+          const atMs = Date.parse(entry.completedAt ?? entry.ts);
           items.push({
-            id: `${runId}:msg:${i}`,
+            id: `${runId}:msg:${entry.itemId ?? "anonymous"}:${entry.eventSeq ?? i}`,
             kind: "message",
             author: "agent",
             authorName: agentName,
@@ -1047,7 +1129,7 @@ export function transcriptToTaskChatItems(
       case "provider_activity": {
         if (entry.eventType === "context.compacted") {
           // One entry per compaction; producers may reuse a thread-scoped id.
-          items.push(contextCompactedMarker(entry, `${runId}:compaction:${String(entry.payload.compactionId ?? "")}:${i}`));
+          items.push(contextCompactedMarker(entry, `${runId}:compaction:${providerActivityKey(entry)}`));
           resetInline();
           break;
         }
@@ -1060,10 +1142,8 @@ export function transcriptToTaskChatItems(
             .includes(String(entry.payload.category)))) break;
         // Each retry keeps its own position, so work between two retries in
         // one turn cannot make the later retry look recovered.
-        const key = entry.family === "provider_notice" && entry.payload.category === "provider_retry"
-          ? `provider:${providerActivityKey(entry)}:${i}`
-          : `provider:${providerActivityKey(entry)}`;
         const item = providerActivityItem(entry, runId, i);
+        const key = entry.family === "hook" ? `provider:${providerActivityKey(entry, false)}` : item.id;
         const existingIndex = protocolIndexByKey.get(key);
         const previous = existingIndex == null ? undefined : items[existingIndex];
         // A harness can reuse one hook id for two calls (for example two
@@ -1073,7 +1153,8 @@ export function transcriptToTaskChatItems(
         const newHookCall = entry.family === "hook"
           && previous?.kind === "protocol"
           && previous.surface === "provider_activity"
-          && previous.status !== "running";
+          && (previous.status !== "running" || entry.eventType === "hook.started")
+          && previous.id !== item.id;
         if (existingIndex == null || newHookCall) {
           items.push(item);
           protocolIndexByKey.set(key, items.length - 1);
@@ -1341,7 +1422,7 @@ export function settledCompactionMarkers(
   const markers: TaskChatMarkerItem[] = [];
   entries.forEach((entry, index) => {
     if (entry.kind !== "provider_activity" || entry.eventType !== "context.compacted") return;
-    markers.push(contextCompactedMarker(entry, `${runId}:compaction:${String(entry.payload.compactionId ?? "")}:${index}`));
+    markers.push(contextCompactedMarker(entry, `${runId}:compaction:${providerActivityKey(entry)}`));
   });
   return markers;
 }
@@ -1369,6 +1450,17 @@ export function omitProgressRepeatedByResponse(
  * one removal per segment. Preserve all intentional earlier repetitions and
  * remove only the final progress item matching the durable response.
  */
+// The server stores long item text cut at a bound, ending in this marker
+// (heartbeat-run-summary.ts RUN_EVENT_TEXT_BOUND_MARKER). A cut copy whose kept
+// text the response already carries is that response's earlier copy.
+const RUN_EVENT_TEXT_BOUND_MARKER = "…[truncated]";
+function truncatedCopyOf(text: string, normalizedResponse: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.endsWith(RUN_EVENT_TEXT_BOUND_MARKER)) return false;
+  const kept = trimmed.slice(0, -RUN_EVENT_TEXT_BOUND_MARKER.length).trim();
+  return kept.length > 0 && normalizedResponse.includes(kept);
+}
+
 export function omitProgressRepeatedByResponseAcrossSegments(
   segments: readonly (readonly TaskChatItem[])[],
   responseText: string | null | undefined,
@@ -1388,8 +1480,10 @@ export function omitProgressRepeatedByResponseAcrossSegments(
       if (
         item.kind === "message" &&
         item.interstitial &&
-        item.channel === "progress" &&
-        item.text.trim() === normalizedResponse
+        // Unclassified streamed prose (a delta with no start, Pi) is the
+        // response's own stream when its text equals the response.
+        item.channel !== "final" &&
+        (item.text.trim() === normalizedResponse || truncatedCopyOf(item.text, normalizedResponse))
       ) {
         redundantSegmentIndex = segmentIndex;
         redundantIndex = index;
@@ -1426,7 +1520,7 @@ function omitProgressComposingResponse(
     const items = segments[segmentIndex]!;
     for (let index = items.length - 1; index >= 0; index -= 1) {
       const item = items[index]!;
-      const text = item.kind === "message" && item.interstitial && item.channel === "progress" ? item.text.trim() : "";
+      const text = item.kind === "message" && item.interstitial && item.channel !== "final" ? item.text.trim() : "";
       if (!text) continue;
       composed = composed ? `${text}\n\n${composed}` : text;
       if (composed.length > normalizedResponse.length) break walk;
@@ -1561,10 +1655,12 @@ export function paperclipRunnerTimelineItems(
   const activityIds = new Set(
     paperclipRunnerActivityItems(parsed).map((item) => item.id),
   );
+  // Keep textless reasoning at settle, but not empty receipts for prose already present.
   return parsed.filter(
     (item) =>
-      activityIds.has(item.id) ||
-      (item.kind === "thinking" && Boolean(item.streaming)) ||
+      (item.kind === "thinking"
+        ? item.lines.some(line => line.trim()) || !activityIds.has(item.id)
+        : activityIds.has(item.id)) ||
       item.kind === "plan_document" ||
       (item.kind === "protocol" && item.surface === "runtime_request"),
   );
@@ -1631,7 +1727,7 @@ export function paperclipRunnerFinalResponse(
     allowFallback?: boolean;
     /** Run metadata established a yielded wait even if the transcript lacks its result. */
     yielded?: boolean;
-    /** The yielded result's wait summary, when known outside the transcript. */
+    /** Legacy run summary; equality alone does not establish a wait stub. */
     waitSummary?: string | null;
   },
 ): TaskChatMessageItem | undefined {
@@ -1665,10 +1761,10 @@ export function paperclipRunnerFinalResponse(
     // It streamed into view while the turn was live; dropping it on settle
     // makes the conversation flash and lose that reply. Wait stubs are
     // skipped, not terminal: a provider may echo one after its reply.
-    const waitSummaries = [
-      options?.waitSummary,
-      ...yieldedResults.map((result) => result.summary),
-    ];
+    // A yielded summary may copy the reply; only actual request prompts identify card echoes.
+    const waitSummaries = parsed.flatMap((item) =>
+      item.kind === "protocol" && item.surface === "runtime_request" ? [item.prompt] : [],
+    );
     for (let index = parsed.length - 1; index >= 0; index -= 1) {
       const item = parsed[index];
       if (item.kind !== "message" || item.channel !== "final") continue;
@@ -2063,6 +2159,7 @@ function subagentsFromDelegation(
 export function buildTurnTimelineRows(
   parsed: readonly TaskChatItem[],
   running: boolean,
+  hasFinalResponse = true,
 ): TaskChatTurnChildItem[] {
   const rows: TaskChatTurnChildItem[] = [];
   let current: TaskChatActivityPhaseItem | null = null;
@@ -2161,7 +2258,7 @@ export function buildTurnTimelineRows(
       const legacyTrailingReply =
         (item.channel == null || item.channel === "unknown") &&
         item === legacyReplyBoundary;
-      if (!running && (explicitFinal || legacyTrailingReply)) continue;
+      if (!running && (explicitFinal || (legacyTrailingReply && hasFinalResponse))) continue;
       current = {
         id: `${item.id}:phase`,
         kind: "activity_phase",
@@ -2328,7 +2425,7 @@ function transcriptSpanMs(
  */
 export function buildTurnSummary(
   entries: readonly TranscriptEntry[],
-  opts: { durationMs?: number; failed?: boolean } = {},
+  opts: { durationMs?: number; failed?: boolean; personStopped?: boolean } = {},
 ): TaskChatTurnItem["summary"] {
   const toolIds = new Set<string>();
   let added = 0;
@@ -2361,6 +2458,7 @@ export function buildTurnSummary(
     removed,
     tokensLabel: formatTokensLabel(tokens),
     failed: opts.failed || undefined,
+    personStopped: opts.personStopped || undefined,
   };
 }
 
@@ -2369,6 +2467,7 @@ export interface TurnSummaryPart {
   entries: readonly TranscriptEntry[];
   durationMs?: number;
   failed?: boolean;
+  personStopped?: boolean;
 }
 
 /**
@@ -2392,7 +2491,7 @@ export function buildMergedTurnSummary(
   }
   // durationMs: 0 suppresses the concatenated-span fallback (which would count
   // the gap between runs); the summed label is applied over it below.
-  const counts = buildTurnSummary(all, { durationMs: 0, failed });
+  const counts = buildTurnSummary(all, { durationMs: 0, failed, personStopped: parts.some(part => part.personStopped) });
   return {
     ...counts,
     durationLabel:
@@ -2424,16 +2523,33 @@ export function assembleThreadItems(
   unanchored: readonly { turn: TaskChatTurnItem; startMs: number }[],
 ): TaskChatItem[] {
   const out: TaskChatItem[] = [];
+  // A turn is normally placed at its opening, but its answer can be much later.
+  // A files-lost receipt posted in between must be read BEFORE that answer,
+  // including when the turn would otherwise attach directly to its request.
+  const notices = entries.filter(entry => entry.item.kind === "message" && isUnrecoveredFilesNotice(entry.item));
+  const placement = (turn: TaskChatTurnItem, startMs: number) => {
+    const response = turn.finalResponse;
+    const answerMs = response?.createdAtIso ? new Date(response.createdAtIso).getTime() : response?.atMs;
+    return notices.reduce((at, notice) => answerMs != null && notice.ms >= at && notice.ms <= answerMs ? notice.ms : at, startMs);
+  };
+  const pending = unanchored.map(({ turn, startMs }) => ({ turn, startMs: placement(turn, startMs) }));
+  const anchored = new Map<string, TaskChatTurnItem[]>();
+  for (const entry of entries) for (const turn of turnsByAnchor.get(entry.id) ?? []) {
+    const startMs = placement(turn, entry.ms);
+    if (startMs > entry.ms) pending.push({ turn, startMs });
+    else anchored.set(entry.id, [...(anchored.get(entry.id) ?? []), turn]);
+  }
+  pending.sort((a, b) => a.startMs - b.startMs);
   let next = 0;
   for (const entry of entries) {
-    while (next < unanchored.length && unanchored[next].startMs < entry.ms) {
-      out.push(unanchored[next++].turn);
+    while (next < pending.length && pending[next].startMs < entry.ms) {
+      out.push(pending[next++].turn);
     }
     out.push(entry.item);
-    const following = turnsByAnchor.get(entry.id);
+    const following = anchored.get(entry.id);
     if (following) out.push(...following);
   }
-  while (next < unanchored.length) out.push(unanchored[next++].turn);
+  while (next < pending.length) out.push(pending[next++].turn);
   return out;
 }
 
@@ -2457,6 +2573,9 @@ export function prependIssueBrief(
 
 /** Per-turn identity + raw summary inputs for coalescing (keyed by turn item id). */
 export interface SettledTurnMergeMeta {
+  /** Explicit request lineage; independent of agent identity and adjacency. */
+  chainId?: string;
+  chainOrder?: number;
   /** Stable agent identity (agentId); empty/unknown turns never merge. */
   agentKey: string;
   /** Display name, used to keep another agent's bubble from bridging a merge. */
@@ -2495,34 +2614,47 @@ export function coalesceSettledTurns(
   const mergedMeta = new Map<string, SettledTurnMergeMeta>();
   const metaFor = (id: string) => mergedMeta.get(id) ?? metaById.get(id);
   let heldIdx = -1; // index in `out` of the last mergeable settled turn
+  const chainSlots = new Map<string, number>();
   for (const item of items) {
     if (item.kind === "turn" && item.settled) {
       const meta = metaFor(item.id);
+      if (meta?.chainId) heldIdx = chainSlots.get(meta.chainId) ?? -1;
       const held = heldIdx >= 0 ? (out[heldIdx] as TaskChatTurnItem) : null;
       const heldMeta = held ? metaFor(held.id) : undefined;
       if (
         held &&
         meta &&
         heldMeta &&
-        Boolean(item.historical) === Boolean(held.historical) &&
-        meta.agentKey &&
-        meta.agentKey === heldMeta.agentKey
+        (meta.chainId ? meta.chainId === heldMeta.chainId :
+          !heldMeta.chainId && Boolean(item.historical) === Boolean(held.historical) &&
+          meta.agentKey && meta.agentKey === heldMeta.agentKey)
       ) {
-        out.splice(heldIdx, 1);
+        if (!meta.chainId) out.splice(heldIdx, 1);
         const parts = [...heldMeta.parts, ...meta.parts];
+        const latest = (meta.chainOrder ?? 0) >= (heldMeta.chainOrder ?? 0) ? item : held;
         const mcpStartupFailures = mergeMcpStartupFailures(held.mcpStartupFailures, item.mcpStartupFailures);
-        out.push({
+        const merged: TaskChatTurnItem = {
           ...held,
-          items: [...held.items, ...item.items],
+          historical: latest.historical,
+          continuedAfterSteering: held.continuedAfterSteering || item.continuedAfterSteering,
+          items: [...held.items, ...(meta.chainId && held.finalResponse ? [held.finalResponse] : []), ...item.items],
           ...(mcpStartupFailures ? { mcpStartupFailures } : {}),
-          finalResponse: item.finalResponse ?? held.finalResponse,
+          finalResponse: meta.chainId ? item.finalResponse : item.finalResponse ?? held.finalResponse,
           animateFold: held.animateFold || item.animateFold || undefined,
-          summary: buildMergedTurnSummary(parts),
-        });
-        mergedMeta.set(held.id, { ...heldMeta, parts });
+          summary: meta.chainId ? {
+            ...buildMergedTurnSummary(parts),
+            failed: latest.summary.failed,
+            personStopped: latest.summary.personStopped,
+            durationLabel: latest.summary.durationLabel,
+          } : buildMergedTurnSummary(parts),
+        };
+        if (meta.chainId) out[heldIdx] = merged;
+        else out.push(merged);
+        mergedMeta.set(held.id, { ...(latest === item ? meta : heldMeta), parts });
       } else {
         out.push(item);
       }
+      if (meta?.chainId && !chainSlots.has(meta.chainId)) chainSlots.set(meta.chainId, out.length - 1);
       heldIdx = meta?.agentKey ? out.length - 1 : -1;
       continue;
     }
@@ -2567,6 +2699,7 @@ export function attachSettledTurns(
     if (
       item.kind === "turn" &&
       item.settled &&
+      !metaById.get(item.id)?.chainId &&
       prev?.kind === "message" &&
       prev.author === "agent" &&
       prev.origin !== "fast_response" &&

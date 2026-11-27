@@ -179,6 +179,12 @@ export interface SandboxLeaseAcquisition {
   outcome: "created" | "resumed" | "replacement";
   providerLeaseId: string;
   previousProviderLeaseId?: string;
+  /** This allocation was restored from older disk state: cold-resume, never adopt its old Runner. */
+  restoredFromSnapshotAt?: string;
+  /** The provider rebooted the same allocation after its bound run ended. */
+  rebootedAt?: string;
+  /** This process-loss generation already has a successfully started successor Runner. */
+  handledProcessRestartKey?: string;
   reason?: "not_found" | "expired" | "identity_mismatch" | "resume_failed";
 }
 
@@ -5011,9 +5017,17 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     // the run parent context (see `runWithRuntimeParent` inside that function).
     // So the startup `mkdir` execs stay parented to the step, and every later
     // request `sandbox.exec` span parents to the live run span.
+    const configuredPollIntervalMs = Number(process.env.PAPERCLIP_SANDBOX_BRIDGE_POLL_INTERVAL_MS?.trim() || Number.NaN);
+    const configuredIdleMaxMs = Number(process.env.PAPERCLIP_SANDBOX_BRIDGE_IDLE_MAX_MS?.trim() || Number.NaN);
     worker = await startSandboxCallbackBridgeWorker({
       client,
       queueDir,
+      pollIntervalMs: Number.isInteger(configuredPollIntervalMs)
+        ? Math.min(5000, Math.max(25, configuredPollIntervalMs))
+        : undefined,
+      idleMaxMs: Number.isInteger(configuredIdleMaxMs)
+        ? Math.min(5000, Math.max(25, configuredIdleMaxMs))
+        : undefined,
       maxBodyBytes,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,

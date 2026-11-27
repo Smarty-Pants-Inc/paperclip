@@ -1,3 +1,4 @@
+import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
@@ -72,6 +73,7 @@ import {
 import { readRemoteCodexModelCliVersion } from "../native-runtime/codex-model-fallback.js";
 import {
   describeRunnerdNativeSessionBackend,
+  NativeProviderStateIncompatibleError,
   parseNativeExecutionInput,
   type NativeExecutionInput,
 } from "../../vendor/paperclip-runner/index.js";
@@ -90,6 +92,7 @@ import { normalizePaperclipWakePayload, selectPaperclipTaskMarkdown } from "@pap
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
 import { stageNativeRuntimeSkillAssets, bindStagedNativeRuntimeSkillAssets } from "../native-runtime/runtime-skill-preservation.js";
 import { configuredSecretGuidance } from "../native-runtime/configured-secret-guidance.js";
+import { nativeContinuationProviderSessionId, nativeContinuationReadState, type NativeInputRevision } from "../native-runtime/native-turn-budget.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -121,6 +124,8 @@ export interface HeartbeatRuntimeSelectionInput {
     persistedNativeExecutionInput: NativeExecutionInput | null;
     persistedRunnerProfile: Record<string, unknown>;
     taskResumeSessionId: string | null;
+    /** An automatic fresh attempt already spent this incident's one replacement. */
+    warmRecoveryRetainSessionId?: string | null;
     isFailedChatRunRetry: boolean;
     getFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   };
@@ -167,6 +172,7 @@ export type HeartbeatRuntimeSelectionResult = { selected: false } | {
   nativeExecution: NativeExecutionInput | null;
   nativeRunnerInstanceId: string | null;
   pluginTaskDescription?: PluginTaskDescription;
+  workspaceContinuationSource?: NativeExecutionInput;
   toolRefreshOnResume?: boolean;
   getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   nativeWorkspaceSync: Awaited<ReturnType<typeof prepareNativeWorkspaceSync>>;
@@ -338,6 +344,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     authorityCwd: sshAuthority?.location?.remoteCwd ?? null,
   });
   let nativeExecution: NativeExecutionInput | null = null;
+  let workspaceContinuationSource: NativeExecutionInput | undefined;
   let toolRefreshOnResume: boolean | undefined;
   let getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   let nativeRunnerInstanceId: string | null = null;
@@ -568,6 +575,21 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             beforeCreatedAt: run.createdAt,
           }))
         : null;
+    // The previous provider must be witnessed by the reading run itself, not
+    // context.nativeContinuationReadState (rebuilt for the selected provider).
+    const [previousNativeGeneration] = previousNativeRun ? await db.select({ providerSessionId: sql<string | null>`coalesce(
+      (select generation_event.payload->'prpEvent'->'payload'->>'providerSessionId'
+        from ${heartbeatRunEvents} generation_event
+        -- Drizzle renders single-table columns unqualified; inside this subquery an
+        -- unqualified id / company_id would bind to heartbeat_run_events' own columns.
+        where generation_event.company_id = "heartbeat_runs"."company_id" and generation_event.run_id = "heartbeat_runs"."id"
+          and generation_event.event_type in ('session.started', 'session.resumed', 'session.reconciled')
+        order by generation_event.seq desc limit 1),
+      ${heartbeatRuns.contextSnapshot}->'nativeContinuationReadState'->>'providerSessionId',
+      ${heartbeatRuns.contextSnapshot}->'executionContinuation'->'coverage'->>'providerSessionId')` })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, agent.companyId),
+        eq(heartbeatRuns.agentId, agent.id), eq(heartbeatRuns.id, previousNativeRun.id))).limit(1) : [];
+    const previousProviderSessionId = readNonEmptyString(previousNativeGeneration?.providerSessionId);
     nativeRunnerInstanceId =
       previousNativeRun?.runnerInstanceId &&
       previousNativeRun.nativeSessionId ===
@@ -636,6 +658,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         nativeResumeCheckpoint = rebindNativeSessionCheckpoint({
           previousRun: previousNativeRun,
           currentExecution: nativeExecution,
+          sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
           executionTargetKind: executionTarget?.kind ?? "local",
         });
       }
@@ -787,6 +810,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         || nativeRuntimeResolution.profile.backend === "codex_app_server"
         || (nativeRuntimeResolution.profile.backend === "acpx_runtime" && ["claude_local", "grok_local"].includes(agentHarnessType(agent.adapterType, parseObject(agent.adapterConfig))))
         || nativeRuntimeResolution.profile.backend === "opencode_server"
+        || nativeRuntimeResolution.profile.backend === "pi_rpc"
         || (nativeRuntimeResolution.profile.backend === "acpx_runtime"
           && parseObject(agent.adapterConfig).acpxAgent === "copilot")
         ? projectPaperclipRunnerTaskConfig(
@@ -834,7 +858,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               agentKeyId: agentIdentity?.keyId,
               companyId: agent.companyId,
               runId: run.id,
-              issue: nativeReviewRequest ? { ...issueRef, title: `Review: ${issueRef.title}`, description: nativeReviewRequest } : issueRef,
+              issue: { ...(nativeReviewRequest ? { ...issueRef, title: `Review: ${issueRef.title}`, description: nativeReviewRequest } : issueRef), conversationAgentId: issueContext?.conversationAgentId },
               taskPrompt: [
                 nativeReviewRequest ?? readNonEmptyString(
                   selectPaperclipTaskMarkdown(context, {
@@ -850,6 +874,17 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               ].filter(Boolean).join("\n\n"),
               initialCommunicationGuidance: nativeReviewRequest ? null : readNonEmptyString(context.paperclipTaskCommunicationGuidance),
               wakePayload: context.paperclipWake,
+              boundCommandBytes: agent.adapterType === "paperclip_runner",
+              inputRevision: context.nativeInputRevision as NativeInputRevision | undefined,
+              continuationReadState: nativeContinuationReadState(context.nativeContinuationReadState),
+              continuationProviderSessionId: nativeContinuationProviderSessionId(previousNativeRun, normalizedSessionId, previousProviderSessionId),
+              onContinuationBudgeted: bounded => {
+                // Called only for a full-render cut. Delta turns retain the
+                // unbounded snapshot so later deltas never resurrect old IDs.
+                // The lazy handoff loader retains this object; update in place.
+                Object.assign(parseObject(context.executionContinuation), bounded);
+                parseObject(context.paperclipWake).executionContinuation = bounded;
+              },
               caseContext: nativeReviewRequest ? null : context.paperclipCase as CaseExecutionContext | undefined,
               turnContext: context.paperclipTurnContext,
               githubInstructionSkillKeys: runScopedMentionedSkillKeys,
@@ -913,6 +948,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                   : null,
               ...nativeProvider,
               lifecyclePolicy: effectiveLifecyclePolicy,
+              sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
               interactionResponses,
               completionContract: {
                 id: completionContract.row.id,
@@ -930,6 +966,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       const nativeExecutionWithCheckpoint = buildNativeExecutionWithCheckpoint({
         previousRun: previousNativeRun,
         normalizedSessionId: nativeSessionId,
+        sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
         executionTargetKind: executionTarget?.kind ?? "local",
         toolRefreshOnResume,
         refreshTools: context.refreshTools === true,
@@ -944,6 +981,22 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         nativeRunnerInstanceId = randomUUID();
       }
       nativeSessionId = nativeExecutionWithCheckpoint.normalizedSessionId;
+    }
+    // Missing/incompatible checkpoints normally rotate here. An automatic
+    // recovery that already tried fresh must not silently spend another session
+    // (and another whole hand-over) through that stock fallback. Keep saved state
+    // and let the existing bounded recovery policy handle this named refusal.
+    if (input.session.warmRecoveryRetainSessionId && nativeSessionId !== input.session.warmRecoveryRetainSessionId) {
+      throw new NativeProviderStateIncompatibleError("warm_recovery_fresh_session_already_attempted");
+    }
+    if (nativeResumeCheckpoint && previousNativeRun && nativeExecution.provider.kind === "pi_rpc" &&
+      resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous" &&
+      (executionTarget?.kind ?? "local") === "local") {
+      const previous = parseNativeExecutionInput(parseObject(previousNativeRun.runnerProfileJson).nativeExecutionInput);
+      if (JSON.stringify(previous.workspace) !== JSON.stringify(nativeExecution.workspace) ||
+        (previous.binding.executionWorkspaceId !== nativeExecution.binding.executionWorkspaceId &&
+          (previous.binding.executionWorkspaceId !== previous.binding.runId || nativeExecution.binding.executionWorkspaceId !== nativeExecution.binding.runId)))
+        workspaceContinuationSource = previous;
     }
     if (nativeResumeCheckpoint && nativeExecution.provider.kind === "acpx"
       && nativeExecution.provider.agent === "antigravity") {
@@ -1035,6 +1088,9 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         .update(heartbeatRuns)
         .set({
           runtimeMode: "native",
+          // Full renders save their bounded projection; delta renders keep
+          // the full baseline of messages already held by the same session.
+          ...(!lockedProfile.nativeExecutionInput ? { contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ executionContinuation: context.executionContinuation })}::jsonb` } : {}),
           legacyProcessSettlement: null,
           controllerBootId: null,
           controllerLeaseExpiresAt: null,
@@ -1203,5 +1259,5 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       })
       .where(eq(heartbeatRuns.id, run.id)));
   }
-  return { selected: true, nativeExecution, nativeRunnerInstanceId, pluginTaskDescription, toolRefreshOnResume, getNativeFreshSessionHandoff, nativeWorkspaceSync };
+  return { selected: true, nativeExecution, nativeRunnerInstanceId, pluginTaskDescription, workspaceContinuationSource, toolRefreshOnResume, getNativeFreshSessionHandoff, nativeWorkspaceSync };
 }

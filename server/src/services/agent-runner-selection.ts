@@ -19,12 +19,14 @@ import { usesManagedCloudSandboxImage } from "./sandbox-snapshot-qualification.j
 import { environmentCustomImageTemplateMatchesBaseConfig } from "./environment-custom-image-runtime.js";
 import type { ExecutionPolicy } from "./execution-allowlist.js";
 import { pluginEnvironmentRunnerTaskDriver } from "./plugin-runner-ai-connection.js";
+import { isBuiltinSandboxProvider } from "./sandbox-provider-runtime.js";
 
 export type RunnerTarget = {
   driver: string; platform?: string; architecture?: string; libc?: "glibc" | "musl" | "unknown"; glibcVersion?: string;
   /** A plugin environment whose driver declares Runner task execution. It runs agents only through Paperclip Runner. */
   runnerTasks?: boolean;
   managedCloudImage?: boolean;
+  pluginSandbox?: boolean;
   warmTaskVersion?: 1;
   executionMode?: ExecutionPolicy["executionMode"];
 };
@@ -121,6 +123,39 @@ function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, 
     acpxPermissionMode: config.acpxPermissionMode ?? "approve-all",
     lifecycleMode: config.lifecycleMode ?? "per_turn",
   };
+}
+
+function resolveNativePiRunnerConfig(config: Record<string, unknown>, setupOnly?: boolean): Record<string, unknown> {
+  const unsupported = ["extraArgs", "args"]
+    .filter(key => config[key] !== undefined && config[key] !== "" && !(Array.isArray(config[key]) && config[key].length === 0));
+  if (config.command && config.command !== "pi") unsupported.push("command");
+  if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
+  if (config.stdoutLogMode !== undefined && config.stdoutLogMode !== "compact") unsupported.push("stdoutLogMode");
+  // Normalize the card and persisted native aliases before any ACPX defaults.
+  // An explicit, conflicting choice is an error, never a silent downgrade.
+  const levels = ["piThinkingLevel", "piRpcThinkingLevel", "thinking"].flatMap(key => {
+    const value = config[key];
+    if (value == null || (typeof value === "string" && !value.trim())) return [];
+    if (typeof value !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.trim())) unsupported.push(key);
+    return [{ key, value: typeof value === "string" ? value.trim() : value }];
+  });
+  if (new Set(levels.map(level => level.value)).size > 1) unsupported.push(...levels.map(level => level.key));
+  if (unsupported.length) incompatible(unsupported);
+  const translated = { ...config };
+  for (const key of ["command", "extraArgs", "args", "stdoutLogMode", "thinking", "piThinkingLevel", "acpxAgent", "acpxPermissionMode", "acpxSessionMode", "codexPermissionMode"]) delete translated[key];
+  const model = typeof config.model === "string" ? config.model.trim() : "";
+  if (!(setupOnly && !model) && !/^[^/\s]+\/\S+$/.test(model)) throw unprocessable(
+    "Pi requires an explicit provider/model. Select a model before testing or hiring.",
+    { code: "agent_runner_config_incompatible", fields: ["model"] },
+  );
+  const nativeConfig = { ...translated, ...paperclipRunnerProfileForHarness("pi_rpc"), model,
+    piRpcThinkingLevel: levels[0]?.value ?? "medium", lifecycleMode: config.lifecycleMode ?? "per_turn" };
+  try { resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: nativeConfig }); }
+  catch (error) {
+    if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message, { code: error.code });
+    throw error;
+  }
+  return nativeConfig;
 }
 
 function resolveOpenCodeRunnerConfig(config: Record<string, unknown>): Record<string, unknown> {
@@ -324,6 +359,10 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
     }
     return { adapterType: "paperclip_runner", adapterConfig: config };
   }
+  return { adapterType: "paperclip_runner", adapterConfig: resolveCodexRunnerConfig(config) };
+}
+
+function resolveCodexRunnerConfig(config: Record<string, unknown>): Record<string, unknown> {
   const aliasSources = new Map<string, string>();
   for (const [canonical, alias] of [
     ["agentCommand", "acpAgentCommand"], ["stateDir", "acpStateDir"],
@@ -375,12 +414,36 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
     if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message, { code: error.code });
     throw error;
   }
-  return { adapterType: "paperclip_runner", adapterConfig: config };
+  return config;
 }
 
 export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string, input: AgentRunnerSelection & { defaultEnvironmentId?: string | null }) {
   const disabledTypes = await adapterSettingsService(db).getDisabledTypes();
   input = { ...input, disabledTypes };
+  const piCard = input.adapterType === "pi_local" && input.runner !== "legacy";
+  const nativePi = input.adapterConfig?.provider === "pi_rpc" && input.runner !== "legacy"
+    && (input.adapterType === "pi_local" || input.adapterType === "paperclip_runner");
+  if (piCard || nativePi) {
+    const unavailable = () => unprocessable(
+      "The native Pi driver is unavailable. Restore the installed provider pack and retry; no ACPX Pi fallback was used.",
+      { code: "pi_rpc_driver_unavailable" },
+    );
+    const { installedNativePiDriverAvailable } = await import("./native-runtime/remote-provider-pack.js");
+    let installed: boolean;
+    try { installed = await installedNativePiDriverAvailable(); }
+    catch { throw unavailable(); }
+    if (nativePi && !installed) throw unavailable();
+    if (installed) {
+      const target = await resolveAgentRunnerTargetForCompany(db, companyId, input.defaultEnvironmentId, disabledTypes);
+      // Only fresh Pi-card selections need the legacy harness availability check.
+      // Saved native agents stay editable when the Pi adapter is disabled.
+      if (piCard && !agentRunnerAvailability("pi_local", target, disabledTypes).supportedRunners.includes("paperclip")) throw unprocessable(
+        "The installed native Pi driver requires Paperclip Runner in a supported environment. Enable its adapters, choose a supported Computer or explicitly select Legacy.",
+        { code: "agent_runner_unavailable" },
+      );
+      return { adapterType: "paperclip_runner", adapterConfig: resolveNativePiRunnerConfig(input.adapterConfig ?? {}, input.setupOnly) };
+    }
+  }
   const cursor = agentHarnessType(input.adapterType ?? "process", input.adapterConfig) === "cursor_cloud";
   const nativeCursor = cursor && input.runner !== "legacy"
     && (input.adapterType === "paperclip_runner" || input.runner === "paperclip");
@@ -409,6 +472,14 @@ export async function resolveNewAgentRunnerForCompany(db: Db, companyId: string,
   if (!paperclipRunnerProfileForHarness(agentHarnessType(input.adapterType ?? "process", input.adapterConfig))
     || input.runner === "legacy" || (input.adapterType === "paperclip_runner" && (input.runner === undefined || input.runner === "paperclip"))) return resolveNewAgentRunner(input);
   const target = await resolveAgentRunnerTargetForCompany(db, companyId, input.defaultEnvironmentId, input.disabledTypes);
+  if (input.adapterType === "codex_local" && (input.runner === undefined || input.runner === "auto")
+    && target.pluginSandbox && !target.platform) {
+    if (!runnerAdaptersAvailable("codex_local", target.driver, disabledTypes)) throw unprocessable(
+      "Paperclip Runner Codex is unavailable. Enable its adapters or explicitly select Legacy.",
+      { code: "agent_runner_unavailable" },
+    );
+    return { adapterType: "paperclip_runner", adapterConfig: resolveCodexRunnerConfig({ ...input.adapterConfig }) };
+  }
   return resolveNewAgentRunner({ ...input, target });
 }
 
@@ -444,6 +515,9 @@ export async function resolveAgentRunnerTargetForCompany(db: Db, companyId: stri
     const { readSandboxPlatformQualification } = await import("./environment-probe.js");
     const qualified = await readSandboxPlatformQualification(db, environment, companyId);
     if (qualified) target = { driver, ...qualified };
+    else if (typeof environment.config.provider === "string" && !isBuiltinSandboxProvider(environment.config.provider)) {
+      target = { driver, pluginSandbox: true };
+    }
   }
   const disabledForSsh = driver === "ssh" && environment
     ? disabledTypes ?? await adapterSettingsService(db).getDisabledTypes() : [];

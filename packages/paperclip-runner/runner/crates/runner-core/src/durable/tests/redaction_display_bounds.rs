@@ -1,4 +1,131 @@
 #[test]
+fn provider_transcript_text_survives_projection_and_durable_storage() {
+    let mut config = config(PathBuf::from("unused"));
+    config.max_frame_bytes = 1024 * 1024;
+    config.max_outbox_bytes = 4 * 1024 * 1024;
+    for (kind, size) in [
+        ("reasoning", 15_435),
+        ("agentMessage", 70_000),
+        ("agentMessage", 300_000),
+    ] {
+        let body: String = "word ".repeat(size / 5 + 1).chars().take(size).collect();
+        assert_eq!(body.chars().count(), size);
+        for (field, value) in [("text", json!(body)), ("summary", json!([{"text": body}]))] {
+            if field == "summary" && kind != "reasoning" {
+                continue;
+            }
+            let mut item = json!({"id":"text-item", "type":kind, "phase":"final_answer"});
+            item[field] = value;
+            let projected = crate::provider_events::normalize_codex_notification(
+                "item/completed",
+                &json!({"item":item}),
+            );
+            let event = projected
+                .iter()
+                .find(|event| event.event_type == "item.completed")
+                .unwrap();
+            let mut state = DurableState::new(&config);
+            state
+                .enqueue_event(
+                    &config,
+                    &event.event_type,
+                    event.priority,
+                    event.payload.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                state.outbox[0]
+                    .envelope
+                    .pointer("/payload/payload/text")
+                    .and_then(Value::as_str),
+                Some(body.as_str()),
+                "{kind} {field} {size}"
+            );
+        }
+        let secret = format!("{body} token=do-not-store");
+        let projected = crate::provider_events::normalize_codex_notification(
+            "item/completed",
+            &json!({"item":{
+                "id":"secret-item", "type":kind, "phase":"final_answer", "text":secret
+            }}),
+        );
+        let event = projected
+            .iter()
+            .find(|event| event.event_type == "item.completed")
+            .unwrap();
+        let mut state = DurableState::new(&config);
+        state
+            .enqueue_event(
+                &config,
+                &event.event_type,
+                event.priority,
+                event.payload.clone(),
+            )
+            .unwrap();
+        let saved = state.outbox[0]
+            .envelope
+            .pointer("/payload/payload/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(saved, format!("{body} token=[REDACTED]"));
+        assert!(!saved.contains("do-not-store"));
+    }
+}
+
+#[test]
+fn over_frame_transcript_is_a_durable_failure_marker_not_a_final_preview() {
+    let mut config = config(PathBuf::from("unused"));
+    config.max_frame_bytes = 1024 * 1024;
+    config.max_outbox_bytes = 4 * 1024 * 1024;
+    let body = "word ".repeat(120_000);
+    let mut state = DurableState::new(&config);
+    state.enqueue_event(&config, "item.completed", EventPriority::P1,
+        json!({"kind":"agentMessage", "channel":"final", "text":body, "answers":["question-1"]}))
+        .unwrap();
+    let saved = state.outbox[0].envelope.pointer("/payload/payload").unwrap();
+    assert_eq!(saved["transcriptOverflow"], true);
+    assert_eq!(saved["truncated"], true);
+    assert_eq!(saved["channel"], "detail");
+    assert!(saved.get("answers").is_none());
+    assert!(saved["text"].as_str().unwrap().contains("no complete answer was saved"));
+    assert!(!saved["text"].as_str().unwrap().contains("word "));
+}
+
+#[test]
+fn transcript_deltas_and_started_items_are_not_diagnostic_previews() {
+    let mut config = config(PathBuf::from("unused"));
+    config.max_frame_bytes = 1024 * 1024;
+    config.max_outbox_bytes = 1024 * 1024;
+    let body = "word ".repeat(3_087);
+    for kind in ["reasoning", "agentMessage", "assistant_message"] {
+        for event_type in [
+            "item.started",
+            "item.updated",
+            "item.delta",
+            "item.completed",
+        ] {
+            let mut state = DurableState::new(&config);
+            state
+                .enqueue_event(
+                    &config,
+                    event_type,
+                    EventPriority::P2,
+                    json!({"kind":kind, "text":body}),
+                )
+                .unwrap();
+            assert_eq!(
+                state.outbox[0]
+                    .envelope
+                    .pointer("/payload/payload/text")
+                    .and_then(Value::as_str),
+                Some(body.as_str()),
+                "{kind} {event_type}"
+            );
+        }
+    }
+}
+
+#[test]
 fn redaction_growth_keeps_a_full_tool_output_inside_its_schema_bound() {
     let mut config = config(PathBuf::from("unused"));
     config.max_outbox_bytes = 1024 * 1024;
