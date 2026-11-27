@@ -7219,6 +7219,39 @@ describe("native opening placement and segment order", () => {
     }
   });
 
+  it.each(["native", "log"])("shows the Stop → lost-files → fresh-session answer row in order on %s and reload", async transport => {
+    const request = comment("request", "Can you continue after Stop?", 10);
+    const answer = reply("opening", "I am answering from the fresh workspace.", 93);
+    const marker = { ...comment("session", "New session · Earlier messages and files are still available.", 9),
+      updatedAt: new Date(at(27)), // Published after recovery, backdated before its wake input.
+      authorType: "system" as const, authorUserId: null, conversationSessionGeneration: 0,
+      metadata: { version: 1 as const, sourceRunId: runId, sections: [] } };
+    const lost = { ...comment("lost", "Paperclip could not recover the unsaved files from the previous run: Paperclip cannot prove which runs used the sandbox that holds the saved files. Files that run did not save or push are not included.", 26),
+      authorType: "system" as const, authorUserId: null, conversationAnchorAt: new Date(at(120)) };
+    const entries = [
+      { kind: "system", text: "", ts: at(11), eventSeq: 1, steeringEvent: { kind: "input", turnId: "fresh" } },
+      { kind: "assistant", text: answer.body, channel: "final", ts: at(93), eventSeq: 2, itemId: answer.id },
+    ];
+    nativeTranscriptState.hydratedRunIds = new Set([runId, "stopped"]);
+    (transport === "native" ? nativeTranscriptState : transcriptState).transcriptByRun.set(runId, entries);
+    const props = { issueId: "issue", currentUserId: "viewer", onAdd: async () => {}, comments: [marker, request, lost, answer],
+      linkedRuns: [{ ...run, finishedAt: at(94), ...({ wakeCommentId: request.id } as object) },
+        { ...run, runId: "stopped", status: "cancelled", createdAt: at(0), finishedAt: at(5),
+          resultJson: { personStop: { requestedAt: at(4) } } }] };
+    for (let reload = 0; reload < 2; reload++) {
+      if (reload) render(<div />);
+      render(<TaskChatThread {...props} />);
+      await settleThreadLayout();
+      assertBefore(lost.body, answer.body);
+      assertBefore(request.body, lost.body);
+      expect(container.textContent).toContain("New session");
+      expect(container.textContent).toContain("Earlier messages are kept. Files the stopped run did not save or push were not brought into this workspace.");
+      expect(container.textContent).not.toContain("Earlier messages and files are still available.");
+      expect(container.querySelector('#comment-lost button[aria-expanded]')).toBeNull();
+      expect(container.querySelector('#comment-lost [data-testid="task-chat-system-notice-details"]')?.textContent).toContain(lost.body);
+    }
+  });
+
   it("keeps a folded non-steered starting input before the opening reply", async () => {
     const request = comment("request", "Start the review.", 10);
     const folded = { ...comment("folded", "Include the appendix in the starting request.", 20), consumedByRunId: runId };

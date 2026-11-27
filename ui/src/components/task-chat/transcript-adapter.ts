@@ -6,6 +6,7 @@
  * only showing a response after the turn settles.
  */
 import { foldApprovedAutoReviews } from "./fold-auto-reviews";
+import { isUnrecoveredFilesNotice } from "./adjacent-errors";
 import { isFatalProviderError, isStatusNotice, isStatusNoticePayload, statusNoticeCategory } from "./status-notice-presentation";
 import type { TranscriptEntry } from "@/adapters";
 import { formatContextTokens } from "@/lib/context-tokens";
@@ -2522,16 +2523,33 @@ export function assembleThreadItems(
   unanchored: readonly { turn: TaskChatTurnItem; startMs: number }[],
 ): TaskChatItem[] {
   const out: TaskChatItem[] = [];
+  // A turn is normally placed at its opening, but its answer can be much later.
+  // A files-lost receipt posted in between must be read BEFORE that answer,
+  // including when the turn would otherwise attach directly to its request.
+  const notices = entries.filter(entry => entry.item.kind === "message" && isUnrecoveredFilesNotice(entry.item));
+  const placement = (turn: TaskChatTurnItem, startMs: number) => {
+    const response = turn.finalResponse;
+    const answerMs = response?.createdAtIso ? new Date(response.createdAtIso).getTime() : response?.atMs;
+    return notices.reduce((at, notice) => answerMs != null && notice.ms >= at && notice.ms <= answerMs ? notice.ms : at, startMs);
+  };
+  const pending = unanchored.map(({ turn, startMs }) => ({ turn, startMs: placement(turn, startMs) }));
+  const anchored = new Map<string, TaskChatTurnItem[]>();
+  for (const entry of entries) for (const turn of turnsByAnchor.get(entry.id) ?? []) {
+    const startMs = placement(turn, entry.ms);
+    if (startMs > entry.ms) pending.push({ turn, startMs });
+    else anchored.set(entry.id, [...(anchored.get(entry.id) ?? []), turn]);
+  }
+  pending.sort((a, b) => a.startMs - b.startMs);
   let next = 0;
   for (const entry of entries) {
-    while (next < unanchored.length && unanchored[next].startMs < entry.ms) {
-      out.push(unanchored[next++].turn);
+    while (next < pending.length && pending[next].startMs < entry.ms) {
+      out.push(pending[next++].turn);
     }
     out.push(entry.item);
-    const following = turnsByAnchor.get(entry.id);
+    const following = anchored.get(entry.id);
     if (following) out.push(...following);
   }
-  while (next < unanchored.length) out.push(unanchored[next++].turn);
+  while (next < pending.length) out.push(pending[next++].turn);
   return out;
 }
 

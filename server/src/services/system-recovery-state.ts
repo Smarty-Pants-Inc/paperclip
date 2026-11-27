@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { ENVIRONMENT_LEASE_POLICIES, WORKSPACE_SOURCE_VERIFICATION_REASONS,
+import { ENVIRONMENT_LEASE_POLICIES, WORKSPACE_SOURCE_VERIFICATION_REASONS, UNRECOVERED_FILES_NOTICE_PREFIX,
   type WorkspaceSourceVerificationFailure } from "@paperclipai/shared";
 import { REMOTE_WORKSPACE_CAPTURE_POLICY_VERSION } from "./remote-workspace-snapshot-archive.js";
 
@@ -242,7 +242,7 @@ function unrecoverableSavedFilesReason(failure: RecoveryFailure) {
 }
 
 export function unrecoverableSavedFilesNotice(failure: RecoveryFailure) {
-  return `Paperclip could not recover the unsaved files from the previous run: ${unrecoverableSavedFilesReason(failure)}. `
+  return `${UNRECOVERED_FILES_NOTICE_PREFIX} ${unrecoverableSavedFilesReason(failure)}. `
     + "Retry continued this task in a new workspace from its recorded work: comments, documents, attachments and pushed commits. "
     + "Files that run did not save or push are not included. Its completed actions stay recorded and are not repeated.";
 }

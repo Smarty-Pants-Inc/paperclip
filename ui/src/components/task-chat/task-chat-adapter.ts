@@ -10,9 +10,12 @@
 import type { Agent } from "@paperclipai/shared";
 import type { IssueChatComment } from "@/lib/issue-chat-messages";
 import { resolveCommentAttribution } from "@/lib/comment-attribution";
+import { isUnrecoveredFilesNotice } from "./adjacent-errors";
 import { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
 import type { CompanyUserProfile } from "@/lib/company-members";
 import type { TaskChatAuthorKind, TaskChatItem, TaskChatMessageItem } from "./task-chat-model";
+
+const LEGACY_RECOVERY_MARKER_WINDOW_MS = 15 * 60_000;
 
 export interface TaskChatAdapterContext {
   agentMap?: Map<string, Agent>;
@@ -70,11 +73,33 @@ export function commentsToTaskChatItems(
   ctx: TaskChatAdapterContext = {},
 ): TaskChatItem[] {
   const items: TaskChatItem[] = [];
+  // Admission writes the receipt BEFORE session.started publishes its marker.
+  // Marker createdAt is backdated for display; its initial updatedAt is the DB
+  // insertion time. These system markers are not edited. Match the next inserted
+  // marker within the legacy recovery window, never the preceding session or
+  // an unrelated session hours later. Older partial rows without updatedAt can
+  // only use their unbackdated createdAt.
+  // Sorting separately preserves the caller's comment/item index alignment.
+  const publishedAt = (comment: IssueChatComment) => new Date(comment.updatedAt ?? comment.createdAt).getTime();
+  const sessionMarkers = comments.filter(comment => !comment.deletedAt &&
+    comment.authorType === "system" && comment.conversationSessionGeneration != null)
+    .sort((a, b) => publishedAt(a) - publishedAt(b));
+  const lostFilesSessions = new Set<string>();
+  for (const comment of comments) {
+    if (comment.deletedAt || !isUnrecoveredFilesNotice({ author: authorKind(comment), text: comment.body,
+      presentation: comment.presentation })) continue;
+    const at = new Date(comment.createdAt).getTime();
+    const marker = sessionMarkers.find(marker => publishedAt(marker) >= at &&
+      publishedAt(marker) - at <= LEGACY_RECOVERY_MARKER_WINDOW_MS);
+    if (marker) lostFilesSessions.add(marker.id);
+  }
   for (const comment of comments) {
     if (comment.deletedAt) continue;
     if (comment.conversationSessionGeneration != null) {
       items.push({ id: comment.id, kind: "marker", variant: "session_start", label: "New session",
-        detail: "Earlier messages and files are still available.", createdAtIso: new Date(comment.createdAt).toISOString() });
+        detail: lostFilesSessions.has(comment.id)
+          ? "Earlier messages are kept. Files the stopped run did not save or push were not brought into this workspace."
+          : "Earlier messages and files are still available.", createdAtIso: new Date(comment.createdAt).toISOString() });
       continue;
     }
     const kind = authorKind(comment);

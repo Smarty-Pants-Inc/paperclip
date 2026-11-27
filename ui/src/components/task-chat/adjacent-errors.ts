@@ -1,4 +1,16 @@
+import { matchesUnrecoveredFilesNotice } from "@paperclipai/shared";
 import type { TaskChatItem, TaskChatMarkerItem, TaskChatMessageItem } from "./task-chat-model";
+
+/** Legacy saved-work recovery comments carry only system authorship and body:
+ * explicit-native-continuation emits no presentation/cause/run metadata. Keep
+ * this compatibility recognition anchored to the producer's own statement,
+ * never to a quotation or to ordinary user/agent messages.
+ */
+export function isUnrecoveredFilesNotice(item: Pick<TaskChatMessageItem, "author" | "text"> & {
+  presentation?: { kind?: string | null } | null;
+}): boolean {
+  return item.author === "system" && matchesUnrecoveredFilesNotice(item.text, item.presentation?.kind);
+}
 
 const RECOVERY_STATEMENT = /^Paperclip tried to (?:start|continue) this task again, but it still could not (?:start|continue)\b/i;
 const LEGACY_RECOVERY_STATEMENT = /^Paperclip (?:automatically )?retried (?:dispatch|continuation|this issue's run)\b[^\r\n]*\bit still has no live execution path\b/i;

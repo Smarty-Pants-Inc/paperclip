@@ -62,7 +62,7 @@ import { ToolCallProgressProvider } from "@/components/task-chat/tool-call-progr
 import { TaskChatRunnerHeader, TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
 import { ExecutionBlockerNotice, nativeFailureNoticeRunId, isConversationRecovery, isPersonStoppedRun, isExecutionRetryRefused, executionFailureDetail, type ExecutionRefusalRemedyControls } from "./ExecutionBlockerNotice";
 import type { TranscriptContentVersion, TranscriptEntry } from "@/adapters/types";
-import { isNoLiveExecutionPathNotice } from "./task-chat/adjacent-errors";
+import { isNoLiveExecutionPathNotice, isUnrecoveredFilesNotice } from "./task-chat/adjacent-errors";
 import { partitionRunHealthItems } from "@/components/task-chat/TaskChatRunHealthBanner";
 import {
   TaskChatTurnStatusIsland,
@@ -2028,7 +2028,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const isInput = comment.authorType === "user" || steeringAnchorByCommentId.has(comment.id);
       entries.push({
         // Steering input keeps send order. Session reads split output only.
-        ms: !isInput && replyPlacementByCommentId.has(comment.id)
+        ms: item.kind === "message" && isUnrecoveredFilesNotice(item)
+          ? toMs(comment.createdAt)
+          : !isInput && replyPlacementByCommentId.has(comment.id)
           ? replyPlacementByCommentId.get(comment.id)!.atMs
           : !isInput && comment.conversationAnchorAt
             ? toMs(comment.conversationAnchorAt)
