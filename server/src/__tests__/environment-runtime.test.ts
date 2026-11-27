@@ -7,7 +7,7 @@ import { createSandboxOrphanCleanupSpool } from "../services/sandbox-orphan-clea
 import { idleWorkSnapshot } from "../services/task-admission.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +22,8 @@ import {
 import {
   activityLog,
   agentTaskSessions,
+  agentRuntimeState,
+  agentWakeupRequests,
   heartbeatRunEvents,
   issueComments,
   workspaceOperations,
@@ -29,6 +31,11 @@ import {
   agents,
   builtInManagedResources,
   companies,
+  completionContracts,
+  nativeRunResults,
+  statusDecisions,
+  statusDecisionEffects,
+  workAssessments,
   companySecretVersions,
   companySecrets,
   createDb,
@@ -61,7 +68,12 @@ import { resolveRunnerEnvironmentForRun } from "../services/runner-environment-l
 import { environmentService } from "../services/environments.ts";
 import { resumePluginEnvironmentLease } from "../services/plugin-environment-driver.js";
 import { remoteExecutionHasStopped } from "../services/remote-execution-termination.ts";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.ts";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { failedPreparationOwnsBoundedRetry } from "../services/failed-preparation-retry.js";
+import { hasStopOnlyCleanup } from "../services/sandbox-stop-and-retain.js";
+import { closeIdleWarmNativeSessionsForRestart } from "../services/native-runtime/native-session-executor.js";
+import type { NativeRunIdentity, NativeSession, PrpEvent } from "@paperclipai/paperclip-runner";
 import { secretService } from "../services/secrets.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
 import type { Environment, EnvironmentDriver, EnvironmentStatus } from "@paperclipai/shared";
@@ -79,6 +91,7 @@ import { claimNativeRestartRecoveries } from "../services/native-runtime/native-
 import { NATIVE_PREPARATION_FENCING_VERSION } from "../services/native-runtime/native-active-runs.js";
 import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
 import { verifyRecoverableNativeHarnessBackup } from "../services/native-runtime/native-harness-backup-storage.js";
+import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } from "../vendor/paperclip-runner/testing.js";
 
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
@@ -258,9 +271,18 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await db.delete(agentTaskSessions);
     await db.delete(heartbeatRunEvents);
     await db.delete(issueComments);
+    await db.delete(nativeRunFinalizations);
+    await db.delete(statusDecisionEffects);
+    await db.delete(statusDecisions);
+    await db.delete(workAssessments);
+    await db.delete(nativeRunResults);
+    await db.update(heartbeatRuns).set({ completionContractId: null });
+    await db.delete(completionContracts);
     await db.delete(issues);
     await db.delete(costEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(environments);
     await db.delete(executionWorkspaces);
@@ -5829,6 +5851,169 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     console.log("TERMINAL_REOPEN_ROW", JSON.stringify({ phase: "failed_stop_backoff", ageMs, sweep, sessionId: f.sessionId,
       originalBox: f.originalBox, reason: "reusable_sandbox_terminal_stop_unsettled", retryAfter: pending.metadata?.pendingCleanupRetryAfterMs, newBoxes: 0 }));
   }, 40_000);
+
+  it("heartbeat retries terminal stop backoff and answers in the same Pi session and allocation", async () => {
+    const f = await seedReusablePluginSandboxLease("paperclip_runner");
+    const issueId = randomUUID(), answer = `remember-${randomUUID()}`;
+    const root = await mkdtemp(path.join(os.tmpdir(), "terminal-heartbeat-")); fixtureRoots.push(root);
+    vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", root);
+    const settings = instanceSettingsService(db), previousSettings = await settings.getExperimental();
+    const memories = new Map<string, string>(), submissions: Array<{ runId: string; sessionId: string; box: string; reply: string }> = [];
+    const call = vi.fn(async (_pluginId: string, method: string, params: any) => {
+      if (method === "environmentResumeLease") return { providerLeaseId: params.providerLeaseId, metadata: { remoteCwd: root } };
+      if (method === "environmentAcquireLease") return { providerLeaseId: f.reusableLease.providerLeaseId,
+        metadata: { provider: "fake-plugin", image: "fake:test", timeoutMs: 1234, reuseLease: true, remoteCwd: root } };
+      if (method === "environmentRealizeWorkspace") return { cwd: root };
+      if (method === "environmentExecute") {
+        try {
+          return await new Promise((resolve, reject) => {
+            const child = execFile(params.command, params.args ?? [], { cwd: root,
+              env: { PATH: process.env.PATH, HOME: root, ...params.env }, timeout: 15_000 },
+              (error, stdout, stderr) => error ? reject(error) : resolve({ exitCode: 0, stdout, stderr }));
+            child.stdin?.end(params.stdin ?? "");
+          });
+        } catch (error: any) { return { exitCode: typeof error.code === "number" ? error.code : 1,
+          stdout: error.stdout ?? "", stderr: error.stderr ?? error.message }; }
+      }
+      if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" };
+      if (method === "environmentReleaseLease") return undefined;
+      throw new Error(`Unexpected provider method: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentRealizeWorkspace",
+        "environmentExecute", "environmentStopLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    const backendFactory: NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> = execution => {
+      let identity: NativeRunIdentity, sourceInstanceId = "", reply = "";
+      let turn = Promise.withResolvers<string>(), lastTurnId = "";
+      const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+      const session: NativeSession = {
+        identity: () => identity, capabilities: async () => capabilities,
+        attachRun: async input => { identity = input.identity;
+          sourceInstanceId = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, identity.runId)))[0]!.runnerInstanceId!; },
+        steer: async () => {}, interrupt: async () => {},
+        startTurn: async () => {
+          const leases = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, identity.runId));
+          const lease = leases.find(row => row.status === "active")!;
+          expect(lease.providerLeaseId).toBe(f.reusableLease.providerLeaseId);
+          const key = `${lease.providerLeaseId}:${identity.sessionId}`;
+          if (submissions.length === 0) memories.set(key, answer);
+          reply = memories.get(key)!;
+          expect(reply).toBe(answer);
+          submissions.push({ runId: identity.runId, sessionId: identity.sessionId, box: lease.providerLeaseId!, reply });
+          const turnId = randomUUID(); lastTurnId = turnId; turn.resolve(turnId); return { turnId };
+        },
+        async *events() {
+          const turnId = await turn.promise;
+          const event = (sourceSeq: number, eventType: PrpEvent["eventType"], payload: Record<string, unknown>): PrpEvent => ({
+            schema: "paperclip.prp.event.v1", sourceKind: "runner", sourceInstanceId,
+            sourceEventId: `${identity.runId}:${sourceSeq}`, sourceSeq, runId: identity.runId,
+            normalizedSessionId: identity.sessionId, turnId, schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), eventType, payload,
+          });
+          yield event(1, "turn.started", {});
+          yield event(2, "item.completed", { kind: "agentMessage", channel: "final", text: reply });
+          turn = Promise.withResolvers<string>();
+          yield event(3, "turn.completed", { status: "completed" });
+        },
+        result: async () => {
+          const result = structuredClone(CONTROL_PLANE_CONFORMANCE_RESULT);
+          result.summary = reply;
+          result.completionClaim.contractRevision = execution.completionContract.contract.revision;
+          return { result, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL, turnId: lastTurnId };
+        },
+        snapshot: async () => ({ backendKind: "mock", sessionId: identity.sessionId, identity,
+          providerSessionId: identity.sessionId, cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }),
+        close: async () => {},
+      };
+      return {
+        descriptor: async () => {
+          sourceInstanceId = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId)))[0]!.runnerInstanceId!;
+          return { kind: "mock", name: "Terminal stop retry provider", version: "1", capabilities,
+            runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } };
+        },
+        openSession: async input => { identity = input.identity; return session; },
+        recoverSession: async snapshot => { identity = snapshot.identity; return { recovered: true, session }; },
+      };
+    };
+    const heartbeat = heartbeatService(db, { environmentRuntime: runtime, nativeSessionBackendFactory: backendFactory });
+    try {
+      await settings.updateExperimental({ enableNativeRunner: true });
+      await db.update(companies).set({ defaultResponsibleUserId: "local-board" }).where(eq(companies.id, f.companyId));
+      await db.update(agents).set({ adapterType: "paperclip_runner", status: "idle", defaultEnvironmentId: f.environment.id,
+        adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-6.1-sol", sessionContinuity: "continuous", cwd: root,
+          lifecycleMode: "warm", idleTimeoutMs: 300_000 },
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+      await db.insert(issues).values({ id: issueId, companyId: f.companyId, title: "Remember across done and reopen", status: "in_progress",
+        assigneeAgentId: f.agentId, responsibleUserId: "local-board", executionWorkspaceId: f.executionWorkspaceId });
+      // Start the initial task through heartbeat too: its allocation gets the
+      // current runtime fingerprint and its real native checkpoint.
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, f.reusableLease.id));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+      const first = (await heartbeat.invoke(f.agentId, "on_demand", { issueId }, "manual"))!;
+      await heartbeat.drainActiveRunExecutions();
+      const good = (await heartbeat.getRun(first.id))!;
+      expect(good.status, JSON.stringify(good)).toBe("succeeded");
+      expect(good.runtimeMode).toBe("native"); expect(good.nativeSessionId).toEqual(expect.any(String));
+      expect(submissions).toHaveLength(1);
+      expect(call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toHaveLength(1);
+      const callsBeforeDone = call.mock.calls.length;
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      await runtime.destroyReusableSandboxLeases({ companyId: f.companyId, issueId, failureReason: "issue_terminal_done" });
+      call.mockRejectedValueOnce(new Error("provider stop unavailable"));
+      await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+      const pending = (await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, first.id)))[0]!;
+      expect(pending).toMatchObject({ status: "pending_cleanup", metadata: { pendingCleanupInFlight: false } });
+      expect(hasStopOnlyCleanup(pending)).toBe(true);
+      expect(call.mock.calls.slice(callsBeforeDone).map(([, method]) => method)).toEqual(["environmentStopLease"]);
+      expect(Number(pending.metadata?.pendingCleanupRetryAttempts)).toBeGreaterThan(0);
+      expect(Number(pending.metadata?.pendingCleanupRetryAfterMs)).toBeGreaterThan(Date.now());
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+      const reopened = (await heartbeat.invoke(f.agentId, "on_demand", { issueId }, "manual"))!;
+      await heartbeat.drainActiveRunExecutions();
+      const failed = (await heartbeat.getRun(reopened.id))!;
+      expect(failed).toMatchObject({ status: "failed", errorCode: "reusable_sandbox_resume_failed", runtimeMode: "legacy",
+        nativeSessionId: null, runnerInstanceId: null, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+      expect(failed.error).toContain("reusable_sandbox_terminal_stop_unsettled");
+      expect(submissions).toHaveLength(1);
+      const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, reopened.id));
+      expect(retries).toEqual([expect.objectContaining({ status: "scheduled_retry", scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 1 })]);
+      expect(failedPreparationOwnsBoundedRetry(failed)).toBe(true);
+      // Let only the real cleanup owner advance its clock; do not mutate the
+      // attempt/in-flight state or settle a receipt by hand.
+      await db.update(environmentLeases).set({ metadata: { ...pending.metadata, pendingCleanupRetryAfterMs: 0 } }).where(eq(environmentLeases.id, pending.id));
+      await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+      const settled = (await environmentService(db).getLeaseById(pending.id))!;
+      expect(settled).toMatchObject({ status: "released", cleanupStatus: "success",
+        metadata: { remoteExecutionTermination: { state: "stopped", providerLeaseId: pending.providerLeaseId },
+          sandboxStopAndRetainReceipt: { method: "environmentStopLease", providerLeaseId: pending.providerLeaseId } } });
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(eq(heartbeatRuns.id, retries[0]!.id));
+      expect(await heartbeat.promoteDueScheduledRetries()).toMatchObject({ promoted: 1 });
+      await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
+      const retried = (await heartbeat.getRun(retries[0]!.id))!;
+      expect(retried.status, JSON.stringify(retried)).toBe("succeeded");
+      expect(retried.nativeSessionId).toBe(good.nativeSessionId);
+      expect(submissions).toEqual([{ runId: first.id, sessionId: good.nativeSessionId, box: pending.providerLeaseId, reply: answer },
+        { runId: retried.id, sessionId: good.nativeSessionId, box: pending.providerLeaseId, reply: answer }]);
+      // Standard tasks publish their answer in the durable run transcript, not
+      // conversation comments. Assert the real event sink received the reply.
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, retried.id));
+      const replies = events.filter(event => event.eventType === "item.completed").map(event => event.payload?.prpEvent);
+      expect(replies).toEqual([expect.objectContaining({ runId: retried.id, normalizedSessionId: good.nativeSessionId,
+        payload: { kind: "agentMessage", channel: "final", text: answer } })]);
+      expect(call.mock.calls.slice(callsBeforeDone).some(([, method]) => ["environmentAcquireLease", "environmentDestroyLease"].includes(method))).toBe(false);
+      console.log("TERMINAL_HEARTBEAT_RETRY_ROW", JSON.stringify({ firstRunId: first.id, reopenedRunId: failed.id, retryRunId: retried.id,
+        pending: { id: pending.id, providerLeaseId: pending.providerLeaseId, status: pending.status, metadata: pending.metadata },
+        failed: { id: failed.id, status: failed.status, errorCode: failed.errorCode, error: failed.error, runtimeMode: failed.runtimeMode,
+          nativeSessionId: failed.nativeSessionId, runnerInstanceId: failed.runnerInstanceId, executionRecovery: failed.resultJson?.executionRecovery },
+        scheduled: { id: retries[0]!.id, status: retries[0]!.status, reason: retries[0]!.scheduledRetryReason, attempt: retries[0]!.scheduledRetryAttempt },
+        settled: { status: settled.status, cleanupStatus: settled.cleanupStatus, receipt: settled.metadata?.remoteExecutionTermination,
+          stopOnlyReceipt: settled.metadata?.sandboxStopAndRetainReceipt },
+        retried: { id: retried.id, status: retried.status, runtimeMode: retried.runtimeMode, nativeSessionId: retried.nativeSessionId },
+        failedPreparationOwnsBoundedRetry: failedPreparationOwnsBoundedRetry(failed), submissions, replies, newBoxes: 0 }));
+    } finally {
+      await heartbeat.drainActiveRunExecutions(); await closeIdleWarmNativeSessionsForRestart(); await settings.updateExperimental(previousSettings);
+    }
+  }, 90_000);
 
   it("terminal reopen owns the allocation before provider resume and fences stale terminal cleanup", async () => {
     const f = await terminalConversationFixture();
