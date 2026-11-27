@@ -8,6 +8,25 @@ import {
 } from "../src/host-client-factory.js";
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
+describe("projected issue reads", () => {
+  it.each([
+    ["issues.wakeDiagnostics", "wakeDiagnostics", "issues.diagnostics.read"],
+    ["issues.chatBinding", "chatBinding", "issues.chat-binding.read"],
+  ] as const)("gates %s independently and enforces invocation company", async (method, delegate, capability) => {
+    const read = vi.fn(async () => ({ safe: true }));
+    const services = { issues: { [delegate]: read } } as unknown as HostServices;
+    const params = { issueId: "issue-a", companyId: "company-a", limit: 2 };
+    const context = { invocationScope: { companyId: "company-a" } };
+    const denied = createHostClientHandlers({ pluginId: "test.reads", capabilities: ["issues.read"], services });
+    await expect(denied[method](params, context)).rejects.toBeInstanceOf(CapabilityDeniedError);
+    const allowed = createHostClientHandlers({ pluginId: "test.reads", capabilities: [capability], services });
+    await expect(allowed[method]({ ...params, companyId: "company-b" }, context)).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(read).not.toHaveBeenCalled();
+    await expect(allowed[method](params, context)).resolves.toEqual({ safe: true });
+    expect(read).toHaveBeenCalledWith(params);
+  });
+});
+
 describe("createHostClientHandlers invocation company scope", () => {
   it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
     const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));

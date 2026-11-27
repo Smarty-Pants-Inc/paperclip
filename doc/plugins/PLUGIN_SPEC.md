@@ -956,6 +956,17 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `projects.read`
 - `project.workspaces.read`
 - `issues.read`
+- `issues.diagnostics.read` — `ctx.issues.wakeDiagnostics(issueId, companyId, { limit? })`.
+  Returns only `{ events, truncated }` for recent wake requests in the host's
+  diagnostic lookback window. The limit defaults to 50 and is clamped to 1–50.
+  Events contain only `kind`, `status`, `runId`, `agentId`, `requestedAt`,
+  `claimedAt`, `finishedAt`, and `failureClass`. Times are ISO strings.
+  This read does not return activity records, wake payloads, reasons or error text.
+- `issues.chat-binding.read` — `ctx.issues.chatBinding(issueId, companyId)`.
+  Returns `null` or only `{ conversationId }`; no provider, endpoint, labels or URL.
+  Both reads require an in-company issue readable by the plugin. These capabilities
+  are independent of `issues.read` and require explicit operator approval when
+  added by an upgrade, as described in §15.3.
 - `issue.comments.read`
 - `issue.documents.read`
 - `issue.relations.read`

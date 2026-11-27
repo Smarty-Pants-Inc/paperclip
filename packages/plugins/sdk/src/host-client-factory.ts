@@ -238,6 +238,8 @@ export interface HostServices {
   issues: {
     list(params: WorkerToHostMethods["issues.list"][0]): Promise<WorkerToHostMethods["issues.list"][1]>;
     get(params: WorkerToHostMethods["issues.get"][0]): Promise<WorkerToHostMethods["issues.get"][1]>;
+    wakeDiagnostics(params: WorkerToHostMethods["issues.wakeDiagnostics"][0]): Promise<WorkerToHostMethods["issues.wakeDiagnostics"][1]>;
+    chatBinding(params: WorkerToHostMethods["issues.chatBinding"][0]): Promise<WorkerToHostMethods["issues.chatBinding"][1]>;
     create(params: WorkerToHostMethods["issues.create"][0]): Promise<WorkerToHostMethods["issues.create"][1]>;
     update(params: WorkerToHostMethods["issues.update"][0]): Promise<WorkerToHostMethods["issues.update"][1]>;
     getRelations(params: WorkerToHostMethods["issues.relations.get"][0]): Promise<WorkerToHostMethods["issues.relations.get"][1]>;
@@ -466,6 +468,8 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Issues
   "issues.list": "issues.read",
   "issues.get": "issues.read",
+  "issues.wakeDiagnostics": "issues.diagnostics.read",
+  "issues.chatBinding": "issues.chat-binding.read",
   "issues.create": "issues.create",
   "issues.update": "issues.update",
   "issues.relations.get": "issue.relations.read",
@@ -936,6 +940,12 @@ export function createHostClientHandlers(
     }),
     "issues.get": gated("issues.get", async (params) => {
       return services.issues.get(params);
+    }),
+    "issues.wakeDiagnostics": gated("issues.wakeDiagnostics", async (params) => {
+      return services.issues.wakeDiagnostics(params);
+    }),
+    "issues.chatBinding": gated("issues.chatBinding", async (params) => {
+      return services.issues.chatBinding(params);
     }),
     "issues.create": gated("issues.create", async (params) => {
       return services.issues.create(params);

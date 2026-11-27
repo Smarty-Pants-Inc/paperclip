@@ -74,6 +74,52 @@ describe("isWorkerEntrypoint", () => {
   });
 });
 
+describe("worker projected issue reads", () => {
+  it("round-trips diagnostics options and chat binding over the worker RPC", async () => {
+    const stdin = new PassThrough(), stdout = new PassThrough();
+    const lines = createInterface({ input: stdout });
+    const requests: Array<{ method: string; params: unknown }> = [];
+    const plugin = definePlugin({ async setup(ctx) {
+      ctx.actions.register("read", async () => ({
+        diagnostics: await ctx.issues.wakeDiagnostics("issue-a", "company-a", { limit: 3 }),
+        binding: await ctx.issues.chatBinding("issue-a", "company-a"),
+      }));
+    } });
+    const worker = startWorkerRpcHost({ plugin, stdin, stdout });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    lines.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcRequest(message)) {
+        requests.push({ method: message.method, params: message.params });
+        stdin.write(serializeMessage(createSuccessResponse(message.id,
+          message.method === "issues.wakeDiagnostics" ? { events: [], truncated: false } : { conversationId: "conversation-a" })));
+      } else if (isJsonRpcResponse(message)) {
+        pending.get(String(message.id))?.(message);
+        pending.delete(String(message.id));
+      }
+    });
+    function call(method: string, params: unknown) {
+      const id = `host-${method}`;
+      const response = new Promise<JsonRpcResponse>(resolve => pending.set(id, resolve));
+      stdin.write(serializeMessage(createRequest(method, params, id)));
+      return response;
+    }
+    try {
+      await call("initialize", {
+        manifest: { id: "test.reads", apiVersion: 1, version: "1.0.0", displayName: "Reads", description: "Test",
+          author: "Tests", categories: ["automation"], capabilities: ["issues.diagnostics.read", "issues.chat-binding.read"], entrypoints: {} },
+        config: {}, databaseNamespace: null,
+      });
+      expect(await call("performAction", { key: "read", params: {}, context: { companyId: "company-a" } }))
+        .toMatchObject({ result: { diagnostics: { events: [], truncated: false }, binding: { conversationId: "conversation-a" } } });
+      expect(requests).toEqual([
+        { method: "issues.wakeDiagnostics", params: expect.objectContaining({ issueId: "issue-a", companyId: "company-a", limit: 3 }) },
+        { method: "issues.chatBinding", params: expect.objectContaining({ issueId: "issue-a", companyId: "company-a" }) },
+      ]);
+    } finally { worker.stop(); lines.close(); stdin.destroy(); stdout.destroy(); }
+  });
+});
+
 describe("worker resource lifecycle delivery", () => {
   it("advertises and dispatches the native lifecycle callback", async () => {
     const stdin = new PassThrough(), stdout = new PassThrough();
