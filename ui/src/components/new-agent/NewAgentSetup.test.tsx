@@ -55,9 +55,15 @@ async function configure() {
 
 it("opens native Pi Configure with manual model entry and no adapter-catalog failure", async () => {
   await configure();
+  try {
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(host!.querySelector<HTMLInputElement>('[aria-label="Model ID"]')?.value).toBe("provider/saved-model");
+    }, { timeout: 5000 });
+  } finally {
+    expect(state.adapterModels).not.toHaveBeenCalled();
+  }
   expect(host!.textContent).not.toContain("Could not load models");
-  expect(host!.querySelector<HTMLInputElement>('[aria-label="Model ID"]')?.value).toBe("provider/saved-model");
-  expect(state.adapterModels).not.toHaveBeenCalled();
 });
 
 it("uses the routed Pi catalog and still reports a real connection-catalog failure", async () => {
