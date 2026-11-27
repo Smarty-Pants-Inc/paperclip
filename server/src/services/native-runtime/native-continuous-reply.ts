@@ -238,7 +238,8 @@ export async function publishContinuousNativeReply(input: {
     catch (error) {
       // A competing queue mutation, Stop, or uncertain ACK leaves the durable
       // wake intact for replay/the ordinary end-of-run release path.
-      logger.warn({ error, companyId, issueId, runId }, "held-run person-message drain deferred");
+      const { NativeSessionSteeringError } = await import("./native-session-executor.js");
+      logger.warn({ error, ...(error instanceof NativeSessionSteeringError ? error.diagnostic : {}), companyId, issueId, runId }, "held-run person-message drain deferred");
     }
   }
   // The executor may mark this run idle and request a reset close only after

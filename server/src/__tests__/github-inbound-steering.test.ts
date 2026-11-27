@@ -7,14 +7,22 @@ import {
   heartbeatRuns, heartbeatRunEvents, issueAttachments, issueComments, issues, runIdentityContexts, toolApplications, toolConnections, assets,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { githubCredentialsFixture } from "./helpers/github-credentials-fixture.js";
+import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createInboundWakeups } from "../services/chat-channels/inbound/wakeups.js";
-import { initializeRunIdentity } from "../services/run-identity.js";
+import { captureRunIdentity, initializeRunIdentity } from "../services/run-identity.js";
 import { NativeSessionSteeringError } from "../services/native-runtime/native-session-executor.js";
 import { chatWakeAuthorityDenied } from "../services/chat-channels/inbound/wakeup-authorization-error.js";
 import { defaultGitHubReviewPolicy, type GitHubReviewEventContext } from "@paperclipai/shared";
 import { resumeDeferredChatWake } from "../services/durable-chat-wakeup.js";
 
+vi.mock("../services/secrets.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../services/secrets.js")>();
+  return { ...original, secretService: (...args: Parameters<typeof original.secretService>) => ({ ...original.secretService(...args),
+    resolveUserSecretValue: async (_companyId: string, input: { responsibleUserId: string }) => ({ value: `fixture-token-${input.responsibleUserId}` }),
+  }) };
+});
 const steer = vi.hoisted(() => vi.fn());
 vi.mock("../services/native-runtime/native-session-executor.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>(),
@@ -141,6 +149,14 @@ describe("GitHub inbound steering", () => {
       expect(identity.messageId).toBe(f.original.id);
       const [reservation] = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.messageId, f.followup.id));
       expect(reservation.status).toBe("rejected");
+      expect((await captureRunIdentity(db, { companyId: f.companyId, runId: f.run.id, agentId: f.run.agentId },
+        { readScope: "github_credentials" })).context?.id).toBe(identity.id);
+      expect(receipt.payload?.wakeCommentId).toBe(f.followup.id);
+      const scope = { companyId: f.companyId, issueId: f.issue.id, agentId: f.run.agentId, runId: f.run.id };
+      const credentials = githubCredentialsFixture(() => db);
+      await credentials.grant(scope as Parameters<typeof credentials.grant>[0], f.userId);
+      expect(await resolveGitHubOperationCredentials(db, scope)).toMatchObject({ status: "available", login: f.userId,
+        env: { GH_TOKEN: `fixture-token-${f.userId}` } });
     },
   );
 
@@ -233,6 +249,8 @@ describe("GitHub inbound steering", () => {
     await f.owner.processInboundWakeup(f.action.deliveryId!);
     const [pending] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.action.id));
     expect(pending).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    const [reservation] = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.messageId, f.followup.id));
+    expect(reservation.status).toBe("pending");
     await acknowledge(f);
     expect(onAcknowledged).toBeTypeOf("function");
     await onAcknowledged!();
@@ -417,6 +435,8 @@ describe("GitHub inbound steering", () => {
       const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, next.action.id));
       expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
       expect(receipt.payload?.wakeCommentId).toBe(next.comment.id);
+      // Credential equivalence does not acknowledge delivery. Keep this input
+      // queued until the prior steering acknowledgement can be reconciled.
       expect(steer).toHaveBeenCalledTimes(1);
     } finally {
       release?.({ turnId: "review-turn" });

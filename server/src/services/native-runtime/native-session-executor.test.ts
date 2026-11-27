@@ -12854,17 +12854,17 @@ describe("native session same-turn steering", () => {
     } finally { state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
-  async function wrappedControlFailure(error: Error, operation: "steer" | "interrupt" = "steer") {
+  async function wrappedControlFailure(error: Error, operation: "steer" | "interrupt" = "steer", staleTurn = false) {
     const { FakeCodexTransport, makeDriver, WORKSPACE } = await import(new URL("../../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.ts", import.meta.url).href);
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({ runId: "wrapped-control", normalizedSessionId: "wrapped-control", workingDirectory: WORKSPACE });
     const { turnId } = await session.startTurn({ message: { role: "user", text: "Start." } });
     transport.rejectMethods.set(`turn/${operation}`, error);
-    try { return await (operation === "steer" ? session.steer!({ turnId, message: { role: "user", text: "Follow-up" } }) : session.interrupt!({ turnId })).catch((failure: Error) => failure); }
+    try { return await (operation === "steer" ? session.steer!({ turnId: staleTurn ? `${turnId}-stale` : turnId, message: { role: "user", text: "Follow-up" } }) : session.interrupt!({ turnId })).catch((failure: Error) => failure); }
     finally { await session.close({ reason: "fixture complete" }); }
   }
 
-  it.each(["rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "working-final-then-rejected", "timeout-then-rejected", "uncertain-transport", "uncertain-deadline", "uncertain-follow-up-deadline", "uncertain-indeterminate", "uncertain-prp-unknown", "uncertain-typed-indeterminate", "uncertain-typed-unknown", "uncertain-typed-deadline", "uncertain-typed-array", "uncertain-typed-deadline-capability", "uncertain-deadline-capability", "uncertain-typed-indeterminate-capability", "uncertain-indeterminate-capability", "uncertain-typed-malformed", "uncertain-typed-unsupported-text", "typed-stale", "typed-stop", "uncertain-typed-unsupported", "wrapped-stale", "wrapped-stop", "wrapped-raced", "timeout-then-deadline", "timeout-then-ACK", "prefixed", "prefixed-stale", "prefixed-typed", "uncertain-typed-prefixed-indeterminate"])("hold seam v2: config after a steer outcome: %s", async outcome => {
+  it.each(["runner-stale", "runner-stale-wire", "uncertain-runner-stale", "uncertain-diagnostic", "rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "working-final-then-rejected", "timeout-then-rejected", "uncertain-transport", "uncertain-deadline", "uncertain-follow-up-deadline", "uncertain-indeterminate", "uncertain-prp-unknown", "uncertain-typed-indeterminate", "uncertain-typed-unknown", "uncertain-typed-deadline", "uncertain-typed-array", "uncertain-typed-deadline-capability", "uncertain-deadline-capability", "uncertain-typed-indeterminate-capability", "uncertain-indeterminate-capability", "uncertain-typed-malformed", "uncertain-typed-unsupported-text", "typed-stale", "typed-stop", "uncertain-typed-unsupported", "wrapped-stale", "wrapped-stop", "wrapped-raced", "timeout-then-deadline", "timeout-then-ACK", "prefixed", "prefixed-stale", "prefixed-typed", "uncertain-typed-prefixed-indeterminate"])("hold seam v2: config after a steer outcome: %s", async outcome => {
     const result: Record<string, unknown> = {};
     vi.spyOn(continuousReply, "publishContinuousNativeReply").mockResolvedValue(true);
     vi.spyOn(resetWakeQueue, "closeConversationResetHold").mockResolvedValue(false);
@@ -12877,9 +12877,16 @@ describe("native session same-turn steering", () => {
       payload: { kind: "agentMessage", channel: "final", text: "Done." } };
     let resolve!: () => void, reject!: (error: Error) => void;
     steer.mockReturnValue(new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
-    const immediateRejection = ["rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "typed-stale", "typed-stop", "wrapped-stale", "wrapped-stop", "wrapped-raced", "prefixed", "prefixed-stale", "prefixed-typed"].includes(outcome);
+    const immediateRejection = ["runner-stale", "runner-stale-wire", "rejected", "sync-rejected", "prp-failed", "turn-end-not-delivered", "typed-stale", "typed-stop", "wrapped-stale", "wrapped-stop", "wrapped-raced", "prefixed", "prefixed-stale", "prefixed-typed"].includes(outcome);
     const uncertain = outcome.startsWith("uncertain-") || outcome === "timeout-then-deadline";
     const notDelivered = "a person's Stop is ending this turn";
+    if (outcome === "runner-stale") steer.mockRejectedValue(await wrappedControlFailure(new Error("must not reach provider"), "steer", true));
+    if (outcome === "runner-stale-wire" || outcome === "uncertain-runner-stale") steer.mockRejectedValue(await wrappedControlFailure(Object.defineProperty(new Error("Provider request failed"), "runnerCommandResult", {
+      value: { result: { code: outcome === "runner-stale-wire" ? "command_execution_failed" : "execution_indeterminate", message: "turn provider-turn-1-stale is not the active turn" } },
+    })));
+    if (outcome === "uncertain-diagnostic") steer.mockRejectedValue(Object.defineProperty(new Error("Provider request failed"), "runnerCommandResult", {
+      value: { code: "command_execution_failed", message: `Pi delivery uncertain: Follow-up api_key=private-fixture-value ${"x".repeat(500)}` },
+    }));
     if (outcome === "prefixed") steer.mockRejectedValue(new Error("pi_steer_not_delivered: refusal wording changed"));
     if (outcome === "prefixed-stale") steer.mockRejectedValue(new Error("pi_steer_not_delivered: Pi steering refers to a stale or inactive turn"));
     if (outcome === "prefixed-typed" || outcome === "uncertain-typed-prefixed-indeterminate") steer.mockRejectedValue(await wrappedControlFailure(Object.defineProperty(new Error("Provider request failed"), "runnerCommandResult", {
@@ -12906,13 +12913,16 @@ describe("native session same-turn steering", () => {
     })));
     if (outcome === "uncertain-typed-unsupported-text") steer.mockRejectedValue(await wrappedControlFailure(new Error("unsupported capability failed")));
     if (outcome === "timeout-then-deadline") vi.useFakeTimers();
+    const onDispatch = vi.fn(async (_turnId: string) => {});
     try {
       if (outcome !== "working-final-then-rejected") await accountingEvents.committed!(final);
-      const delivered = steerNativeSession({ runId: execution.binding.runId, message: "Follow-up", correlationId: "v2-follow-up", timeoutMs: outcome === "timeout-then-deadline" ? 10_000 : 5 })
+      const delivered = steerNativeSession({ runId: execution.binding.runId, message: "Follow-up", correlationId: "v2-follow-up", timeoutMs: outcome === "timeout-then-deadline" ? 10_000 : 5, onDispatch })
         .catch(error => error);
       await vi.waitFor(() => expect(steer).toHaveBeenCalledOnce());
       if (outcome === "timeout-then-deadline") await vi.advanceTimersByTimeAsync(10_001);
       const error = await delivered;
+      expect(onDispatch).toHaveBeenCalledExactlyOnceWith(expect.any(String));
+      expect(onDispatch.mock.invocationCallOrder[0]).toBeLessThan(steer.mock.invocationCallOrder[0]);
       if (outcome === "timeout-then-deadline") {
         reject(new Error('PRP command turn.steer failed: {"result":{"code":"command_execution_failed","message":"Pi steer deadline exceeded"},"status":"failed"}'));
         await Promise.resolve();
@@ -12924,7 +12934,16 @@ describe("native session same-turn steering", () => {
         expect(steer).toHaveBeenCalledOnce(); // The uncertain delivery stays cached, never redispatched.
         expect(retried).toMatchObject({ code: "steering_timeout", message: "Steering outcome is uncertain. Your message stays queued pending acknowledgement." });
       }
-      expect(error.code).toBe(outcome === "prp-failed" || outcome === "typed-stale" || outcome === "wrapped-stale" || outcome === "prefixed-stale" ? "steering_stale_turn" : immediateRejection ? "steering_rejected" : "steering_timeout");
+      expect(error.code).toBe(outcome === "runner-stale" || outcome === "runner-stale-wire" || outcome === "prp-failed" || outcome === "typed-stale" || outcome === "wrapped-stale" || outcome === "prefixed-stale" ? "steering_stale_turn" : immediateRejection ? "steering_rejected" : "steering_timeout");
+      if (outcome === "runner-stale-wire") expect(error.diagnostic).toEqual({ runnerCommandResultCode: "command_execution_failed",
+        steeringCauseMessage: "turn provider-turn-1-stale is not the active turn" });
+      if (outcome === "uncertain-diagnostic") {
+        expect(error.diagnostic.runnerCommandResultCode).toBe("command_execution_failed");
+        expect(error.diagnostic.steeringCauseMessage).toHaveLength(300);
+        expect(error.diagnostic.steeringCauseMessage).toContain("Pi delivery uncertain");
+        expect(error.diagnostic.steeringCauseMessage).not.toMatch(/Follow-up|private-fixture-value/);
+        expect(error.cause.message).toBe(error.diagnostic.steeringCauseMessage);
+      }
       result.heldNativeConfigurationEnd = true;
       await getNativeSessionSteeringState(execution.binding.runId);
       if (outcome === "working-final-then-rejected") {
@@ -12948,6 +12967,18 @@ describe("native session same-turn steering", () => {
         expect(interrupt).not.toHaveBeenCalled();
       } else await vi.waitFor(() => expect(interrupt).toHaveBeenCalledOnce());
     } finally { vi.useRealTimers(); resolve(); state.release?.(); await running; vi.restoreAllMocks(); }
+  });
+
+  it("refuses delivery before provider dispatch when the steering target cannot be persisted", async () => {
+    const piExecution = { ...execution, provider: { kind: "pi_rpc", model: "openai/gpt-5", conversationMode: true },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    const { running } = await startActiveSession(piExecution);
+    try {
+      await expect(steerNativeSession({ runId: execution.binding.runId, message: "Still queued", correlationId: "target-write-failed",
+        onDispatch: async () => { throw new Error("database unavailable"); },
+      })).rejects.toMatchObject({ code: "steering_rejected" });
+      expect(steer).not.toHaveBeenCalled();
+    } finally { state.release?.(); await running; vi.restoreAllMocks(); }
   });
 
   it.each(["uncertain", "uncertain-provider", "definitive", "definitive-stale", "definitive-raced", "definitive-prefixed", "late-definitive"])("hold seam v2: interrupt outcome: %s", async outcome => {

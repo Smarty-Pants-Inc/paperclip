@@ -1,4 +1,5 @@
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
+import { reconcileSteeredIdentitiesAfterTurn } from "../run-identity.js";
 import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
@@ -648,6 +649,23 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       // returns to its synchronous governed-wait boundary.
       await this.#onDuplicateEvent?.(event, persisted.row.seq);
     }
+    // Preserve observer ordering and retain the attached session until append
+    // returns; terminal observers do not detach the provider themselves.
+    if (["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"].includes(event.eventType)
+        && event.turnId && event.payload.providerTerminalObserved !== false) {
+      // Never make the terminal append wait on, or fail with, this repair: an
+      // unbounded provider read or a database error leaves the steer pending.
+      const terminal = { ...this.#binding, terminalEventSeq: persisted.row.seq, terminalTurnId: event.turnId };
+      void reconcileSteeredIdentitiesAfterTurn(this.#db, terminal, async () => {
+        const { readNativeSessionUserInputIds } = await import("./native-session-executor.js");
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          return await Promise.race([readNativeSessionUserInputIds(this.#binding.runId, this.#binding.sessionId),
+            new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 5_000); timer.unref?.(); })]);
+        } finally { if (timer) clearTimeout(timer); }
+      }).catch(error => logger.warn({ error, ...this.#binding, terminalTurnId: event.turnId },
+        "steering identity reconcile after turn deferred"));
+    }
     // A provider can flush clear_queue after settlement, or replay its notice.
     // Apply the same click-time filter outside the append's run-row lock; do
     // not rely solely on the finalizer having seen the notice in time.
@@ -670,7 +688,8 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
           const { drainContinuousPersonMessages } = await import("./native-continuous-drain.js");
           await drainContinuousPersonMessages(this.#db, this.#binding, { beforeFirstReply: true });
         } catch (error) {
-          logger.warn({ error, ...this.#binding }, "turn-start person-message drain deferred");
+          const { NativeSessionSteeringError } = await import("./native-session-executor.js");
+          logger.warn({ error, ...(error instanceof NativeSessionSteeringError ? error.diagnostic : {}), ...this.#binding }, "turn-start person-message drain deferred");
         }
       })();
     }

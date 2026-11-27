@@ -17546,6 +17546,7 @@ export function issueRoutes(
       throw forbidden(error.message);
     }
     if (error instanceof NativeSessionSteeringError) {
+      logger.warn({ code: error.code, ...error.diagnostic }, "person comment steering left message queued");
       throw conflict(error.message, { code: error.code, retryable: true });
     }
     throw error;

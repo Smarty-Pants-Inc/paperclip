@@ -9829,8 +9829,9 @@ export class NativeSessionSteeringError extends Error {
       | "steering_timeout"
       | "steering_rejected",
     message: string,
+    readonly diagnostic?: { steeringCauseMessage: string; runnerCommandResultCode: string | null },
   ) {
-    super(message);
+    super(message, diagnostic ? { cause: new Error(diagnostic.steeringCauseMessage) } : undefined);
     this.name = "NativeSessionSteeringError";
   }
 }
@@ -10027,7 +10028,9 @@ function rejectedTurnControl(active: ActiveNativeSession, error: unknown): "stee
   const message = result ? result.message : detail;
   if (typeof message !== "string" || (result ? result.code !== "command_execution_failed"
     : /timeout|timed out|deadline|transport|disconnect|connection|indeterminate/i.test(message))) return null;
-  if (message.includes(PI_STEER_NOT_DELIVERED.legacy[0])) return "steering_stale_turn";
+  // requireActiveTurn refuses before dispatch, unlike an ACK lost after delivery.
+  if ((!result && value.code === "stale_turn") || /^(?:Error: )?turn \S+ is not the active turn$/.test(message)
+      || message.includes(PI_STEER_NOT_DELIVERED.legacy[0])) return "steering_stale_turn";
   return message.includes(PI_STEER_NOT_DELIVERED.prefix) || PI_STEER_NOT_DELIVERED.legacy.slice(1).some(phrase => message.includes(phrase)) ? "steering_rejected" : null;
 }
 
@@ -10038,6 +10041,7 @@ export async function steerNativeSession(input: {
   correlationId: string;
   timeoutMs?: number;
   onAcknowledged?: () => Promise<void>;
+  onDispatch?: (turnId: string) => Promise<void>;
 }): Promise<{ turnId: string }> {
   const active = activeNativeSessions.get(input.runId);
   if (!active) {
@@ -10081,6 +10085,10 @@ export async function steerNativeSession(input: {
     const cached = steeringDeliveries.get(deliveryKey);
     if (cached) delivery = cached;
     else {
+      if (input.onDispatch) {
+        try { await input.onDispatch(turnId); }
+        catch { throw new NativeSessionSteeringError("steering_rejected", "Could not reserve the steering target; the message remains queued."); }
+      }
       reservation.dispatched = true; // Protect the provider-ACK -> durable ACK gap.
       delivery = Promise.resolve().then(() => active.session.steer!({
         turnId, message: { role: "user", text: input.message }, correlationId: input.correlationId,
@@ -10125,8 +10133,15 @@ export async function steerNativeSession(input: {
   } catch (error) {
     if (error instanceof NativeSessionSteeringError) throw error;
     const code = rejectedTurnControl(active, error);
-    if (!code) throw new NativeSessionSteeringError("steering_timeout", "Steering outcome is uncertain. Your message stays queued pending acknowledgement.");
-    throw new NativeSessionSteeringError(code, code === "steering_stale_turn" ? "The target turn is no longer active." : code === "steering_unsupported" ? "This provider does not support same-turn steering." : "The provider rejected the steering message.");
+    const envelope = record(record(error).runnerCommandResult);
+    const result = record("result" in envelope ? envelope.result : envelope);
+    let detail = typeof result.message === "string" ? result.message : error instanceof Error ? error.message : String(error);
+    // Diagnostics never contain the submitted message or an unbounded provider payload.
+    for (const body of [input.message, JSON.stringify(input.message).slice(1, -1)].filter(Boolean)) detail = detail.split(body).join("[REDACTED]");
+    const diagnostic = { steeringCauseMessage: redactSensitiveText(detail).replace(/\s+/g, " ").slice(0, 300),
+      runnerCommandResultCode: typeof result.code === "string" && /^[a-z_]{1,80}$/.test(result.code) ? result.code : null };
+    if (!code) throw new NativeSessionSteeringError("steering_timeout", "Steering outcome is uncertain. Your message stays queued pending acknowledgement.", diagnostic);
+    throw new NativeSessionSteeringError(code, code === "steering_stale_turn" ? "The target turn is no longer active." : code === "steering_unsupported" ? "This provider does not support same-turn steering." : "The provider rejected the steering message.", diagnostic);
   } finally {
     if (timeout) clearTimeout(timeout);
   }
