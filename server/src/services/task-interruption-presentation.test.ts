@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { projectTaskInterruption } from "./task-interruption-presentation.js";
+import { NativeTurnPromptExceedsCommandBoundError, nativePromptCauseFromError, NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND } from "./native-runtime/native-turn-budget.js";
 
 const issue = { id: "task", companyId: "11111111-1111-4111-8111-111111111111", status: "blocked", assigneeAgentId: "agent", projectId: "22222222-2222-4222-8222-222222222222" };
 const run = { id: "run", agentId: "agent", status: "failed", scheduledRetryAt: null,
@@ -31,6 +32,48 @@ describe("classified failure of an unanswered message", () => {
       .toMatchObject({ code: "previous_session_unconfirmed", title: "Couldn't confirm the previous session stopped" });
     expect(project({ errorCode: "native_predecessor_retirement_unproven" })?.failure)
       .toMatchObject({ code: "previous_session_unconfirmed" });
+  });
+  it("carries the size-refusal reason without offering a futile Retry, including owed input", () => {
+    const refused = { ...failed, errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND };
+    for (const owed of [undefined, owedInput]) {
+      const presentation = projectTaskInterruption(issue, { run: refused, agent, paused: false, approval: false, owedInput: owed });
+      expect(presentation).toMatchObject({ state: "failed", canRetry: false,
+        failure: { code: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, title: "Turn is too large", detail: expect.stringContaining("Reduce the request or task context.") } });
+      expect(JSON.stringify(presentation)).not.toContain("private.example");
+    }
+  });
+  it.each(["task_description", "newest_message", "unread_message", "queued_input", "human_response"] as const)("keeps the protected %s cause and never offers Retry", kind => {
+    const cause = { kind, bytes: 600000 };
+    const presentation = project({ errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND,
+      resultJson: { nativeTurnPromptRefusalCause: cause } });
+    expect(presentation).toMatchObject({ canRetry: false, failure: { cause } });
+    expect(presentation?.failure?.title).not.toBe("Task history is too large");
+    if (kind === "human_response") {
+      expect(presentation?.failure?.detail).not.toMatch(/shorten|split/i);
+      expect(presentation?.failure?.detail).toContain("task needs a person's decision");
+    } else expect(presentation?.failure?.detail).toMatch(/shorten|split/i);
+    expect(presentation?.failure?.detail).not.toMatch(/new session|compact/i);
+  });
+  it.each(["unread_messages", "protected_input", "protected_inputs", "command"] as const)("supplies specific safe copy and serialized cause for %s", kind => {
+    const cause = { kind, bytes: 750000, ...(kind === "unread_messages" ? { count: 3 } : {}) };
+    const error = new NativeTurnPromptExceedsCommandBoundError(cause);
+    expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
+    const presentation = project({ errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, resultJson: { nativeTurnPromptRefusalCause: cause } });
+    expect(presentation?.failure?.title).not.toBe("Task history is too large");
+    expect(presentation?.failure?.detail).toContain("733 KB");
+    if (kind === "unread_messages") expect(presentation?.failure?.detail).toContain("3 unread messages total");
+    if (kind === "protected_input") expect(presentation?.failure?.title).toBe("Required task input is too large");
+  });
+  it("presents an unmeasured handback refusal truthfully, not as an oversized request", () => {
+    const cause = { kind: "unmeasured_composition" as const, bytes: 0 };
+    const error = new NativeTurnPromptExceedsCommandBoundError(cause);
+    expect(nativePromptCauseFromError(new Error(String(error)))).toEqual(cause);
+    const presentation = project({ errorCode: NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND,
+      resultJson: { nativeTurnPromptRefusalCause: cause } });
+    expect(presentation).toMatchObject({ state: "failed", canRetry: false, failure: { cause,
+      title: "Queued input cannot be measured for this turn", detail: expect.stringContaining("No queued messages or answers were consumed; they remain saved.") } });
+    expect(presentation?.failure?.detail).toContain("input delivery needs to be repaired before retrying");
+    expect(JSON.stringify(presentation)).not.toMatch(/too large|shorten|split|Reduce the request/);
   });
   it("uses existing stock titles, and a safe fallback for an unmapped classified code", () => {
     expect(project({ errorCode: "provider_quota" })?.failure).toMatchObject({ code: "provider_quota", title: "Error: usage limit reached" });
