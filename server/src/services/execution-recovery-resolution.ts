@@ -1,3 +1,4 @@
+import { hasUnchangedNativeInputRefusal } from "./native-input-refusal.js";
 import { settleOperatorContainedNativeOwner } from "./native-runtime/native-failed-run-owner-release.js";
 import { notifyRoutineExecutionStatus } from "./routine-execution-status-notifications.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
@@ -571,6 +572,7 @@ export async function deliverReconciledExecutions(
             continue;
           }
         }
+        if (await hasUnchangedNativeInputRefusal(db, { companyId: action.companyId, issueId: task.id })) continue;
         if (await deferForUnwakeableAssignee(db, action)) { seenAgents.add(action.returnOwnerAgentId); continue; }
         if (!await agentHasRoom(action, action.returnOwnerAgentId, kind)) {
           seenAgents.add(action.returnOwnerAgentId);
