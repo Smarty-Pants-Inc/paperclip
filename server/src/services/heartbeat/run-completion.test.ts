@@ -31,6 +31,7 @@ import { ProjectAccessDeniedError } from "../project-access-denial.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL, RemoteWorkspaceOperationError, RemoteWorkspaceOperationTimeoutError, RemoteWorkspacePreparationTimeoutError, RemoteWorkspaceRestoreError } from "../remote-workspace-transport.js";
 import { EnvironmentRunError, environmentRunOrchestrator } from "../environment-run-orchestrator.js";
 import { ReusableSandboxResumeError } from "../reusable-sandbox-resume-error.js";
+import { buildStrandedRecoveryEscalationNotice } from "../recovery/stranded-notice.js";
 import { PluginWorkerUnavailableError } from "../plugin-worker-unavailable-error.js";
 import { ReviewedChatBindingDeniedError, ReviewedChatBindingNotReadyError } from "../reviewed-chat-binding-diagnostics.js";
 import { environmentTaskErrorCodeData, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, PluginEnvironmentTaskError, PluginWorkspaceOperationError, workspaceOperationErrorData } from "@paperclipai/plugin-sdk";
@@ -1455,6 +1456,23 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       expect(failed.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false } });
       expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }), f.agent);
     } else expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+  });
+
+  it.each(["legacy", "native"] as const)("persists the terminal stop refusal reason through %s acquisition failure and exhausted recovery", async runtimeMode => {
+    const f = await fixture({ runtimeMode });
+    const resume = new ReusableSandboxResumeError({ provider: "daytona", providerLeaseId: "lease-1",
+      reason: "reusable_sandbox_terminal_stop_unsettled" });
+    const error = new EnvironmentRunError("lease_acquire_failed", resume.message, { cause: resume });
+    f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({ outcome: "not_scheduled", reason: "Retry budget exhausted", issueId: null });
+    await f.completion.failRunSetup(f.setup(error));
+    const failed = await read(f.run.id);
+    expect(failed).toMatchObject({ status: "failed", resultJson: {
+      reusableSandboxResumeReason: "reusable_sandbox_terminal_stop_unsettled" } });
+    const notice = buildStrandedRecoveryEscalationNotice({ recoveryActionId: randomUUID(), continuesAutomatically: false,
+      recoveryOwner: null, sourceRun: failed });
+    expect(notice.presentation.title).toBe("Saved sandbox is still being stopped");
+    expect(notice.body).toContain("to keep its conversation");
+    expect(notice.body).not.toContain("tries again automatically");
   });
 
   it.each(["fresh", "started", "untrusted", "retained"] as const)("routes a %s stopped plugin worker refusal through bounded bootstrap recovery", async scenario => {

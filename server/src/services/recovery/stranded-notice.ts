@@ -72,7 +72,12 @@ export function classifiedRunFailure(run: {
   previousSessionUnconfirmed?: boolean;
   resultJson?: Record<string, unknown> | null;
 }): NonNullable<TaskInterruptionPresentation["failure"]> & { cause?: NativePromptRefusalCause } {
-  let code = run.errorCode ?? "run_failed";
+  let code = run.resultJson?.reusableSandboxResumeReason === "reusable_sandbox_terminal_stop_unsettled"
+    ? "reusable_sandbox_terminal_stop_unsettled" : run.errorCode ?? "run_failed";
+  if (code === "reusable_sandbox_terminal_stop_unsettled") {
+    const notice = WORKSPACE_SCAN_NOTICES[code]!;
+    return { code, title: notice.title, detail: notice.nextAction };
+  }
   if (code === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND) {
     const cause = nativePromptRefusalCause(run.resultJson?.nativeTurnPromptRefusalCause);
     return { code, title: nativePromptRefusalTitle(cause), detail: nativePromptRefusalDetail(cause), ...(cause ? { cause } : {}) };
@@ -112,6 +117,9 @@ const WORKSPACE_SCAN_NOTICES: Record<string, { title: string; nextAction: string
   environment_provider_unavailable: { title: "Environment provider was temporarily unavailable", nextAction: "Paperclip kept retrying automatically for 30 minutes, but the provider was still unavailable. No agent work started. Retry the task once the provider is available." },
   reusable_sandbox_resume_failed: { title: "Saved sandbox could not be resumed", nextAction: "The sandbox service did not start the saved sandbox in time. "
     + "The saved sandbox and its files were kept, and no agent work started. Paperclip tries again automatically." },
+  reusable_sandbox_terminal_stop_unsettled: { title: "Saved sandbox is still being stopped", nextAction:
+    "This task's saved sandbox is still being stopped to keep its conversation. The stop has not finished, so no agent work started. "
+    + "The instance operator needs to resolve the sandbox service's stop failure before this task can continue." },
   workspace_git_scan_saturated: { title: "Workspace scan queue is full", nextAction: "The server was too busy to read the task's files, so no agent work started. Press Retry to start it again." },
   workspace_git_scan_output_limit: { title: "Workspace scan exceeded its limit", nextAction: "The task's files are larger than Paperclip can read at once, so no agent work started. Press Retry to start it again." },
   workspace_git_scan_failed: { title: "Workspace scan failed", nextAction: "The task's files could not be read, so no agent work started. Press Retry to start it again." },
@@ -363,7 +371,8 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     resultJson?: Record<string, unknown> | null;
   } | null | undefined;
 }): StrandedRecoveryEscalationNotice {
-  const scanNotice = WORKSPACE_SCAN_NOTICES[input.sourceRun?.errorCode ?? ""];
+  const scanNotice = WORKSPACE_SCAN_NOTICES[input.sourceRun?.resultJson?.reusableSandboxResumeReason === "reusable_sandbox_terminal_stop_unsettled"
+    ? "reusable_sandbox_terminal_stop_unsettled" : input.sourceRun?.errorCode ?? ""];
   const retriesItself = TEMPORARY_SETUP_CODES.has(input.sourceRun?.errorCode ?? "") && input.continuesAutomatically === true;
   const workspaceScan = scanNotice && TEMPORARY_SETUP_CODES.has(input.sourceRun?.errorCode ?? "") && !retriesItself
     ? { ...scanNotice, nextAction: scanNotice.nextAction.replace(AUTOMATIC_RETRY_SENTENCE, MANUAL_RETRY_SENTENCE) }
