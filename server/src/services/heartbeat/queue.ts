@@ -5207,7 +5207,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               } catch (err) {
                 // Closing/Stop/configuration and delivery races retain the exact
                 // durable wake, just as a failed page steer does.
-                logger.warn({ err, issueId, commentId: wakeCommentId }, "automatic comment steering left message queued");
+                const { NativeSessionSteeringError } = await import("../native-runtime/native-session-executor.js");
+                logger.warn({ err, ...(err instanceof NativeSessionSteeringError ? err.diagnostic : {}), issueId, commentId: wakeCommentId }, "automatic comment steering left message queued");
               }
             }
             if (!oldestPersonWake) return;

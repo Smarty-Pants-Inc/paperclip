@@ -450,6 +450,22 @@ export async function prepareSteeredIdentity(
   });
 }
 
+/** Steering derives only the responsible person; grant and trust policy are
+ * re-read from the unchanged run/task. Company-default attribution is not consent. */
+async function steeringPreservesCredentialIdentity(
+  executor: Pick<Db, "select">,
+  run: { id: string; companyId: string; activeIdentityContextId: string | null; responsibleUserId: string | null },
+  pending: RunIdentityContext,
+) {
+  if (pending.cause !== "steering" || !run.activeIdentityContextId || pending.responsibleUserId !== run.responsibleUserId) return false;
+  const [active] = await executor.select().from(runIdentityContexts).where(and(
+    eq(runIdentityContexts.id, run.activeIdentityContextId), eq(runIdentityContexts.companyId, run.companyId),
+    eq(runIdentityContexts.runId, run.id), eq(runIdentityContexts.status, "accepted"),
+  ));
+  return active?.responsibleUserId === pending.responsibleUserId
+    && active.cause !== "company_default";
+}
+
 export async function reserveSteeredIdentity(
   db: Db,
   input: Parameters<typeof prepareSteeredIdentity>[1],
@@ -503,14 +519,31 @@ export async function reserveSteeredIdentity(
         .update(runIdentityContexts)
         .set({ status: "pending" })
         .where(eq(runIdentityContexts.id, context.id));
-      return { ...context, status: "pending" };
     }
-    return context;
+    if (context.status !== "accepted" && (context.status === "rejected"
+        || (run.contextSnapshot?.steeringIdentityReservation as { contextId?: string } | undefined)?.contextId !== context.id)) {
+      // Attribution is immutable, but a rejected message can be reserved again.
+      // Record this attempt's epoch on the mutable run, so replaying an older
+      // terminal receipt cannot reject a new in-flight attempt of that message.
+      await tx.update(heartbeatRuns).set({ contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb),
+        '{steeringIdentityReservation}', jsonb_build_object('contextId', ${context.id}::text, 'minimumEventSeq', ${run.nextEventSeq}::bigint))`,
+      }).where(eq(heartbeatRuns.id, run.id));
+    }
+    return context.status === "rejected" ? { ...context, status: "pending" } : context;
   });
 }
 
+/** Persist the provider snapshot's actual target before dispatch, without taking
+ * an issue lock: board steering already holds its queue/issue transaction. */
+export async function recordSteeredIdentityTarget(db: Db, context: RunIdentityContext, turnId: string) {
+  await db.update(heartbeatRuns).set({ contextSnapshot: sql`jsonb_set(coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb),
+    '{steeringIdentityReservation,turnId}', to_jsonb(${turnId}::text))`,
+  }).where(and(eq(heartbeatRuns.id, context.runId), eq(heartbeatRuns.companyId, context.companyId),
+    sql`${heartbeatRuns.contextSnapshot}#>>'{steeringIdentityReservation,contextId}' = ${context.id}::text`));
+}
+
 export async function rejectSteeredIdentity(
-  db: Db,
+  db: Pick<Db, "update">,
   context: RunIdentityContext,
 ) {
   await db
@@ -659,13 +692,18 @@ async function captureRunIdentityForPurpose<Scope extends RunIdentityReadScope |
       .limit(1);
     if (pending) {
       const acknowledgement = await storedSteeringAcknowledgement(tx, pending);
-      if (!acknowledgement)
+      if (acknowledgement) {
+        await acceptSteeredIdentity(tx, pending);
+        run.activeIdentityContextId = pending.id;
+        run.responsibleUserId = pending.responsibleUserId;
+      } else if (!(await steeringPreservesCredentialIdentity(tx, run, pending))) {
         throw conflict(
           "Message acceptance is being reconciled; retry credential acquisition",
         );
-      await acceptSteeredIdentity(tx, pending);
-      run.activeIdentityContextId = pending.id;
-      run.responsibleUserId = pending.responsibleUserId;
+      }
+      // Same person, unacknowledged: act under the still-active context and
+      // leave the steer pending. Accepting it early would move the run's
+      // message provenance (and a chat reply's channel) before it was read.
     }
     const [context] = run.activeIdentityContextId
       ? await tx
@@ -755,6 +793,52 @@ export async function reconcileSteeredIdentity(
       .for("no key update");
     if (!run) return;
     await acceptSteeredIdentity(tx, context);
+  });
+}
+
+/** A terminal receipt alone cannot prove non-delivery: Pi may have retained
+ * input despite losing the ACK. Read provider-owned input IDs before taking locks.
+ * The durable terminal cutoff makes replays harmless to newer reservations. */
+export async function reconcileSteeredIdentitiesAfterTurn(
+  db: Db,
+  input: { companyId: string; runId: string; terminalEventSeq: number; terminalTurnId: string },
+  readEnteredInputIds: () => Promise<string[] | null>,
+) {
+  const pendingAtTerminal = and(
+    eq(runIdentityContexts.companyId, input.companyId), eq(runIdentityContexts.runId, input.runId),
+    eq(runIdentityContexts.status, "pending"), eq(runIdentityContexts.cause, "steering"),
+    sql`(select case when ${heartbeatRuns.contextSnapshot}#>>'{steeringIdentityReservation,contextId}' = ${runIdentityContexts.id}::text
+        then (${heartbeatRuns.contextSnapshot}#>>'{steeringIdentityReservation,minimumEventSeq}')::bigint <= ${input.terminalEventSeq}
+        else ${runIdentityContexts.createdAt} <= (select ${heartbeatRunEvents.createdAt} from ${heartbeatRunEvents}
+          where ${heartbeatRunEvents.companyId} = ${input.companyId} and ${heartbeatRunEvents.runId} = ${input.runId}
+            and ${heartbeatRunEvents.seq} = ${input.terminalEventSeq} and ${heartbeatRunEvents.sourceEventId} is not null) end
+      from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.runId} and ${heartbeatRuns.companyId} = ${input.companyId})`,
+  );
+  if (!(await db.select({ id: runIdentityContexts.id }).from(runIdentityContexts).where(pendingAtTerminal).limit(1)).length) return;
+  const entered = await readEnteredInputIds();
+  await db.transaction(async tx => {
+    await lockIdentityTask(tx, input.companyId, input.runId);
+    const [run] = await tx.select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+    )).for("no key update");
+    if (!run) return;
+    const reservation = run.contextSnapshot?.steeringIdentityReservation as { contextId?: string; turnId?: string } | undefined;
+    const pending = await tx.select().from(runIdentityContexts).where(pendingAtTerminal).orderBy(asc(runIdentityContexts.revision));
+    for (const context of pending) {
+      const [userItem] = context.messageId ? await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRunEvents.runId, input.runId),
+        inArray(heartbeatRunEvents.eventType, ["item.started", "item.completed"]),
+        sql`${heartbeatRunEvents.sourceEventId} is not null`,
+        sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'userMessage'`,
+        sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' like ${`%:steer:${context.messageId}`}`,
+      )).limit(1) : [];
+      if (await storedSteeringAcknowledgement(tx, context) || userItem || (context.messageId && entered?.includes(context.messageId))) {
+        await acceptSteeredIdentity(tx, context);
+      } else if (entered !== null && reservation?.contextId === context.id && reservation.turnId === input.terminalTurnId) {
+        await rejectSteeredIdentity(tx, context);
+      }
+      // Missing history or a terminal receipt for another turn is not absence.
+    }
   });
 }
 

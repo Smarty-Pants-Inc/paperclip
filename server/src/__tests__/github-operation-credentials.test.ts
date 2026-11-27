@@ -41,6 +41,7 @@ import {
 import {
   initializeRunIdentity,
   captureRunIdentity,
+  reserveSteeredIdentity,
 } from "../services/run-identity.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import {
@@ -87,6 +88,66 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       vi.unstubAllEnvs();
     }, 60_000);
     const { seed, grant, switchTo } = githubCredentialsFixture(() => db);
+    async function pendingSteer(input: Awaited<ReturnType<typeof seed>>, authorUserId: string) {
+      const [comment] = await db.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
+        authorUserId, body: "Queued instruction" }).returning();
+      return (await reserveSteeredIdentity(db, { ...input, messageId: comment.id }))!;
+    }
+
+    it.each([false, true])("acquires credentials during a same-user pending steer without an acknowledgement (quarantined=%s)", async quarantined => {
+      const input = await seed(), selected = await grant(input, "A");
+      if (quarantined) await db.update(issues).set({ sourceTrust: {
+        preset: "low_trust_review", disposition: "quarantined", sourceIssueId: input.issueId,
+      } }).where(eq(issues.id, input.issueId));
+      const origin = (await captureRunIdentity(db, input)).context!;
+      const pending = await pendingSteer(input, "A");
+      const resolved = await resolveGitHubOperationCredentials(db, input);
+      expect(resolved).toMatchObject(quarantined ? { status: "unavailable", env: {} }
+        : { status: "available", login: "A", grantId: selected.id, env: { GH_TOKEN: "test-token-A" } });
+      expect((await captureRunIdentity(db, input)).context).toMatchObject({ id: origin.id, responsibleUserId: "A" });
+      expect(await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, pending.id)))
+        .toMatchObject([{ status: "pending", acceptedAt: null }]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+      expect(run.activeIdentityContextId).toBe(origin.id);
+    });
+
+    it("blocks another reservation behind a same-user pending identity without an acknowledgement", async () => {
+      const input = await seed(), selected = await grant(input, "A");
+      const origin = (await captureRunIdentity(db, input)).context!;
+      const prior = await pendingSteer(input, "A");
+      await expect(pendingSteer(input, "B")).rejects.toMatchObject({
+        status: 409, message: "A prior steering acknowledgement must be reconciled first",
+      });
+      await expect(resolveGitHubOperationCredentials(db, input)).resolves.toMatchObject({
+        status: "available", grantId: selected.id, env: { GH_TOKEN: "test-token-A" },
+      });
+      expect(await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, prior.id)))
+        .toMatchObject([{ status: "pending", acceptedAt: null }]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+      expect(run.activeIdentityContextId).toBe(origin.id);
+    });
+
+    it("keeps credentials and subsequent steering blocked for a different-user pending steer", async () => {
+      const input = await seed();
+      await grant(input, "A");
+      await grant(input, "B");
+      const pending = await pendingSteer(input, "B");
+      await expect(resolveGitHubOperationCredentials(db, input)).rejects.toMatchObject({ status: 409 });
+      await expect(pendingSteer(input, "A")).rejects.toMatchObject({ status: 409 });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+      expect(run.responsibleUserId).toBe("A");
+      expect(run.activeIdentityContextId).not.toBe(pending.id);
+    });
+
+    it("does not treat a same-user steer from company-default attribution as credential-equivalent", async () => {
+      const input = await seed();
+      await grant(input, "A");
+      await db.update(runIdentityContexts).set({ cause: "company_default" }).where(eq(runIdentityContexts.runId, input.runId));
+      await pendingSteer(input, "A");
+      await expect(resolveGitHubOperationCredentials(db, input)).rejects.toMatchObject({ status: 409 });
+      await expect(pendingSteer(input, "A")).rejects.toMatchObject({ status: 409 });
+    });
+
     async function sharedApp(input: Awaited<ReturnType<typeof seed>>, repositories: string, createdAt = new Date("2026-01-01")) {
       const selected = await grant(input, "App", true);
       vault.installations.set(selected.connectionId, { account: { login: repositories.trim().split("/")[0] }, repository_selection: "all" });

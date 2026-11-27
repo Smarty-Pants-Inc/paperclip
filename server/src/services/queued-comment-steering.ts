@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { reconcileSteeredIdentity, storedSteeringAcknowledgement, type RunIdentityContext } from "./run-identity.js";
+import { reconcileSteeredIdentity, recordSteeredIdentityTarget, storedSteeringAcknowledgement, type RunIdentityContext } from "./run-identity.js";
 import { NativeSessionSteeringError, steerNativeSession } from "./native-runtime/native-session-executor.js";
 
 export function steeringDeliveryIsUncertain(error: unknown, attempted: boolean): boolean {
@@ -19,6 +19,7 @@ export async function deliverSteeredMessage(db: Db, input: {
     companyId: input.companyId, runId: input.runId, messageId: input.messageId,
   }) ?? await steerNativeSession({
     runId: input.runId, correlationId: input.messageId, message: input.message,
+    onDispatch: input.identity ? turnId => recordSteeredIdentityTarget(db, input.identity!, turnId) : undefined,
     onAcknowledged: input.onAcknowledged ?? (input.identity ? () => reconcileSteeredIdentity(db, input.identity!) : undefined),
   });
 }

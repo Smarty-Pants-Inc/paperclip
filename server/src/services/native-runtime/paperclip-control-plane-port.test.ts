@@ -1,4 +1,6 @@
 import { issueService } from "../issues.js";
+import { captureRunIdentity, initializeRunIdentity, recordSteeredIdentityTarget, reserveSteeredIdentity } from "../run-identity.js";
+import * as runIdentity from "../run-identity.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
 import { prepareHeartbeatSession, type HeartbeatSessionPreparationInput } from "../heartbeat/session-preparation.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -9,7 +11,8 @@ import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external
 import { plugins } from "@paperclipai/db";
 import { readTaskPanelActivations } from "../plugin-task-panels.js";
 import { startServerMetrics, stopServerMetrics } from "../server-metrics.js";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
+import * as nativeSteering from "./native-session-executor.js";
 import { and, asc, eq, sql } from "drizzle-orm";
 import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -43,6 +46,7 @@ import {
   nativeRunResults,
   routineRuns,
   routines,
+  runIdentityContexts,
   statusDecisionEffects,
   statusDecisions,
   userCompanyPreferences,
@@ -727,6 +731,163 @@ describe("PaperclipControlPlanePort conformance", () => {
     const result = { result: CONTROL_PLANE_CONFORMANCE_RESULT, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL };
     return { identity, runnerId, binding, port, event, snapshot, result };
   }
+
+  async function waitForIdentityStatus(id: string, status: "pending" | "accepted" | "rejected") {
+    await vi.waitFor(async () => {
+      expect(await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, id)))
+        .toMatchObject([{ status }]);
+    }, { timeout: 2_000 });
+  }
+
+  async function pendingTerminalIdentity() {
+    const f = await terminalObserverFixture(), input = f.identity;
+    const origin = await initializeRunIdentity(db, { ...input, responsibleUserId: "A", cause: "instruction" });
+    const [message] = await db.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
+      authorUserId: "B", body: "Keep queued until delivery is known" }).returning();
+    const pending = await reserveSteeredIdentity(db, { ...input, messageId: message.id });
+    await recordSteeredIdentityTarget(db, pending!, f.event.turnId!);
+    return { ...f, origin, pending: pending! };
+  }
+
+  it("returns a terminal append normally when background identity reconciliation throws", async () => {
+    const f = await pendingTerminalIdentity();
+    const failure = new Error("entered-input history unavailable");
+    const reconcile = vi.spyOn(runIdentity, "reconcileSteeredIdentitiesAfterTurn");
+    const history = vi.spyOn(nativeSteering, "readNativeSessionUserInputIds").mockRejectedValue(failure);
+    onTestFinished(() => { history.mockRestore(); reconcile.mockRestore(); });
+
+    await expect(f.port.appendEvent(f.event)).resolves.toMatchObject({ disposition: "committed" });
+    await vi.waitFor(() => expect(history).toHaveBeenCalledOnce());
+    await expect(reconcile.mock.results[0]!.value).rejects.toBe(failure);
+    await waitForIdentityStatus(f.pending.id, "pending");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.identity.runId));
+    expect(run.activeIdentityContextId).toBe(f.origin.id);
+  });
+
+  it("bounds a never-resolving terminal identity read to five seconds without delaying appendEvent", async () => {
+    const f = await pendingTerminalIdentity();
+    const reconcile = vi.spyOn(runIdentity, "reconcileSteeredIdentitiesAfterTurn");
+    let readStartedAt = 0;
+    const history = vi.spyOn(nativeSteering, "readNativeSessionUserInputIds").mockImplementation(() => {
+      readStartedAt = Date.now();
+      return new Promise<string[] | null>(() => {});
+    });
+    onTestFinished(() => { history.mockRestore(); reconcile.mockRestore(); });
+
+    const appendStartedAt = Date.now();
+    await expect(f.port.appendEvent(f.event)).resolves.toMatchObject({ disposition: "committed" });
+    expect(Date.now() - appendStartedAt).toBeLessThan(1_000);
+    await vi.waitFor(() => expect(history).toHaveBeenCalledOnce());
+    await waitForIdentityStatus(f.pending.id, "pending");
+    await expect(reconcile.mock.results[0]!.value).resolves.toBeUndefined();
+    expect(Date.now() - readStartedAt).toBeGreaterThanOrEqual(4_900);
+    expect(Date.now() - readStartedAt).toBeLessThan(6_000);
+    await waitForIdentityStatus(f.pending.id, "pending");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.identity.runId));
+    expect(run.activeIdentityContextId).toBe(f.origin.id);
+  }, 10_000);
+
+  it.each((["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"] as const)
+    .flatMap(eventType => (["person", "agent"] as const).map(author => ({ eventType, author }))))(
+    "settles an uncertain pending identity on $eventType ($author) without consuming queued input", async ({ eventType, author }) => {
+      const f = await terminalObserverFixture();
+      const input = f.identity;
+      const origin = await initializeRunIdentity(db, { ...input, responsibleUserId: "A", cause: "instruction" });
+      const [message] = await db.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
+        ...(author === "agent" ? { authorType: "agent", authorAgentId: input.agentId } : { authorUserId: "B" }),
+        body: "Still queued for the next turn" }).returning();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: input.companyId, agentId: input.agentId,
+        source: "on_demand", status: "deferred_issue_execution", payload: { issueId: input.issueId, wakeCommentId: message.id } }).returning();
+      const pending = await reserveSteeredIdentity(db, { ...input, messageId: message.id });
+      await recordSteeredIdentityTarget(db, pending!, f.event.turnId!);
+      const history = vi.spyOn(nativeSteering, "readNativeSessionUserInputIds").mockResolvedValue([]);
+      onTestFinished(() => history.mockRestore());
+      expect(pending?.responsibleUserId).toBe(author === "agent" ? "A" : "B");
+      if (author === "person") await expect(captureRunIdentity(db, input)).rejects.toMatchObject({ status: 409 });
+      await f.port.appendEvent({ ...f.event, eventType, payload: { status: eventType.slice(5) } });
+      await waitForIdentityStatus(pending!.id, "rejected");
+      expect((await captureRunIdentity(db, input)).context?.id).toBe(origin.id);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))
+        .toMatchObject([{ status: "deferred_issue_execution", payload: { wakeCommentId: message.id } }]);
+    },
+  );
+
+  it.each(["entered", "user-item", "unavailable"] as const)("reconciles an uncertain steer from %s input evidence at turn end", async evidence => {
+    const f = await terminalObserverFixture();
+    const input = f.identity;
+    await initializeRunIdentity(db, { ...input, responsibleUserId: "A", cause: "instruction" });
+    const [message] = await db.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
+      authorUserId: "B", body: "Uncertain delivery" }).returning();
+    const pending = await reserveSteeredIdentity(db, { ...input, messageId: message.id });
+    const history = vi.spyOn(nativeSteering, "readNativeSessionUserInputIds").mockResolvedValue(evidence === "entered" ? [message.id] : null);
+    onTestFinished(() => history.mockRestore());
+    if (evidence === "user-item") await f.port.appendEvent({ ...f.event, eventType: "item.started",
+      itemId: `${f.event.turnId}:steer:${message.id}`, payload: { kind: "userMessage" } });
+    await f.port.appendEvent({ ...f.event, sourceSeq: 2, sourceEventId: `${f.runnerId}:2` });
+    await vi.waitFor(() => expect(history).toHaveBeenCalledOnce());
+    await waitForIdentityStatus(pending!.id, evidence === "unavailable" ? "pending" : "accepted");
+    if (evidence === "unavailable") await expect(captureRunIdentity(db, input)).rejects.toMatchObject({ status: 409 });
+    else expect((await captureRunIdentity(db, input)).context?.responsibleUserId).toBe("B");
+  });
+
+  it("accepts an acknowledgement before terminal cleanup and preserves reservations after a replayed terminal", async () => {
+    const f = await terminalObserverFixture();
+    const input = f.identity;
+    await initializeRunIdentity(db, { ...input, responsibleUserId: "A", cause: "instruction" });
+    const [message, next] = await db.insert(issueComments).values(["B", "A"].map(authorUserId => ({
+      companyId: input.companyId, issueId: input.issueId, authorUserId, body: "Instruction",
+    }))).returning();
+    const pending = await reserveSteeredIdentity(db, { ...input, messageId: message.id });
+    await f.port.appendEvent({ ...f.event, eventType: "item.completed", itemId: `${f.event.turnId}:steer:${message.id}`,
+      payload: { kind: "steering_acknowledgement" } });
+    const terminal = { ...f.event, sourceSeq: 2, sourceEventId: `${f.runnerId}:2` };
+    await f.port.appendEvent(terminal);
+    expect((await captureRunIdentity(db, input)).context?.id).toBe(pending!.id);
+    const later = await reserveSteeredIdentity(db, { ...input, messageId: next.id });
+    await f.port.appendEvent(terminal);
+    expect(await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, later!.id)))
+      .toMatchObject([{ status: "pending" }]);
+    await expect(captureRunIdentity(db, input)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("does not reject input aimed at another turn when an older terminal arrives late", async () => {
+    const f = await terminalObserverFixture(), input = f.identity;
+    await initializeRunIdentity(db, { ...input, responsibleUserId: "A", cause: "instruction" });
+    const [message] = await db.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
+      authorUserId: "B", body: "New turn input" }).returning();
+    const pending = await reserveSteeredIdentity(db, { ...input, messageId: message.id });
+    await recordSteeredIdentityTarget(db, pending!, "next-turn");
+    const history = vi.spyOn(nativeSteering, "readNativeSessionUserInputIds").mockResolvedValue([]);
+    onTestFinished(() => history.mockRestore());
+    await f.port.appendEvent(f.event);
+    await expect(captureRunIdentity(db, input)).rejects.toMatchObject({ status: 409 });
+    await f.port.appendEvent({ ...f.event, turnId: "next-turn", sourceSeq: 2, sourceEventId: `${f.runnerId}:2` });
+    await waitForIdentityStatus(pending!.id, "rejected");
+    expect((await captureRunIdentity(db, input)).context?.responsibleUserId).toBe("A");
+  });
+
+  it("does not let an old terminal receipt reject a retried reservation of the same message", async () => {
+    const f = await terminalObserverFixture(), input = f.identity;
+    const origin = await initializeRunIdentity(db, { ...input, responsibleUserId: "A", cause: "instruction" });
+    const [message] = await db.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
+      authorUserId: "B", body: "Retry the same queued input" }).returning();
+    const pending = await reserveSteeredIdentity(db, { ...input, messageId: message.id });
+    await recordSteeredIdentityTarget(db, pending!, f.event.turnId!);
+    const history = vi.spyOn(nativeSteering, "readNativeSessionUserInputIds").mockResolvedValue([]);
+    onTestFinished(() => history.mockRestore());
+    await f.port.appendEvent(f.event);
+    await waitForIdentityStatus(pending!.id, "rejected");
+    const retried = await reserveSteeredIdentity(db, { ...input, messageId: message.id });
+    await recordSteeredIdentityTarget(db, retried!, "next-turn");
+    expect(retried).toMatchObject({ id: pending!.id, createdAt: pending!.createdAt, status: "pending" });
+    await f.port.appendEvent(f.event);
+    expect(await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, pending!.id)))
+      .toMatchObject([{ status: "pending" }]);
+    await expect(captureRunIdentity(db, input)).rejects.toMatchObject({ status: 409 });
+    await f.port.appendEvent({ ...f.event, sourceSeq: 2, sourceEventId: `${f.runnerId}:2`, turnId: "next-turn" });
+    await waitForIdentityStatus(pending!.id, "rejected");
+    expect((await captureRunIdentity(db, input)).context?.id).toBe(origin.id);
+  });
 
   it("masks the rest of a secret that arrives after a controller restart between deltas", async () => {
     const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
