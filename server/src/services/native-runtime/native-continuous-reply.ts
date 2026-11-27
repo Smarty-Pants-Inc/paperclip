@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, lt, lte, sql } from "drizzle-orm";
 import { agentWakeupRequests, agents, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { completedPlanProposalIds, nativeFinalReplyKey, readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
@@ -164,7 +164,7 @@ export async function publishContinuousNativeReply(input: {
     // Different items can repeat one final. Only a newly answered input earns
     // another identical comment; keep every item in the ledger for replay.
     const previous = input.event.turnId ? Object.values(replies).map(parseObject)
-      .filter(reply => reply.turnId === input.event.turnId && reply.publishedByReference !== true && typeof reply.cursor === "number")
+      .filter(reply => reply.turnId === input.event.turnId && typeof reply.cursor === "number")
       .sort((a, b) => Number(b.cursor) - Number(a.cursor))[0] : undefined;
     if (!questionCommentIds.length && previous?.normalizedText === normalizedText && typeof previous.commentId === "string") {
       await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
@@ -172,8 +172,33 @@ export async function publishContinuousNativeReply(input: {
       } } }).where(eq(heartbeatRuns.id, runId));
       return true;
     }
+    // A tool may already have published this answer. Reuse only an unclaimed
+    // comment inside this turn's first-event/final window, never an earlier answer
+    // to a different input (even if its text is identical).
+    // One read: the window's start is a subquery, so recovery reads no extra
+    // event rows (the final-message projection stays its only event read).
+    const windowStart = typeof previous?.cursor === "number"
+      ? sql`(select ${heartbeatRunEvents.createdAt} from ${heartbeatRunEvents} where ${heartbeatRunEvents.companyId} = ${companyId}
+          and ${heartbeatRunEvents.runId} = ${runId} and ${heartbeatRunEvents.seq} = ${Number(previous.cursor)} and ${heartbeatRunEvents.seq} < ${input.cursor})`
+      : sql`(select ${heartbeatRunEvents.createdAt} from ${heartbeatRunEvents} where ${heartbeatRunEvents.companyId} = ${companyId}
+          and ${heartbeatRunEvents.runId} = ${runId} and ${heartbeatRunEvents.seq} < ${input.cursor}
+          and ${heartbeatRunEvents.payload}->'prpEvent'->>'turnId' = ${input.event.turnId ?? null}
+          order by ${heartbeatRunEvents.seq} asc limit 1)`;
+    const claimedCommentIds = new Set(Object.values(replies).map(value => parseObject(value).commentId));
+    // A tool may already have published this answer. Reuse only an unclaimed
+    // comment inside this turn's first-event/final window, never an earlier answer
+    // to a different input (even if its text is identical). No start = no reuse.
+    const candidates = input.event.turnId ? await tx.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorAgentId, agentId),
+      eq(issueComments.createdByRunId, runId), isNull(issueComments.deletedAt), sql`${issueComments.createdAt} >= ${windowStart}`,
+      lte(issueComments.createdAt, sql`coalesce((select ${heartbeatRunEvents.createdAt} from ${heartbeatRunEvents}
+        where ${heartbeatRunEvents.companyId} = ${companyId} and ${heartbeatRunEvents.runId} = ${runId}
+          and ${heartbeatRunEvents.seq} = ${input.cursor}), 'infinity'::timestamptz)`),
+    )).orderBy(asc(issueComments.createdAt), asc(issueComments.id)) : [];
+    const referenced = candidates.find(comment => !claimedCommentIds.has(comment.id) &&
+      comment.body.trim().replace(/\s+/g, " ") === normalizedText);
     const authorizationReason = await resolveChatRunPresentationAuthorizationReason(tx, { companyId, issueId, runId });
-    const comment = await issueService(input.db).addComment(issueId, resolved.text, { agentId, runId }, {
+    const comment = referenced ?? await issueService(input.db).addComment(issueId, resolved.text, { agentId, runId }, {
       authorizationReason, clientRequestId,
     }, tx);
     // Only the first final owns this run's frozen completion input. Later
@@ -184,7 +209,7 @@ export async function publishContinuousNativeReply(input: {
     if (explicitAnswers && answers.length)
       await acknowledgeChatCompletionReply(tx, runId, comment.id, answers.filter((id): id is string => typeof id === "string"));
     await tx.update(heartbeatRuns).set({ resultJson: { ...result, continuousReplies: { ...replies,
-      [input.event.itemId!]: { ...receipt, commentId: comment.id },
+      [input.event.itemId!]: { ...receipt, commentId: comment.id, ...(referenced ? { publishedByReference: true } : {}) },
     } } }).where(eq(heartbeatRuns.id, runId));
     // Reply attribution and queue settlement commit together. A claim alone is
     // not consumption: before this final, failed starts still owe every answer.
@@ -224,7 +249,7 @@ export async function publishContinuousNativeReply(input: {
         }).where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, receipt.id)));
       }
     }
-    await logActivity(tx, { companyId, actorType: "agent", actorId: agentId, agentId, runId, issueId,
+    if (!referenced) await logActivity(tx, { companyId, actorType: "agent", actorId: agentId, agentId, runId, issueId,
       action: "issue.comment_added", entityType: "issue", entityId: issueId,
       details: { commentId: comment.id, bodySnippet: comment.body.slice(0, 120), identifier: issue.identifier,
         issueTitle: issue.title, authorizationReason, source: "run_presentation_resolver",
