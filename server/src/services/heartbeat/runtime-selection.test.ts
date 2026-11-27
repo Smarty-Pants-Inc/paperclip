@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
@@ -34,7 +34,7 @@ import { agentInstructionWorkingCopyService } from "../agent-instruction-working
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession, type HeartbeatSessionPreparationInput } from "./session-preparation.js";
-import { getAdapterSessionCodec } from "./run-state.js";
+import { getAdapterSessionCodec, createHeartbeatRunState } from "./run-state.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
 
@@ -320,6 +320,42 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       process.stdout.write(`RECOVERY_CREDENTIAL_SELECTION ${JSON.stringify({ shape, runId: run.id,
         retained, pin: input.session.warmRecoveryRetainSessionId, selectedSession: (await read(run.id)).nativeSessionId })}\n`);
     });
+
+  it("replacement fence v5: same-run native selection stays pinned to the older Pi session after the task session changes", async () => {
+    const f = await fixture();
+    const adapterConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+    f.input.agent = { ...f.agent, adapterConfig };
+    f.input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: f.run, enabled: true,
+      runtimeConfig: {}, adapterConfig, agent: f.input.agent, issue: f.issue, target: null, workspaceId: null });
+    const original = await selectHeartbeatRuntime(db, f.input);
+    if (!original.selected || !original.nativeExecution) throw new Error("Expected native selection");
+    const oldRun = await read(f.run.id);
+    const oldSession = original.nativeExecution.session.normalizedSessionId;
+    await db.update(heartbeatRuns).set({ status: "interrupted", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
+    const newerSession = randomUUID();
+    const [newer] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
+      issueId: f.issue.id, nativeIssueId: f.issue.id, scopeKind: "issue", runtimeMode: "native",
+      status: "succeeded", nativeSessionId: newerSession, createdAt: new Date(oldRun.createdAt.getTime() + 1) }).returning();
+    const state = createHeartbeatRunState(db);
+    await state.upsertTaskSession({ companyId: f.agent.companyId, agentId: f.agent.id, adapterType: "paperclip_runner",
+      taskKey: f.issue.id, sessionDisplayId: newerSession, sessionParamsJson: { sessionId: newerSession },
+      lastRunId: newer.id, lastError: null });
+    expect(await state.resolveSessionBeforeForWakeup(f.input.agent, f.issue.id)).toBe(newerSession);
+    // A claimed same-run recovery carries its persisted native identity. It
+    // must not silently jump sessions just because the task pointer changed.
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, f.run.id));
+    f.input.run = await read(f.run.id);
+    f.input.session = { ...f.input.session, taskResumeSessionId: newerSession,
+      persistedRunnerProfile: oldRun.runnerProfileJson ?? {}, persistedNativeExecutionInput: original.nativeExecution };
+    const resumed = await selectHeartbeatRuntime(db, f.input);
+    if (!resumed.selected || !resumed.nativeExecution) throw new Error("Expected native reselection");
+    expect(resumed.nativeExecution.session.normalizedSessionId).toBe(oldSession);
+    expect((await read(f.run.id)).nativeSessionId).toBe(oldSession);
+    if (process.env.PAPERCLIP_REPLACEMENT_ROWS) await appendFile(process.env.PAPERCLIP_REPLACEMENT_ROWS,
+      JSON.stringify({ row: expect.getState().currentTestName, runId: f.run.id, newerRunId: newer.id,
+        oldSession, newerTaskSession: newerSession, selectedSession: resumed.nativeExecution.session.normalizedSessionId,
+        sameRunPinnedIdentityPreserved: true }) + "\n");
+  });
 
   it("rejects invalid local Runner configuration before native authority and retains the preparation owner", async () => {
     const f = await fixture();

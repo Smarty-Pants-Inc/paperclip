@@ -16,7 +16,7 @@ import { recordAgentProviderRateLimits } from "../agent-provider-rate-limits.js"
 import { nativePostResultFailureCategory, type NativePostResultFailureCategory } from "./native-post-result-failure.js";
 import { logger } from "../../middleware/logger.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
-import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
+import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, readNativeProviderEventCursors, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
@@ -992,6 +992,23 @@ const pluginTaskSessionOwners = new WeakMap<NativeSession, ReturnType<typeof cre
 // Closing a remote owner saves its checkpoint asynchronously. A new turn must
 // not inspect or quarantine that owner's state until the save has finished.
 const closingWarmNativeSessions = new Map<string, Promise<void>>();
+const warmNativePreservationDeadlines = new WeakMap<Promise<void>, number>();
+function registerWarmNativeSessionClosing(scope: string, closing: Promise<void>): Promise<void> {
+  const deadline = Date.now() + warmSessionPreservationWait.timeoutMs;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bounded = Promise.race([closing, new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("native_session_preservation_wait_expired")),
+      Math.max(0, deadline - Date.now()));
+  })]).finally(() => {
+    clearTimeout(timer);
+    if (closingWarmNativeSessions.get(scope) === bounded) closingWarmNativeSessions.delete(scope);
+  });
+  warmNativePreservationDeadlines.set(bounded, deadline);
+  closingWarmNativeSessions.set(scope, bounded);
+  // Idle timers have no awaiting initiator. Admission still sees the rejection.
+  void bounded.catch(() => undefined);
+  return bounded;
+}
 
 export async function forgetDestroyedWarmNativeSessions(lease: { companyId: string; environmentId: string | null; providerLeaseId: string | null }) {
   for (const [scope, entry] of warmNativeSessions) {
@@ -1037,6 +1054,30 @@ subscribeRunStartHandoverChanges(() => {
  * before.
  */
 export const warmSessionReleaseWait = { timeoutMs: 30_000, pollMs: 25 };
+// Preservation is preparation, not a provider turn or 60-second finalization.
+// Join only an admitted save, with the same five-minute allowance as sync-out;
+// an actually active owner retains the ordinary short release/busy semantics.
+export const warmSessionPreservationWait = { timeoutMs: 300_000 };
+
+async function waitForWarmNativeSessionPreservation(scope: string): Promise<boolean> {
+  const closing = closingWarmNativeSessions.get(scope);
+  if (!closing) return false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      closing,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("native_session_preservation_wait_expired")),
+          Math.max(0, (warmNativePreservationDeadlines.get(closing) ?? Date.now()) - Date.now()));
+      }),
+    ]);
+    return true;
+  } catch (error) {
+    // Transport/close errors must not escape as unnamed admission failures.
+    if (error instanceof Error && error.message === "native_session_preservation_wait_expired") throw error;
+    throw new Error("native_session_preservation_failed", { cause: error });
+  } finally { clearTimeout(timer); }
+}
 
 async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
   const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
@@ -1046,13 +1087,9 @@ async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
   while (settlingNativeSessionScopes.has(scope) && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
   }
-  const closing = closingWarmNativeSessions.get(scope);
-  if (!closing) return;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([
-    closing.catch(() => undefined),
-    new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - Date.now())); }),
-  ]).finally(() => clearTimeout(timer));
+  // A retirement save is not a stuck active turn. Do not consume its budget
+  // with the short post-turn release allowance (or return into a busy owner).
+  await waitForWarmNativeSessionPreservation(scope);
 }
 
 /** Reserve the existing physical copy before heartbeat composes AGENT_HOME and
@@ -1137,6 +1174,8 @@ export async function reserveWarmNativeInstructionDirectory(input: {
 }): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
+    await waitForWarmNativeSessionPreservation(id);
+    if (warmNativeSessions.get(id) !== entry) continue;
     if (forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
@@ -1186,8 +1225,16 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   reason: string;
   forceStopUnsettled?: boolean;
   db?: Db;
+  conversations?: { companyId: string; agentId: string; issueId: string | null; normalizedSessionId: string }[];
 }): Promise<WarmNativeSessionCloseResult> {
   return closeIdleWarmNativeSessions(input);
+}
+
+/** A failed retirement fences native reuse (see the warm admission check).
+ * Keeping its allocation is safe; promising this run can reuse its owner isn't. */
+export function warmNativeRetirementPending(input: { environmentId: string; providerLeaseId: string }): boolean {
+  return [...warmNativeSessions.values()].some(entry => entry.environmentId === input.environmentId
+    && entry.providerLeaseId === input.providerLeaseId && entry.closeOnReleaseReason !== undefined);
 }
 
 async function warmSandboxTerminated(db: Db, entry: WarmNativeSession): Promise<boolean> {
@@ -1350,6 +1397,7 @@ async function closeIdleWarmNativeSessions(input: {
   canRetire?: () => boolean;
   forceStopUnsettled?: boolean;
   db?: Db;
+  conversations?: { companyId: string; agentId: string; issueId: string | null; normalizedSessionId: string }[];
 }): Promise<WarmNativeSessionCloseResult> {
   let closed = 0;
   let busy = 0;
@@ -1358,6 +1406,19 @@ async function closeIdleWarmNativeSessions(input: {
   const retryIdleCloseAfterSweep: [string, WarmNativeSession][] = [];
   let stopped = false;
   const closeEntry = async (sessionId: string, entry: WarmNativeSession) => {
+    // A second preservation barrier joins the exact in-flight close instead
+    // of reporting supervisor contention or starting another export.
+    if (closingWarmNativeSessions.has(sessionId)) {
+      try {
+        await waitForWarmNativeSessionPreservation(sessionId);
+        if (warmNativeSessions.get(sessionId) !== entry) { closed += 1; return; }
+      } catch (error) {
+        failed += 1;
+        failures.push({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+          providerLeaseId: entry.providerLeaseId ?? null, reason: `close failed: ${describeWarmCloseFailure(error)}` });
+        return;
+      }
+    }
     if (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(sessionId)
       || (input.canRetire && (entry.instructionPreparationRunId || closingWarmNativeSessions.has(sessionId)))) {
       // A busy turn can complete while another idle session is checkpointing.
@@ -1376,16 +1437,21 @@ async function closeIdleWarmNativeSessions(input: {
     entry.busy = true;
     if (!detach) entry.closeOnReleaseReason = input.reason;
     let forcedStopFailure: unknown;
-    const closing = Promise.resolve().then(() =>
+    let closeSettled = false;
+    const rawClosing = Promise.resolve().then(() =>
       detach ? detachReleasedWarmNativeSession(entry) : closeWarmNativeSession(entry, input.reason, input.forceStopUnsettled ? {
         discardUnsettledSession: true,
         onForcedStopFailed: error => { forcedStopFailure = error; },
       } : undefined),
-    );
-    closingWarmNativeSessions.set(sessionId, closing);
+    ).then(() => { forgetWarmNativeSession(sessionId, entry); });
+    // A deadline bounds the initiating run as well as joiners. The actual close
+    // cannot be cancelled here: keep its owner busy/fenced until it settles,
+    // rather than admitting a second export over the same remote stream.
+    void rawClosing.then(() => { closeSettled = true; entry.busy = false; },
+      () => { closeSettled = true; entry.busy = false; });
+    const closing = registerWarmNativeSessionClosing(sessionId, rawClosing);
     try {
       await closing;
-      forgetWarmNativeSession(sessionId, entry);
       closed += 1;
     } catch (error) {
       if (detach) entry.closeOnReleaseReason = "released Runner local detach is unconfirmed";
@@ -1393,7 +1459,7 @@ async function closeIdleWarmNativeSessions(input: {
         busy += 1;
         return;
       }
-      if (!detach && await warmCloseFailureProvesOwnerGone(entry, error, input.db ?? entry.sandboxLeaseDb)) {
+      if (closeSettled && !detach && await warmCloseFailureProvesOwnerGone(entry, error, input.db ?? entry.sandboxLeaseDb)) {
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason: input.reason, closeFailure: describeWarmCloseFailure(error) },
         "warm native session's Runner or sandbox is gone; released its owner");
@@ -1408,7 +1474,7 @@ async function closeIdleWarmNativeSessions(input: {
         providerLeaseId: entry.providerLeaseId ?? null,
         reason: `${detach ? "released Runner detach failed" : "close failed"}: ${describeWarmCloseFailure(error)}${forced}` });
     } finally {
-      entry.busy = false;
+      if (closeSettled) entry.busy = false;
       if (closingWarmNativeSessions.get(sessionId) === closing) {
         closingWarmNativeSessions.delete(sessionId);
       }
@@ -1423,6 +1489,9 @@ async function closeIdleWarmNativeSessions(input: {
   for (const [sessionId, entry] of owners) {
     if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) continue;
     if (input.providerLeaseId !== undefined && entry.providerLeaseId !== input.providerLeaseId) continue;
+    if (input.conversations && !input.conversations.some(conversation => conversation.companyId === entry.companyId
+      && conversation.agentId === entry.agentId && conversation.issueId === entry.issueId
+      && conversation.normalizedSessionId === entry.normalizedSessionId)) continue;
     const agentKey = `${entry.companyId}:${entry.agentId}`;
     const queue = agentQueues.get(agentKey);
     if (queue) queue.push([sessionId, entry]); else agentQueues.set(agentKey, [[sessionId, entry]]);
@@ -8098,6 +8167,7 @@ export interface NativeHarnessBackupManifest {
     bytes: number;
   }>;
   completedAt: string;
+  providerEventCursors?: Array<{ runId: string; seq: number }>;
   providerArtifacts?: NativeProviderArtifactReceipt;
 }
 
@@ -8676,6 +8746,7 @@ type NativeHarnessBackupManifestInput = {
   providerSessionIdentity: unknown;
   sourceProviderLeaseId: string;
   completedAt?: string;
+  providerEventCursors?: Array<{ runId: string; seq: number }>;
 };
 
 export function buildNativeHarnessBackupManifest(input: NativeHarnessBackupManifestInput): NativeHarnessBackupManifest {
@@ -8727,6 +8798,7 @@ function nativeHarnessBackupManifest(
     runnerContractVersion: RUNNERD_BINARY_CONTRACT_VERSION,
     directories,
     completedAt: input.completedAt ?? new Date().toISOString(),
+    ...(input.providerEventCursors ? { providerEventCursors: input.providerEventCursors } : {}),
   };
 }
 
@@ -9171,7 +9243,7 @@ function armWarmNativeSessionIdleTimer(
         releaseIdleSessionToolAuthority(sessionId);
       });
     // Admission waits for this checkpoint like a restart sweep's close.
-    closingWarmNativeSessions.set(sessionId, closing);
+    registerWarmNativeSessionClosing(sessionId, closing);
   }, idleTimeoutMs);
   entry.idleTimer.unref();
 }
@@ -11017,6 +11089,9 @@ export async function executePaperclipNativeSession(input: {
   const physicalIngressKey = physicalIngress ? nativeWarmIngressAllocation(physicalIngress) : undefined;
   let ownsPhysicalIngress = false;
   try {
+    // Before native claim/startup and finalization deadlines: the old owner's
+    // suspended checkpoint must finish before this run reads its controller.
+    await waitForWarmNativeSessionPreservation(nativeSessionScopeKey(input.execution));
     if (physicalIngressKey) {
       const retained = warmNativeSessions.get(nativeSessionScopeKey(input.execution));
       if (retained && retained.issueId !== input.execution.binding.issueId) throw new Error("native_session_supervisor_busy");
@@ -11056,7 +11131,7 @@ export async function executePaperclipNativeSession(input: {
     // The shutdown sweep can have removed an idle owner while its remote
     // checkpoint is still being saved. The scope reservation also prevents
     // a later sweep from closing an owner this turn is about to acquire.
-    await closingWarmNativeSessions.get(sessionScopeId);
+    await waitForWarmNativeSessionPreservation(sessionScopeId);
 
     if (input.execution.schema === "paperclip.native-execution-input.v6" || input.execution.schema === "paperclip.native-execution-input.v8") {
       return await executePaperclipNativeSessionWithinScope(input, undefined, false, ownDiagnosticLease);
@@ -19197,6 +19272,12 @@ async function createRunnerdBackendWithinSessionClaim(
                 return verified.providerSessionIdentity;
               };
               try {
+                // Only this binding's provider turn is known settled. Snapshot
+                // other runs before copying, so work they deliver during the
+                // copy cannot be advertised as covered by these older bytes.
+                const otherRunCursors = await readNativeProviderEventCursors(input.db,
+                  input.execution.binding.companyId, nativeSessionKey(input.execution),
+                  { excludeRunId: input.execution.binding.runId });
                 const providerSessionIdentity = await retryTransientRemoteCheckpointRead(
                   captureSettledState,
                   (attempt, attempts) => input.onLog?.(
@@ -19215,6 +19296,11 @@ async function createRunnerdBackendWithinSessionClaim(
                     input.durableEnvironmentLeaseId ??
                     "unknown",
                 });
+                // Late delivery is safe only for the settled binding's turn;
+                // do not extend other runs' coverage past the pre-copy census.
+                manifest.providerEventCursors = [...otherRunCursors, ...await readNativeProviderEventCursors(input.db,
+                  input.execution.binding.companyId, nativeSessionKey(input.execution),
+                  { runId: input.execution.binding.runId })];
                 if (providerArtifacts) manifest.providerArtifacts = providerArtifacts;
                 backupSpanAttributes.bytesTransferred =
                   manifest.directories.reduce(
