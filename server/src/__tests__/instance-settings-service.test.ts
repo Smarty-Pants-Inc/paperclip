@@ -120,6 +120,7 @@ describe("instance settings service", () => {
       enableEnvironments: true,
       enableNativeRunner: false,
       remoteWorkspaceStorageEnabled: true,
+      autoFreshSessionOnRecovery: false,
       enableAiConnectionRouters: false,
       enableManagedSandboxOnly: false,
       enableIsolatedWorkspaces: true,

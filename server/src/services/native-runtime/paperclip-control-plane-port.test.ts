@@ -1,5 +1,9 @@
 import { issueService } from "../issues.js";
 import { nativeResponsePresentationWork } from "./native-response-presentation-work.js";
+import { prepareHeartbeatSession, type HeartbeatSessionPreparationInput } from "../heartbeat/session-preparation.js";
+import { instanceSettingsService } from "../instance-settings.js";
+import { getAdapterSessionCodec } from "../heartbeat/run-state.js";
+import { attachPaperclipSessionMetadataToSessionParams } from "../heartbeat/workspaces.js";
 import * as issueCommentWrites from "../issue-comment-writes.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { plugins } from "@paperclipai/db";
@@ -16,6 +20,7 @@ import { ONBOARDING_FIRST_TASK_ORIGIN_KIND } from "@paperclipai/shared";
 import { readCompletedAssistantMessageCandidate, resolveHeartbeatRunResponse, selectHeartbeatRunFinalAgentMessage } from "../heartbeat-run-summary.js";
 import {
   activityLog,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   assets,
@@ -123,6 +128,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       temporary = await startRecoveryPostgres("paperclip-native-port-");
       db = createDb(temporary.connectionString);
     }
+    await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: true });
     const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     await db.insert(companies).values({ id: identity.companyId, name: "Phase 6", issuePrefix: "P6C" });
     await db.insert(agents).values({
@@ -327,6 +333,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       await db.delete(issueWorkProducts);
       await db.delete(issueRelations);
       await db.delete(heartbeatRunEvents);
+      await db.delete(agentTaskSessions);
       await db.delete(heartbeatRuns);
       await db.delete(completionContracts);
       await db.delete(routineRuns);
@@ -472,7 +479,9 @@ describe("PaperclipControlPlanePort conformance", () => {
     } finally { releaseObserver(); await outcome; if (terminalWasRecorded) await observerDone; }
   });
 
-  it.each(["no wake", "wake", "clamp"] as const)("marks a fresh start after a prior session once, but never a resume: %s", async mode => {
+  it.each((["no wake", "wake", "clamp"] as const).flatMap(mode =>
+    [false, true].map(taskRecovery => ({ mode, taskRecovery }))))(
+    "marks a fresh start after a prior session once, but never a resume: $mode (automatic task recovery=$taskRecovery)", async ({ mode, taskRecovery }) => {
     const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const issueId = randomUUID(), fixtureContractId = randomUUID();
     const firstRunAt = new Date("2026-01-01T00:00:00.000Z");
@@ -481,10 +490,14 @@ describe("PaperclipControlPlanePort conformance", () => {
     const markers = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
       sql`${issueComments.presentation}->>'kind' = 'system_notice'`));
     await db.insert(issues).values({ id: issueId, companyId, title: "Fresh-session disclosure",
-      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active" });
+      assigneeAgentId: agentId, ...(!taskRecovery ? {
+        conversationAgentId: agentId, conversationUserId: randomUUID(), conversationState: "active",
+      } : {}) });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.id, contractId));
     await db.insert(completionContracts).values({ ...contract!, id: fixtureContractId, issueId });
     let replayFirst: () => Promise<unknown> = async () => {};
+    let previousSessionId: string | null = null;
+    let recoveryInput: HeartbeatSessionPreparationInput | undefined;
     for (const [index, eventType] of (["session.started", "session.started", "session.resumed", "session.started"] as const).entries()) {
       const runId = randomUUID(), sessionId = randomUUID(), runnerId = randomUUID();
       const identity = { companyId, agentId, issueId, runId, sessionId };
@@ -498,7 +511,35 @@ describe("PaperclipControlPlanePort conformance", () => {
       const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
         nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runnerId,
         completionContractId: fixtureContractId, completionContractSha256: contractSha, createdAt: runAt,
-        contextSnapshot: { issueId, conversationSessionGeneration: 0, ...(wakeCommentId ? { wakeCommentId } : {}) } }).returning();
+        contextSnapshot: { issueId, conversationSessionGeneration: 0, ...(wakeCommentId ? { wakeCommentId } : {}),
+          ...(taskRecovery && index === 3 ? { explicitFreshSession: true } : {}) } }).returning();
+      if (taskRecovery && index === 1) {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+        const runtimeConfig = { provider: "pi_rpc", model: "fixture/model", sessionContinuity: "continuous" };
+        const context = { issueId, forceFreshSession: true, source: "execution.reconciled", conversationSessionGeneration: 0 };
+        recoveryInput = {
+          run, agent: { ...agent, adapterType: "paperclip_runner", adapterConfig: runtimeConfig },
+          task: { context, issueRef: { id: issueId }, issueContext: null, taskProjectContext: null, workspaceProjectContext: null,
+            wakeCommentId: null, acceptedPlanContinuationWake: false, acceptedPlanWakeRoutingDecision: null },
+          session: { taskSession: null, taskSessionDecodedParams: { sessionId: previousSessionId }, explicitResumeSessionParams: null,
+            explicitResumeSessionDisplayId: null, sessionCodec: getAdapterSessionCodec("paperclip_runner") },
+          config: { runtimeConfig, agentIdentity: undefined, issueAssigneeOverrides: null, originalAiIssueOverrides: null,
+            managedAiRuntime: undefined, aiBinding: undefined, requestedAiBinding: undefined, secretManifest: [],
+            runtimeSkillEntries: [], routineEnvContext: { env: null } },
+          workspace: { requestedExecutionWorkspaceMode: "shared_workspace", effectiveExecutionWorkspaceMode: "shared_workspace",
+            projectExecutionWorkspacePolicy: null, issueExecutionWorkspaceSettings: null, executionPolicy: {} as never,
+            requestedReusableExecutionWorkspaceConfig: null, reusableExistingExecutionWorkspace: null },
+          environment: { environmentResolution: { environmentId: null, source: "default" }, selectedEnvironmentId: null,
+            selectedEnvironmentForConfig: null },
+          getLatestAgentConfigRevision: async () => ({ id: agent.id, changedKeys: [], createdAt: run.createdAt }),
+        };
+        const prepared = await prepareHeartbeatSession(db, recoveryInput);
+        expect(prepared.resetTaskSession).toBe(true);
+        expect(prepared.taskResumeSessionId).toBeNull();
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].contextSnapshot)
+          .toMatchObject({ warmRecoveryFreshSession: { runId } });
+      }
       const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: fixtureContractId,
         completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: "marker-control" });
       await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
@@ -511,21 +552,83 @@ describe("PaperclipControlPlanePort conformance", () => {
         finally { markerWrite.mockRestore(); }
         expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(1);
       } else await port.appendEvent(event);
+      // CHPORT: consume the REAL port-written session.started receipt, not a
+      // hand-shaped DB event. The explicit fresh request starts S2 after the
+      // automatic S1 incident, and preparation must anchor its next incident on S2.
+      if (taskRecovery && index === 3) {
+        expect(recoveryInput).toBeDefined();
+        const baseline = await prepareHeartbeatSession(db, { ...recoveryInput!,
+          task: { ...recoveryInput!.task, context: {} } });
+        const [boundary] = await db.update(heartbeatRuns).set({ status: "failed", error: "ordinary provider failure" })
+          .where(eq(heartbeatRuns.id, runId)).returning();
+        const [current] = await db.insert(heartbeatRuns).values({ companyId, agentId, nativeIssueId: issueId,
+          status: "queued", createdAt: new Date(boundary.createdAt.getTime() + 1), contextSnapshot: { issueId },
+        }).returning();
+        // C34A8-PORT: S2 really started, but publication still points at S1.
+        const [incident] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, recoveryInput!.run.id));
+        const s1 = incident.nativeSessionId!;
+        const [lagging] = await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: issueId,
+          lastRunId: recoveryInput!.run.id, sessionDisplayId: s1,
+          sessionParamsJson: attachPaperclipSessionMetadataToSessionParams({ sessionId: s1 }, baseline.configuredModel, baseline.sessionConfigMetadata),
+        }).returning();
+        const nextInput = { ...recoveryInput!, run: current,
+          task: { ...recoveryInput!.task, context: { forceFreshSession: true, source: "execution.reconciled" } },
+          session: { ...recoveryInput!.session, taskSession: lagging, taskSessionDecodedParams: { sessionId: s1 } },
+        };
+        await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: false });
+        const ordinary = await prepareHeartbeatSession(db, nextInput);
+        await instanceSettingsService(db).updateExperimental({ autoFreshSessionOnRecovery: true });
+        process.stdout.write(`C34A8-PORT ${JSON.stringify({ s1, s2: sessionId, boundaryRunId: runId,
+          nextRunId: current.id, resumes: ordinary.taskResumeSessionId, pin: ordinary.warmRecoveryRetainSessionId,
+          reset: ordinary.resetTaskSession })}\n`);
+        expect(ordinary.resetTaskSession).toBe(false);
+        expect(ordinary.warmRecoveryRetainSessionId).toBeNull();
+        expect(ordinary.taskResumeSessionId).toBe(sessionId);
+        // Preserve CHPORT's existing refusal/new-incident check too.
+        await db.update(heartbeatRuns).set({ error: "remote_warm_session_not_idle" }).where(eq(heartbeatRuns.id, runId));
+        const next = await prepareHeartbeatSession(db, nextInput);
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, current.id));
+        expect(next.resetTaskSession).toBe(true);
+        expect(next.warmRecoveryRetainSessionId).toBeNull();
+        expect(saved.contextSnapshot).toMatchObject({ warmRecoveryFreshSession: { runId: current.id, retainedSessionId: sessionId } });
+        const [receipt] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        expect(receipt.payload).toMatchObject({ prpEvent: { normalizedSessionId: sessionId } });
+        process.stdout.write(`CHPORT ${JSON.stringify({ boundaryRunId: runId, sessionId, eventType: receipt.eventType,
+          nextRunId: current.id, nextIncident: saved.contextSnapshot?.warmRecoveryFreshSession })}\n`);
+      }
       if (index === 0) {
         replayFirst = () => port.appendEvent(event);
+        previousSessionId = sessionId;
         await db.insert(issueComments).values({ companyId, issueId, body: "Previous session reply", authorType: "agent",
           authorAgentId: agentId, createdByRunId: runId, createdAt: previousReplyAt });
+        if (taskRecovery) await db.update(heartbeatRuns).set({ status: "failed", error: "remote_warm_session_not_idle" })
+          .where(eq(heartbeatRuns.id, runId));
       }
       const comments = await markers();
       expect(comments).toHaveLength(index === 0 ? 0 : 1);
       if (index === 1) {
         expect(comments[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null,
+          body: "New session · Earlier messages and files are still available.",
           createdByRunId: null, conversationSessionGeneration: 0, metadata: { sourceRunId: runId },
           presentation: { kind: "system_notice", tone: "neutral" } });
         // Marker time orders the input, not the later session.started receipt.
         const expectedAt = mode === "no wake" ? run!.createdAt
           : new Date(Math.max(wakeAt.getTime() - 1, previousReplyAt.getTime() + 1));
         expect(comments[0]!.createdAt).toEqual(expectedAt);
+        const [receipt] = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        const [startedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        if (taskRecovery) {
+          expect(startedRun.contextSnapshot).toMatchObject({ warmRecoveryFreshSession: { runId } });
+          expect(receipt).toMatchObject({ runId, eventType: "session.started" });
+          expect(comments[0]!.metadata).toMatchObject({ sourceRunId: receipt!.runId });
+          process.stdout.write(`RECOVERY_RESET_START_MARKER ${JSON.stringify({ runId,
+            reset: startedRun.contextSnapshot?.warmRecoveryFreshSession, sessionId: startedRun.nativeSessionId,
+            event: { runId: receipt!.runId, eventType: receipt!.eventType },
+            comment: { id: comments[0]!.id, body: comments[0]!.body, metadata: comments[0]!.metadata } })}\n`);
+        }
+        // Without a wake, preserve the original recovery marker's run-creation assertion.
+        if (mode === "no wake") expect(comments[0]!.createdAt).toEqual(startedRun.createdAt);
+        expect(comments[0]!.createdAt.getTime()).toBeLessThanOrEqual(receipt!.createdAt.getTime());
         await db.update(issueComments).set({ deletedAt: new Date(runAt.getTime() + 10_000) }).where(eq(issueComments.id, comments[0]!.id));
         await port.appendEvent(event);
         await port.appendEvent({ ...event, sourceEventId: `${runnerId}:2`, sourceSeq: 2 });
@@ -541,7 +644,7 @@ describe("PaperclipControlPlanePort conformance", () => {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue).toMatchObject({ conversationSessionGeneration: 0, conversationBoundaryCommentId: null });
     expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`))).toHaveLength(0);
-  });
+  }, 30_000);
 
   it.each(["single", "batch", "clamp", "no wake", "foreign wake"] as const)("orders the fresh-session marker against its first input: %s", async mode => {
     const { companyId, agentId } = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
