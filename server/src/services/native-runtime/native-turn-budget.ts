@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
-import { continuationResultIdentityKeys } from "../execution-continuation-identity.js";
+import { continuationResultHasError, continuationResultIdentityKeys } from "../execution-continuation-identity.js";
 import type { DurablePrpControlPlane, NativeSession } from "../../vendor/paperclip-runner/index.js";
 
 // One split, in encoded UTF-8 journal-command bytes (not prompt characters).
@@ -260,23 +260,24 @@ export function boundNativeExecutionContinuation(
     if (result.resultOmittedForSize === true) continue;
     // Failed/unknown writes are evidence, not successful save receipts. Keep
     // their errors, outcome and retry guidance whole, even under size pressure.
-    if (write && (result.ok !== true || result.status !== undefined
-      && !(typeof result.status === "number" && result.status >= 200 && result.status < 300)
-      || result.outcome === "unknown" || result.error)) continue;
+    if (write && (result.ok !== true
+      || !(typeof result.status === "number" && result.status >= 200 && result.status < 300)
+      || result.status === 207 || result.outcome === "unknown" || continuationResultHasError(result))) continue;
     if (write && Array.isArray(result.data) && (result.data.length > 20 || result.data.length === 0)) continue;
     const topIdentity = write ? identity(result) : {};
     const dataIdentity = write ? (Array.isArray(result.data) ? result.data.map(resourceIdentity) : resourceIdentity(result.data)) : {};
-    const hasResourceIdentity = (value: Record<string, unknown>) => findable(value) || Object.values(value).some(child => findable(record(child)));
+    // A nested record's id does not locate the resource this write saved.
+    const hasResourceIdentity = (value: Record<string, unknown>) => locator(value.id);
     // Every bulk target must remain findable. In particular, never hide the
     // targets after the 20-element cap behind a misleading re-read note.
     if (write && Array.isArray(dataIdentity) && !dataIdentity.every(hasResourceIdentity)) continue;
     const artifact = record(result.artifact);
-    if (write && !findable(topIdentity) && !(Array.isArray(dataIdentity)
+    if (write && !locator(topIdentity.id) && !(Array.isArray(dataIdentity)
       ? dataIdentity.length > 0 : hasResourceIdentity(dataIdentity))
       && !locator(artifact.artifactId) && !locator(artifact.url)) continue;
     const shortened = { ...pick(result, ["operationId", "ok", "status", "kind", "target"]), ...topIdentity,
       ...(Object.keys(dataIdentity).length ? { data: dataIdentity } : {}),
-      ...(write && result.artifact !== undefined ? { artifact: result.artifact } : {}),
+      ...(write && result.artifact !== undefined ? { artifact: result.artifact, ...pick(result, ["guidance"]) } : {}),
       resultOmittedForSize: true, note: write
         ? "Result omitted for size; the write succeeded. Re-read the target by its id if needed."
         : "Result omitted for size; re-read if needed.",
