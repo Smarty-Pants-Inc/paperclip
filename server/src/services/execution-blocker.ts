@@ -468,9 +468,27 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   const nativeMessageAction = nativeContinuation && !chatBinding && run && !recordedUserStop(run)
     ? retryOffered ? "Send a message or press Retry to continue." : "Send a message to continue."
     : null;
+  // Saved-message count excludes input already claimed by a run. That input
+  // can still be unanswered: only Retry is proven to answer it, not a new message.
+  const [unansweredOrigin] = retryOffered && run?.runtimeMode === "native" && ["failed", "timed_out"].includes(run.status)
+    && workspaceRecoveryState?.status === "recovered" && !chatBinding && !withoutWorkspace && !run.resultJson?.externalWorkspaceInspection
+    ? await db.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "user"),
+      sql`${issueComments.deletedAt} is null`,
+      sql`exists (select 1 from ${heartbeatRuns} source
+        where source.company_id = ${companyId} and source.id = ${run.id}
+          and (source.context_snapshot->>'wakeCommentId' = ${issueComments.id}::text
+            or source.context_snapshot->'wakeCommentIds' @> jsonb_build_array(${issueComments.id}::text)))`,
+      sql`not exists (select 1 from ${issueComments} reply
+        where reply.company_id = ${companyId} and reply.issue_id = ${issueId}
+          and reply.author_type = 'agent' and reply.created_at > ${issueComments.createdAt})`,
+    )).limit(1) : [];
+  const recoveredMessage = unansweredOrigin
+    ? nativeMessageAction ? "Saved work recovered. Press Retry to answer your last message, or send a new one."
+      : "Saved work recovered. Retry continues from it and answers your last message."
+    : nativeMessageAction ? `Saved work recovered. ${nativeMessageAction}` : recoveredWorkMessage(run?.status, retryOffered);
   const workspaceRecovery = workspaceRecoveryState?.status === "recovered"
-    ? { ...workspaceRecoveryState, message: nativeMessageAction
-      ? `Saved work recovered. ${nativeMessageAction}` : recoveredWorkMessage(run?.status, retryOffered) }
+    ? { ...workspaceRecoveryState, message: recoveredMessage }
     : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered };
   let nextAction = action.status === "active" && action.cause === EXECUTION_FINALIZATION_DEADLINE_EXCEEDED
     ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : action.nextAction;
