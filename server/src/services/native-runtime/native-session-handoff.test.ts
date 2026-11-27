@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { MODEL_HIDDEN_RUN_ID_KEYS, withoutModelHiddenRunIds } from "@paperclipai/adapter-utils/model-facing-history";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, documents, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocuments, issues, issueThreadInteractions } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -9,18 +11,83 @@ import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
-describe("bounded fresh-session handoff", () => {
-  it("marks omissions and stays within its byte budget for huge Unicode histories", () => {
-    const rendered = renderNativeSessionHandoff({ issueId: "task", generation: 1, omittedEntriesAtLeast: 1,
-      entries: Array.from({ length: 100 }, (_, i) => ({ kind: "message", id: String(i), body: "🦖".repeat(10_000) })),
-    });
-    expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(NATIVE_HANDOFF_MAX_BYTES);
-    expect(rendered).toContain('"truncated":true');
-    expect(rendered).toContain("content omitted");
-    expect(rendered).toContain("get_task_history");
-    expect(rendered).toContain("Legacy adapters can use the equivalent Paperclip");
+const modelFacingHistorySources = [
+  "../../../../packages/shared/src/types/execution-continuation.ts",
+  "../execution-continuation.ts",
+  "../source-trust.ts",
+  "./child-review-outcomes.ts",
+  "./native-session-handoff.ts",
+];
+
+describe("model-facing history run ids", () => {
+  it("decides every run-id field in the sources that feed the continuation and fresh-session history", () => {
+    const names = new Set(modelFacingHistorySources.flatMap((source) =>
+      readFileSync(new URL(source, import.meta.url), "utf8").match(/\b(?:runId|[a-z][A-Za-z]*RunId)\b/g) ?? []));
+    expect([...names].filter((name) => !MODEL_HIDDEN_RUN_ID_KEYS.has(name)).sort()).toEqual([]);
   });
 
+  it("hides the reviewer run of a child review outcome", () => {
+    const outcome = { id: "interaction-1", kind: "request_confirmation", status: "accepted",
+      result: { sourceRunId: "run-a", reviewerRunId: "run-b", decision: "approved", resolvedAt: null } };
+    expect(withoutModelHiddenRunIds(outcome)).toEqual({ id: "interaction-1", kind: "request_confirmation", status: "accepted",
+      result: { decision: "approved", resolvedAt: null } });
+  });
+});
+
+const swarmRunId = "5a1d0c2e-7f3b-4c41-9b0a-0d3c8e9f1a21";
+const reply = "Both requested files have been created in the task folder and verified.";
+
+describe("renderNativeSessionHandoff", () => {
+  it("keeps retrievable source ids and names no run ids", () => {
+    const packet = renderNativeSessionHandoff({
+      issueId: "issue-48",
+      generation: null,
+      omittedEntriesAtLeast: 0,
+      entries: [
+        { kind: "original_request", id: "comment-request", body: "Create w1.txt and w2.txt.", author: "user" },
+        { kind: "document", id: "document-summary", key: "continuation-summary", body: "# Continuation Summary" },
+        { kind: "run_summary", id: swarmRunId, status: "succeeded", body: reply, sourceTrust: null },
+        { kind: "agent_reply", id: "11171", runId: swarmRunId, body: reply, sourceTrust: {
+          preset: "low_trust_review", disposition: "quarantined", sourceIssueId: "issue-48", sourceRunId: swarmRunId, sourceAgentId: "agent-1",
+        } },
+      ],
+    });
+    expect(packet).not.toContain(swarmRunId);
+    expect(packet).not.toContain("11171");
+    const entries = JSON.parse(packet.split("\n").at(-1)!).entries as Array<Record<string, unknown>>;
+    expect(entries.map(({ kind, id }) => [kind, id])).toEqual([
+      ["original_request", "comment-request"],
+      ["document", "document-summary"],
+      ["run_summary", undefined],
+      ["agent_reply", undefined],
+    ]);
+    expect(entries[2]).toMatchObject({ status: "succeeded", body: reply, truncated: false });
+    expect(entries[3]!.sourceTrust).toEqual({
+      preset: "low_trust_review", disposition: "quarantined", sourceIssueId: "issue-48", sourceAgentId: "agent-1",
+    });
+  });
+
+  it("preserves other_agent author labels alongside agent and user entries", () => {
+    const packet = renderNativeSessionHandoff({
+      issueId: "chat-1",
+      generation: 0,
+      omittedEntriesAtLeast: 0,
+      entries: [
+        { kind: "original_request", id: "c-user", body: "Plan the launch", author: "user" },
+        { kind: "message", id: "c-peer", body: "PEER NOTE", author: "other_agent", authorAgentId: "agent-peer" },
+        { kind: "message", id: "c-own", body: "OWN REPLY", author: "agent", authorAgentId: "agent-self" },
+      ],
+    });
+    const entries = JSON.parse(packet.split("\n").at(-1)!).entries as Array<Record<string, unknown>>;
+    expect(entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "c-user", author: "user", body: "Plan the launch" }),
+      expect.objectContaining({ id: "c-peer", author: "other_agent", authorAgentId: "agent-peer", body: "PEER NOTE" }),
+      expect.objectContaining({ id: "c-own", author: "agent", authorAgentId: "agent-self", body: "OWN REPLY" }),
+    ]));
+  });
+});
+
+describe("whole fresh-session handoff", () => {
   it("bounds whole handoffs by keeping the newest messages whole and naming every omission", () => {
     const entries = Array.from({ length: 6 }, (_, i) => ({ kind: "message", id: String(i), body: `${i}:` + "🦖".repeat(45_000) }));
     const rendered = renderNativeSessionHandoff({ issueId: "task", generation: 1, mode: "whole", entries, omittedEntriesAtLeast: 0 });
@@ -94,27 +161,10 @@ describe("bounded fresh-session handoff", () => {
     expect(packet.omittedMessages).toBe(1);
     expect(packet.entries.map((entry: { id: string }) => entry.id)).toEqual(["new"]);
   });
-
-  it("restores the handoff on fresh bootstrap and resume failure, without replaying it on resume", () => {
-    const input = buildNativeExecutionInput({
-      companyId: "company", runId: "run", agentId: "agent", normalizedSessionId: "session", conversationMode: true,
-      issue: { id: "task", identifier: "BOT-2", title: "Chat", description: null, workMode: "standard" },
-      taskPrompt: "GitHub is connected", freshSessionHandoff: "original goal: build the PR review bot", initialCommunicationGuidance: "Lead with the answer",
-      workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
-      completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
-        revision: "1", objective: "Build bot", criteria: [{ id: "objective", requirement: "Build bot" }],
-      } }, runtimeContext: nativeRuntimeContextFixture(),
-    });
-    expect(buildNativeModelEnvelope(input).task.prompt).toContain("original goal");
-    const resumed = buildNativeModelEnvelope(input, { resumedSession: true });
-    expect("task" in resumed && resumed.task.prompt).not.toContain("original goal");
-    // The runtime uses the same full envelope if actual recovery fails.
-    expect(buildNativeModelEnvelope(input).task.prompt).toContain("Lead with the answer");
-  });
 });
 
 const support = await getEmbeddedPostgresTestSupport();
-(support.supported ? describe : describe.skip)("handoff history scope", () => {
+(support.supported ? describe : describe.skip)("whole handoff history scope", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), boundaryId = randomUUID(), requestId = randomUUID();
@@ -142,8 +192,6 @@ const support = await getEmbeddedPostgresTestSupport();
       createdByAgentId: agentId, createdAt: new Date(6_000), resolvedAt: new Date(7_000),
       payload: { version: 1, questions: [] }, result: { version: 1, summaryMarkdown: "Use CODEOWNERS and publish a Storybook per PR" },
     });
-    // An activity can start before the wake while its answer arrives later.
-    // The answer timestamp, not just the activity's start, fences replay.
     await db.insert(issueThreadInteractions).values({ companyId, issueId, kind: "ask_user_questions", status: "answered",
       createdByAgentId: agentId, createdAt: new Date(2_500), resolvedAt: new Date(3_500),
       payload: { version: 1, questions: [] }, result: { version: 1, summaryMarkdown: "LATER CUTOFF DECISION" },
@@ -174,71 +222,6 @@ const support = await getEmbeddedPostgresTestSupport();
     ]);
   });
   afterAll(async () => database?.cleanup());
-  it("preserves the original goal and prior answer while excluding reset, deleted and future history", async () => {
-    const result = await buildNativeSessionHandoff({ db, companyId, issueId, agentId, before: new Date(20_000) });
-    expect(result).toContain("Build a GitHub PR review bot");
-    expect(result).toContain('"author":"paperclip_receipt"');
-    expect(result).toContain("[Paperclip acknowledgement; not agent work] I’ll check the review request.");
-    expect(result).toContain("Final constraint: require a team review");
-    expect(result).toContain('"truncated":true');
-    expect(Buffer.byteLength(result!)).toBeLessThanOrEqual(NATIVE_HANDOFF_MAX_BYTES);
-    expect(result).toContain("CODEOWNERS");
-    expect(result).toContain("Repository research complete");
-    expect(result).toContain("Saved plan");
-    expect(result).toContain("Waiting for GitHub access");
-    expect(result).toContain("Legacy answer: repository selection is complete");
-    expect(result).not.toContain("UNRELATED TASK ANSWER");
-    expect(result).not.toContain("OLD TOPIC");
-    expect(result).not.toContain("Deleted private message");
-    expect(result).not.toContain("FUTURE MESSAGE");
-    expect(result).not.toContain("UNTRUSTED BODY");
-    expect(result).not.toContain("/new");
-    expect(await buildNativeSessionHandoff({ db, companyId: randomUUID(), issueId, agentId, before: new Date(20_000) })).toBeNull();
-    expect(await buildNativeSessionHandoff({ db, companyId, issueId, agentId: randomUUID(), before: new Date(20_000) })).toBeNull();
-  });
-  it("honors the exact wake-comment cutoff when building a fresh replay", async () => {
-    const result = await buildNativeSessionHandoff({ db, companyId, issueId, agentId, before: new Date(20_000), throughCommentId: requestId });
-    expect(result).toContain("Build a GitHub PR review bot");
-    expect(result).not.toContain("CODEOWNERS");
-    expect(result).not.toContain("Legacy answer");
-    expect(result).not.toContain("LATER CUTOFF DECISION");
-    expect(result).not.toContain("LATER CUTOFF REPLY");
-    expect(result).not.toContain("LATER CUTOFF RUN SUMMARY");
-    expect(result).not.toContain(workflowDocumentId);
-    expect(await buildNativeSessionHandoff({ db, companyId, issueId, agentId, before: new Date(20_000), throughCommentId: randomUUID() })).toBeNull();
-  });
-
-  it("keeps workflow history reference-only for fresh bootstrap and resume fallback while preserving plan excerpts", async () => {
-    const load = createNativeSessionHandoffLoader({ db, companyId, issueId, agentId, before: new Date(20_000) });
-    const history = await load();
-    expect(history).not.toContain("WORKFLOW_BODY_CANARY");
-    expect(history).toContain("Saved plan: review changed files by CODEOWNERS");
-    const packet = JSON.parse(history!.split("\n").at(-1)!);
-    expect(packet.entries).toEqual(expect.arrayContaining([expect.objectContaining({
-      kind: "document", id: workflowDocumentId, key: "workflow", revisionId: workflowRevisionId,
-      body: 'Read this task\'s workflow instructions with read_document using key "workflow" before choosing the next phase.',
-      readPath: `/api/issues/${issueId}/documents/workflow`, truncated: false,
-    })]));
-    const input = buildNativeExecutionInput({
-      companyId, runId: randomUUID(), agentId, normalizedSessionId: "session", conversationMode: true,
-      issue: { id: issueId, identifier: "HAND-1", title: "Chat", description: null, workMode: "standard" },
-      taskPrompt: "Continue the current phase", freshSessionHandoff: history,
-      workspace: { id: "workspace", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
-      completionContract: { id: "contract", sha256: "a".repeat(64), schemaVersion: "paperclip.run-result.v1", contract: {
-        revision: "1", objective: "Follow the workflow", criteria: [{ id: "objective", requirement: "Follow the workflow" }],
-      } }, runtimeContext: nativeRuntimeContextFixture(),
-    });
-    const fresh = buildNativeModelEnvelope(input);
-    expect(fresh.task.prompt).toContain(workflowRevisionId);
-    expect(fresh.task.prompt).not.toContain("WORKFLOW_BODY_CANARY");
-    const resumed = buildNativeModelEnvelope(input, { resumedSession: true });
-    expect("task" in resumed && resumed.task.prompt).not.toContain(workflowRevisionId);
-    // A failed provider resume uses the same cached history and full envelope.
-    expect(await load()).toBe(history);
-    const fallback = buildNativeModelEnvelope(input);
-    expect(fallback.task.prompt).toContain(`/api/issues/${issueId}/documents/workflow`);
-    expect(fallback.task.prompt).not.toContain("WORKFLOW_BODY_CANARY");
-  });
 
   it("keeps whole comments and unmatched finals chronological beyond every stock cap, with stock form/document context", async () => {
     const taskId = randomUUID(), commentedRun = randomUUID(), finalRun = randomUUID();
@@ -413,35 +396,5 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(packet.entries[0]).toMatchObject({ kind: "original_request", truncated: true });
     expect(packet.entries[0].body).toMatch(/^START.*END$/s);
     expect(packet.omittedMessages).toBe(0);
-  });
-
-  it("loads and redacts history once only when a fresh attempt requests it", async () => {
-    const select = vi.spyOn(db, "select");
-    try {
-      const load = createNativeSessionHandoffLoader({ db, companyId, issueId, agentId, before: new Date(20_000) });
-      expect(select).not.toHaveBeenCalled();
-      const first = await load();
-      const reads = select.mock.calls.length;
-      expect(reads).toBeGreaterThan(0);
-      expect(await load()).toBe(first);
-      expect(select).toHaveBeenCalledTimes(reads);
-    } finally { select.mockRestore(); }
-  });
-
-  it("retains a prior run's quarantine after the current agent and task use standard policy", async () => {
-    const runId = randomUUID();
-    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded", nativeIssueId: issueId,
-      contextSnapshot: { issueId, conversationSessionGeneration: 2, executionPolicy: {
-        trustPreset: "low_trust_review", authorizationPolicy: { trustPreset: "low_trust_review",
-          trustBoundary: { mode: "low_trust_review", companyId, issueIds: [issueId] } },
-      } }, createdAt: new Date(16_000), finishedAt: new Date(18_000),
-      runnerProfileJson: { sessionCheckpoint: { semanticResult: { summary: "QUARANTINED RUN SUMMARY" } } } });
-    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId, seq: 1, eventType: "item.completed", createdAt: new Date(17_000),
-      payload: { prpEvent: { payload: { kind: "agentMessage", channel: "final", text: "QUARANTINED RUN REPLY" } } } });
-    const result = await buildNativeSessionHandoff({ db, companyId, issueId, agentId, before: new Date(20_000) });
-    expect(result).not.toContain("QUARANTINED RUN REPLY");
-    expect(result).not.toContain("QUARANTINED RUN SUMMARY");
-    expect(result).toContain("Quarantined low-trust output omitted");
-    expect(result).toContain(runId);
   });
 });

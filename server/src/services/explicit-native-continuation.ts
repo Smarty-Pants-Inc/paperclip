@@ -1,4 +1,5 @@
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
+import { nativeEffectiveRunTerminalStateSql, nativeEffectiveRunTerminalStateSqlText } from "./native-runtime/native-accepted-outcome.js";
 import { agentDirectoryPreparationWaitPredicate, isAgentDirectoryPreparationWait } from "./pre-dispatch-execution-evidence.js";
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
@@ -27,12 +28,13 @@ import {
   environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
-import { executionBlockerPredicate, getExecutionBlocker, hasPendingRunCleanup, nativeExecutionRecoveryActionPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker, hasPendingRunCleanup, nativeExecutionRecoveryActionPredicate, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
 import { activeIssueInteractionCondition } from "./issue-question-context.js";
 
+import { hasHermesGatewayTerminalStopProof } from "@paperclipai/hermes-paperclip-adapter/gateway/server";
 import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { firstTurnDeliveredCommentIds, historyReadDeliveredCommentIds } from "./queued-comment-delivery.js";
@@ -292,6 +294,7 @@ export async function admitExplicitNativeContinuation(input: {
   const actions = await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
     boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate(),
+      restoreHoldPredicate(),
       blocker?.recoveryActionId ? eq(issueRecoveryActions.id, blocker.recoveryActionId) : undefined) : undefined,
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
     or(executionBlockerPredicate(), and(
@@ -305,7 +308,7 @@ export async function admitExplicitNativeContinuation(input: {
         where completed.company_id = ${companyId} and result.issue_id = ${issueId}
           and completed.id::text = coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')
           and completed.runtime_mode = 'native' and completed.status = 'succeeded' and finalized.phase = 'committed'
-          and result.schema_status = 'accepted' and result.result_json#>>'{terminal,runTerminalState}' = 'succeeded')`,
+          and result.schema_status = 'accepted' and ${sql.raw(nativeEffectiveRunTerminalStateSqlText("result.result_json"))} = 'succeeded')`,
     )),
   )).for("update");
   const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
@@ -334,7 +337,7 @@ export async function admitExplicitNativeContinuation(input: {
         eq(nativeRunResults.companyId, companyId), eq(nativeRunResults.issueId, issueId),
         eq(nativeRunResults.runId, latest.id), eq(nativeRunResults.id, coordinator.resultId),
         eq(nativeRunResults.schemaStatus, "accepted"),
-        sql`${nativeRunResults.resultJson}#>>'{terminal,runTerminalState}' = 'succeeded'`,
+        sql`${nativeEffectiveRunTerminalStateSql(nativeRunResults.resultJson)} = 'succeeded'`,
       )).limit(1) : [];
       if (!result || await hasPendingRunCleanup(db, companyId, latest.id))
         return blocked("cleanup_pending", "Waiting for the previous run to finish cleanup. Your message is saved.");
@@ -423,8 +426,9 @@ export async function admitExplicitNativeContinuation(input: {
     // operator Stop or redeliver a message already consumed by this run.
     if (queuedRequest && !queuedInterrupt && (run.contextSnapshot?.wakeCommentId === commentId ||
         (Array.isArray(run.contextSnapshot?.wakeCommentIds) && run.contextSnapshot.wakeCommentIds.includes(commentId)))) return null;
+    let historicalAdapter: string | null = null;
     if (legacyUserTurn && !failedPreparation) {
-      const historicalAdapter = await historicalAdapterType(db, run);
+      historicalAdapter = await historicalAdapterType(db, run);
       // A settings change never converts a known process/webhook execution into
       // a conversation. Those adapters retain their reconciliation contract.
       if (historicalAdapter && !isConversationAdapter(historicalAdapter)) {
@@ -453,7 +457,7 @@ export async function admitExplicitNativeContinuation(input: {
         eq(nativeRunResults.companyId, companyId), eq(nativeRunResults.issueId, issueId),
         eq(nativeRunResults.runId, run.id), eq(nativeRunResults.id, coordinator.resultId),
         eq(nativeRunResults.schemaStatus, "accepted"),
-        sql`${nativeRunResults.resultJson}#>>'{terminal,runTerminalState}' = 'succeeded'`,
+        sql`${nativeEffectiveRunTerminalStateSql(nativeRunResults.resultJson)} = 'succeeded'`,
       )).limit(1);
       const recovery = readSystemRecovery(action.evidence);
       const snapshotSettled = completedResult && freshIntent && action.id && recovery?.state === "complete"
@@ -544,7 +548,7 @@ export async function admitExplicitNativeContinuation(input: {
           eq(nativeRunResults.companyId, companyId), eq(nativeRunResults.issueId, issueId),
           eq(nativeRunResults.runId, run.id), eq(nativeRunResults.id, coordinator.resultId),
           eq(nativeRunResults.schemaStatus, "accepted"),
-          sql`${nativeRunResults.resultJson}->'terminal'->>'runTerminalState' = ${run.status}`,
+          sql`${nativeEffectiveRunTerminalStateSql(nativeRunResults.resultJson)} = ${run.status}`,
         )).limit(1)
       : [];
     // A terminal failure may retain a result accepted before checkpoint or
@@ -589,7 +593,14 @@ export async function admitExplicitNativeContinuation(input: {
         if (freshIntent && (run.processPid || run.processGroupId) && !await recordedLocalExecutionStopped(db, run))
           return blocked("process_identity_missing", "Paperclip is verifying that the previous session stopped.");
         // A missing process identity is not evidence that a provider exited.
+        // Remote HTTP gateway adapters (hermes_gateway) never spawn a local OS child process;
+        // require a saved terminal response from the gateway before clearing the hold so an
+        // unconfirmed timeout cannot overlap with a still-running remote run.
+        const remoteGatewayStopped = legacyUserTurn
+          && historicalAdapter === "hermes_gateway"
+          && hasHermesGatewayTerminalStopProof(run.resultJson);
         if (!run.processPid && !run.processGroupId &&
+            !remoteGatewayStopped &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&
             !await hasHistoricalSuspendedNativeSession(db, run) &&
             !await nativeRunNeverLaunched(db, run) &&

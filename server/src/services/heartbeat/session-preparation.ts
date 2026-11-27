@@ -22,6 +22,7 @@ import {
 } from "./workspaces.js";
 import type { HeartbeatWorkspacePreparationInput, prepareHeartbeatWorkspace } from "./workspace-preparation.js";
 import type { prepareHeartbeatTaskContext } from "./task-context.js";
+import { runContentDeleted } from "../tool-access/connections/run-session-reset.js";
 
 type RunState = ReturnType<typeof createHeartbeatRunState>;
 type WorkspaceInput = HeartbeatWorkspacePreparationInput;
@@ -241,6 +242,8 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
         !(continuableConfigChange && reason.startsWith("effective run configuration changed: "))) ||
       (context.wakeReason === "heartbeat_timer" && !deriveTaskKey(context, null)),
   }).continue) resetTaskSession = false;
+  // Deleted source content is a hard reset, including for continuous sessions.
+  resetTaskSession ||= await runContentDeleted(db, agent.companyId, taskSession?.lastRunId);
   const sessionResetReason =
     sessionConfigFreshness.reasons.join("; ") || null;
   const taskSessionForRun = resetTaskSession ? null : taskSession;

@@ -1,4 +1,5 @@
 import { ENVIRONMENT_PROVIDER_WAIT_KEY, ENVIRONMENT_PROVIDER_WAIT_RETRY_REASON, environmentProviderWaitMessage } from "./environment-provider-wait.js";
+import { ANTIGRAVITY_SWARM_UNAVAILABLE } from "./antigravity-swarm-refusal.js";
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
 import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
@@ -15,6 +16,7 @@ import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
 import { conversationOwedInputs } from "./conversation-owed-input.js";
 import { classifiedRunFailure } from "./recovery/stranded-notice.js";
 import { failedRunStage, previousSessionUnconfirmed } from "./run-failure-stage.js";
+import { isProviderQuotaActionRequired } from "./provider-quota-reset.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { PROJECT_ACCESS_DENIED } from "./project-access-denial.js";
 import { authorizationService } from "./authorization.js";
@@ -246,7 +248,10 @@ export function projectTaskInterruption(issue: ProjectionIssue, input: Projectio
       && input.run.companyId === issue.companyId && input.run.nativeIssueId === issue.id
       && isAcknowledgedNativeStop({ ...input.run, companyId: issue.companyId, nativeIssueId: issue.id })));
   if (owed && !stopped && !["done", "cancelled"].includes(issue.status)
-      && presentation?.responsibility !== "user" && !input.paused && !input.approval && !input.question
+      && presentation?.responsibility !== "user"
+      && !(presentation?.state === "failed" && input.run?.errorCode === ANTIGRAVITY_SWARM_UNAVAILABLE
+        && presentation.providerFailure?.provider === "antigravity" && presentation.providerFailure.retryability === "requires_action")
+      && !input.paused && !input.approval && !input.question
       && input.agent?.status !== "paused" && !input.project?.pausedAt && input.company?.status !== "paused") {
     const owner = owed.deliveryOwner || Boolean(input.run?.nativeResumeAt) || input.run?.nativeFinalizationRetryPending === true;
     if (owner) {
@@ -460,6 +465,14 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
     return { ...base, state: "failed", canRetry: false,
       retryWait: { reason: "cleanup_quarantined", message: NATIVE_CLEANUP_SETTLING_MESSAGE } };
   }
+  if (run.status === "failed" && isProviderQuotaActionRequired(run, new Date(now)))
+    return { ...base, responsibility: "user", state: "waiting_for_user", userAction: "provider_billing", canRetry: true };
+  // A /swarm the swarm route refused for a reason the person must change (the
+  // model, a planning run, extra tool servers): Retry would meet the same
+  // refusal, so the plain message says what to do and no Retry is offered.
+  if (run.status === "failed" && run.errorCode === ANTIGRAVITY_SWARM_UNAVAILABLE
+      && providerFailure?.provider === "antigravity" && providerFailure.retryability === "requires_action")
+    return { ...base, state: "failed", canRetry: false };
   return { ...base, state: "failed", canRetry: true, ...(projectAccess ? { projectAccess } : {}) };
 }
 

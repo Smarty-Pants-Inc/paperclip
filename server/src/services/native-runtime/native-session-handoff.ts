@@ -1,10 +1,12 @@
 import { and, asc, desc, eq, inArray, isNull, lte, notInArray, or, sql, type SQL } from "drizzle-orm";
 import { documents, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocuments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
+import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, withoutLegacyRunLines } from "../issue-continuation-summary.js";
 import { buildLowTrustSourceTrust, redactQuarantinedBodyForHigherTrust, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { resolveCoreTrustPreset } from "../trust-preset-resolver.js";
 import { fastResponseHistoryBody, type ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { nativeFinalReplyKey } from "../heartbeat-run-summary.js";
+import { modelFacingObject, type ModelFacingObject } from "@paperclipai/adapter-utils/model-facing-history";
 
 export const NATIVE_HANDOFF_MAX_BYTES = 24_000;
 // The journal allows 522,240 bytes; reserve 154,240 for the wake/envelope and margin.
@@ -17,7 +19,7 @@ const LIMIT = 10;
 
 export type HandoffEntry = { kind: string; id: string; body: string; truncated?: boolean; [key: string]: unknown };
 type HandoffMode = "bounded" | "whole";
-const isConversationEntry = (entry: HandoffEntry) => ["original_request", "message", "agent_reply"].includes(entry.kind);
+const isConversationEntry = (entry: { kind?: unknown }) => entry.kind === "original_request" || entry.kind === "message" || entry.kind === "agent_reply";
 
 export function createNativeSessionHandoffLoader(input: Parameters<typeof buildNativeSessionHandoff>[0]): () => Promise<string | null> {
   let packet: Promise<string | null> | undefined;
@@ -29,7 +31,7 @@ export function renderNativeSessionHandoff(input: {
   issueId: string; generation: number | null; entries: HandoffEntry[]; omittedEntriesAtLeast: number; omittedMessages?: number; mode?: HandoffMode;
 }): string {
   const whole = input.mode === "whole";
-  const entries: HandoffEntry[] = [];
+  const entries: ModelFacingObject[] = [];
   let omittedMessages = input.omittedMessages ?? 0;
   let omittedSupport = input.omittedEntriesAtLeast;
   let truncated = omittedMessages + omittedSupport > 0;
@@ -50,9 +52,11 @@ export function renderNativeSessionHandoff(input: {
     const clipped = oversizedOrigin || (!complete && entry.body.length > ENTRY_MAX_CHARS);
     // Preserve both the start and latest direction in exceptionally long messages.
     const body = clipped ? `${entry.body.slice(0, 2_900)}\n[content omitted]\n${entry.body.slice(-900)}` : entry.body;
-    const bounded = { ...entry, body, truncated: entry.truncated === true || clipped };
-    entries.push(bounded);
-    truncated ||= bounded.truncated;
+    const { id, ...modelEntry } = modelFacingObject(entry);
+    const retrievable = entry.kind !== "run_summary" && entry.kind !== "agent_reply";
+    const entryTruncated = entry.truncated === true || clipped;
+    entries.push({ ...(retrievable ? { id } : {}), ...modelEntry, body, truncated: entryTruncated });
+    truncated ||= entryTruncated;
     // Leave space for the final omission count, including multi-byte Unicode.
     // Complete conversation bytes cannot consume the stock excerpt budget.
     if (!complete && Buffer.byteLength(render(whole ? entries.filter(entry => !isConversationEntry(entry)) : entries), "utf8") > NATIVE_HANDOFF_MAX_BYTES - 128) {
@@ -70,7 +74,7 @@ export function renderNativeSessionHandoff(input: {
     let size = overhead + entries.reduce((sum, entry, i) => sum + entryBytes.get(entry)! + Number(i > 0), 0);
     const evictionOrder = [...entries.filter(entry => !isConversationEntry(entry)).reverse(),
       ...entries.filter(entry => isConversationEntry(entry) && entry.kind !== "original_request")];
-    const evicted = new Set<HandoffEntry>();
+    const evicted = new Set<ModelFacingObject>();
     for (const entry of evictionOrder) {
       if (size <= NATIVE_WHOLE_HANDOFF_MAX_BYTES) break;
       size -= entryBytes.get(entry)! + Number(entries.length - evicted.size > 1);
@@ -293,7 +297,7 @@ export async function buildNativeSessionHandoff(input: {
     const { clientRequestId: _replyKey, bodySize: _bodySize, ...comment } = row;
     const safe = sanitizeQuarantinedCommentForHigherTrust(comment);
     entries.push({ ...safe, body: fastResponseHistoryBody(safe), kind,
-      author: row.origin === "fast_response" ? "paperclip_receipt" : row.authorAgentId ? "agent" : "user" });
+      author: row.origin === "fast_response" ? "paperclip_receipt" : row.authorAgentId === agentId ? "agent" : row.authorAgentId ? "other_agent" : "user" });
   };
   if (retainedOrigin[0]) addComment(retainedOrigin[0], "original_request");
   (whole ? retainedRecent : recent.slice(0, LIMIT)).forEach(row => addComment(row, "message"));
@@ -303,7 +307,8 @@ export async function buildNativeSessionHandoff(input: {
     const sourceTrust = historicalTrust(row.runId, executionPolicy);
     entries.push({ ...sanitizeQuarantinedCommentForHigherTrust({ ...entry, sourceTrust }), kind: "agent_reply" });
   }
-  savedDocuments.slice(0, 3).forEach(row => entries.push({ ...redactQuarantinedBodyForHigherTrust(row), kind: "document",
+  savedDocuments.slice(0, 3).forEach(row => entries.push({ ...redactQuarantinedBodyForHigherTrust(
+    row.key === ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY ? { ...row, body: withoutLegacyRunLines(row.body) } : row), kind: "document",
     ...(row.key === "workflow" ? { readPath: `/api/issues/${issueId}/documents/workflow` } : {}),
   }));
   for (const row of runSummaries.slice(0, 2)) {
