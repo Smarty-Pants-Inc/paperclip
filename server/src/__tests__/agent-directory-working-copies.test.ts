@@ -756,7 +756,7 @@ describe("persistent agent directories", () => {
     } finally { open.mockRestore(); }
   });
 
-  it("reports an oversized run file without a partial save and removes its temporary copy", async () => {
+  it("reports an oversized run file without a partial save and retains its temporary copy", async () => {
     const copy = await run();
     await sparseFile(path.join(copy.localRoot, "too-large.bin"), MAX_AGENT_FILE_BYTES + 1);
     await fs.writeFile(path.join(copy.localRoot, entryFile), "changed instructions");
@@ -768,8 +768,8 @@ describe("persistent agent directories", () => {
     await expect(fs.stat(path.join(root, "too-large.bin"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await copies.reportUnavailable(companyId, copy.runId))?.errorCode).toBe("AGENT_FILES_LIMIT_EXCEEDED");
     await copies.release(companyId, copy.runId);
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
-    expect((await copies.get(companyId, copy.runId))?.receipt?.baseline).toBeUndefined();
+    expect((await fs.stat(copy.localRoot)).isDirectory()).toBe(true);
+    expect((await copies.get(companyId, copy.runId))?.receipt).toMatchObject({ cleanupPending: true, retainedForRecovery: true, baseline: copy.receipt?.baseline });
     const next = await run();
     expect(await fs.readFile(path.join(next.localRoot, entryFile), "utf8")).toBe(initial);
     await fs.writeFile(path.join(next.localRoot, "next-task.txt"), "still working");
@@ -806,7 +806,7 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(first.localRoot, entryFile), "utf8")).toBe(initial);
     const stopped = await copies.collectStopped({ companyId, runId: first.runId });
     expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
-    await expect(fs.stat(first.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.stat(first.localRoot)).isDirectory()).toBe(true);
     copies = agentInstructionWorkingCopyService(db);
     const cleanup = await run();
     expect(cleanup.state).toBe("prepared");
@@ -860,12 +860,12 @@ describe("persistent agent directories", () => {
     } finally { readdir.mockRestore(); }
   }, 30_000);
 
-  it("keeps the entry's 1 MiB limit and cleans up failed synchronization", async () => {
+  it("keeps the entry's 1 MiB limit and retains failed synchronization", async () => {
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, entryFile), "a".repeat(1024 * 1024 + 1));
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
     expect(result?.state).toBe("unavailable");
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.stat(copy.localRoot)).isDirectory()).toBe(true);
     expect(result?.errorMessage).toContain("at most 1 MiB");
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
   });
@@ -1162,7 +1162,7 @@ describe("persistent agent directories", () => {
     expect(result?.errorCode).toBe("AGENT_FILES_SAVE_FAILED");
     expect(result?.receipt?.storageWarning).toBe(copy.receipt?.storageWarning);
     if (full) expect(result?.receipt?.storageWarning).toContain("Agent storage is full");
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.stat(copy.localRoot)).isDirectory()).toBe(true);
     await expect(fs.stat(path.join(root, "innocent.txt"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
 
@@ -1304,7 +1304,7 @@ describe("persistent agent directories", () => {
     expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
     expect(stopped.receipt?.storageWarning).toContain("Agent storage is full");
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.stat(copy.localRoot)).isDirectory()).toBe(true);
     expect(await run({ warm: true })).toBeTruthy();
   });
   it("rechecks authorization even for an unchanged warm checkpoint", async () => {
@@ -1338,6 +1338,269 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(root, "saved.txt"), "utf8")).toBe("checkpoint");
     await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
+  describe("retained save failures", () => {
+    async function remoteCopies(warm: boolean) {
+      const remoteCwd = path.join(home, randomUUID());
+      await fs.mkdir(remoteCwd);
+      const commands: string[] = [];
+      const runner: import("@paperclipai/adapter-utils/command-managed-runtime").CommandManagedRuntimeRunner = {
+        execute: async input => {
+          const startedAt = new Date().toISOString();
+          const env = { ...process.env, ...input.env };
+          const args = [...(input.args ?? [])];
+          commands.push(args[1] ?? input.command);
+          if (input.stdin != null && (args[0] === "-c" || args[0] === "-lc")) {
+            env.PAPERCLIP_TEST_STDIN = input.stdin;
+            args[1] = `printf '%s' "$PAPERCLIP_TEST_STDIN" | (${args[1]})`;
+          }
+          try {
+            const result = await execFile(input.command, args, { cwd: input.cwd, env, timeout: input.timeoutMs, maxBuffer: 32 * 1024 * 1024 });
+            return { exitCode: 0, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
+          } catch (error) {
+            const e = error as { code?: number; signal?: NodeJS.Signals; stdout?: string; stderr?: string };
+            return { exitCode: typeof e.code === "number" ? e.code : 1, signal: e.signal ?? null, timedOut: false, stdout: e.stdout ?? "", stderr: e.stderr ?? "", pid: null, startedAt };
+          }
+        },
+      };
+      const remote = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), leaseId: "", remoteCwd, runner };
+      await db.insert(environments).values({ id: remote.environmentId, name: remote.environmentId, driver: "sandbox" });
+      const prepare = async (runId = randomUUID()) => {
+        await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+        const target = { ...remote, leaseId: randomUUID() };
+        await db.insert(environmentLeases).values({ id: target.leaseId, companyId, environmentId: target.environmentId,
+          heartbeatRunId: runId, provider: "daytona", providerLeaseId: "retained-allocation" });
+        const copy = (await copies.prepare({ companyId, agentId, runId, cwd: home, target, warm }))!;
+        return { copy, target };
+      };
+      return { prepare, commands };
+    }
+
+    it.each([false, true])("keeps both copies after a collected save rejection and isolates the next run (warm=%s)", async warm => {
+      const remote = await remoteCopies(warm);
+      const { copy, target } = await remote.prepare();
+      await fs.writeFile(path.join(copy.executionRoot, "unsaved.txt"), "recover these changes");
+      await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
+      await db.update(companyMemberships).set({ membershipRole: "member" }).where(eq(companyMemberships.companyId, companyId));
+      const failed = (await copies.collectStopped({ companyId, runId: copy.runId, target }))!;
+      expect((await fs.stat(copy.localRoot)).isDirectory()).toBe(true);
+      expect(await fs.readFile(path.join(copy.executionRoot, "unsaved.txt"), "utf8")).toBe("recover these changes");
+      expect(failed).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED", nextAttemptAt: null,
+        receipt: { cleanupPending: true, retainedForRecovery: true, baseline: copy.receipt?.baseline } });
+      expect(failed.errorMessage).toContain("kept for recovery");
+      expect((await fs.stat(copy.localRoot)).isDirectory()).toBe(true);
+      if (!warm) expect(await fs.readFile(path.join(copy.localRoot, "unsaved.txt"), "utf8")).toBe("recover these changes");
+      expect(await fs.readFile(path.join(copy.executionRoot, "unsaved.txt"), "utf8")).toBe("recover these changes");
+      await expect(fs.stat(path.join(root, "unsaved.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      await copies.release(companyId, copy.runId);
+      expect(remote.commands.some(command => command.startsWith("rm -rf --") && command.includes(`'${copy.executionRoot}'`))).toBe(false);
+      copies = agentInstructionWorkingCopyService(db);
+      const before = await copies.get(companyId, copy.runId);
+      await copies.recoverCaptured();
+      await copies.recoverStopped();
+      expect(await copies.get(companyId, copy.runId)).toEqual(before);
+      await db.update(companyMemberships).set({ membershipRole: "operator" }).where(eq(companyMemberships.companyId, companyId));
+      const next = await remote.prepare();
+      expect(next.copy.localRoot).not.toBe(copy.localRoot);
+      expect(next.copy.executionRoot).not.toBe(copy.executionRoot);
+      await expect(fs.stat(path.join(next.copy.localRoot, "unsaved.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(path.join(copy.executionRoot, "unsaved.txt"), "utf8")).toBe("recover these changes");
+      if (!warm) expect(await fs.readFile(path.join(copy.localRoot, "unsaved.txt"), "utf8")).toBe("recover these changes");
+      expect(await copies.get(companyId, copy.runId)).toEqual(before);
+    });
+
+    it.each([false, true])("moves the unsaved host copy aside before preparing the same run afresh (warm=%s)", async warm => {
+      const copy = await run({ warm });
+      const unsavedBytes = Buffer.from([0, 128, 255, 42]);
+      await fs.writeFile(path.join(copy.localRoot, "unsaved.bin"), unsavedBytes);
+      await fs.rm(path.join(copy.localRoot, entryFile));
+      const failed = (await copies.collectStopped({ companyId, runId: copy.runId }))!;
+      expect(failed).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED",
+        receipt: { cleanupPending: true, retainedForRecovery: true, baseline: copy.receipt?.baseline } });
+      copies = agentInstructionWorkingCopyService(db);
+      const fresh = (await copies.prepare({ companyId, agentId, runId: copy.runId, cwd: home, warm }))!;
+      expect(fresh).toMatchObject({ state: "prepared", localRoot: copy.localRoot, executionRoot: copy.executionRoot,
+        processStoppedAt: null, errorCode: null, errorMessage: null });
+      expect(fresh.receipt?.retainedForRecovery).toBeUndefined();
+      const runRoot = path.dirname(copy.localRoot), runsRoot = path.dirname(runRoot);
+      const siblings = (await fs.readdir(runsRoot)).filter(name => name.startsWith(`${path.basename(runRoot)}.unsaved-`));
+      expect(siblings).toHaveLength(1);
+      expect(siblings[0]).toMatch(/\.unsaved-\d+$/);
+      const retainedRoot = path.join(runsRoot, siblings[0]!, "live");
+      expect(await fs.readFile(path.join(retainedRoot, "unsaved.bin"))).toEqual(unsavedBytes);
+      await expect(fs.stat(path.join(retainedRoot, entryFile))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(path.join(fresh.localRoot, entryFile), "utf8")).toBe(initial);
+      await expect(fs.stat(path.join(fresh.localRoot, "unsaved.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(root, "unsaved.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await copies.hasChanges({ companyId, runId: copy.runId })).toBe(false);
+      await copies.collectStopped({ companyId, runId: copy.runId });
+      await copies.release(companyId, copy.runId);
+      await copies.recoverCaptured();
+      await copies.recoverStopped();
+      await expect(fs.stat(fresh.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(path.join(retainedRoot, "unsaved.bin"))).toEqual(unsavedBytes);
+    });
+
+    async function unsavedSibling(directory: string) {
+      const parent = path.dirname(directory);
+      const siblings = (await fs.readdir(parent)).filter(name => name.startsWith(`${path.basename(directory)}.unsaved-`));
+      expect(siblings).toHaveLength(1);
+      expect(siblings[0]).toMatch(/\.unsaved-\d+$/);
+      return path.join(parent, siblings[0]!);
+    }
+
+    it.each([false, true])("moves the uncollected sandbox copy aside before same-run preparation (warm=%s)", async warm => {
+      const remote = await remoteCopies(warm);
+      const { copy, target } = await remote.prepare();
+      const unsavedBytes = Buffer.from([0, 128, 255, 42]);
+      await fs.writeFile(path.join(copy.executionRoot, "unsaved.bin"), unsavedBytes);
+      await fs.writeFile(path.join(copy.executionRoot, entryFile), "sandbox-only instructions");
+      await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: new Date(),
+        errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE" }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      await copies.release(companyId, copy.runId);
+      await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+
+      const fresh = (await copies.prepare({ companyId, agentId, runId: copy.runId, cwd: home, target, warm }))!;
+      expect(fresh).toMatchObject({ state: "prepared", executionRoot: copy.executionRoot, localRoot: copy.localRoot,
+        processStoppedAt: null, errorCode: null, errorMessage: null });
+      const retainedRoot = await unsavedSibling(copy.executionRoot);
+      expect(await fs.readFile(path.join(retainedRoot, "unsaved.bin"))).toEqual(unsavedBytes);
+      expect(await fs.readFile(path.join(retainedRoot, entryFile), "utf8")).toBe("sandbox-only instructions");
+      for (const directory of [fresh.localRoot, fresh.executionRoot, root]) {
+        expect(await fs.readFile(path.join(directory, entryFile), "utf8")).toBe(initial);
+        await expect(fs.stat(path.join(directory, "unsaved.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      await copies.collectStopped({ companyId, runId: copy.runId, target });
+      await copies.release(companyId, copy.runId);
+      expect(await fs.readFile(path.join(retainedRoot, "unsaved.bin"))).toEqual(unsavedBytes);
+    });
+
+    it.each(["nonzero", "timeout", "throw"] as const)("refuses same-run preparation when moving the uncollected sandbox copy fails: %s", async failure => {
+      const remote = await remoteCopies(false);
+      const { copy, target } = await remote.prepare();
+      const unsavedBytes = Buffer.from([0, 128, 255, 42]);
+      await fs.writeFile(path.join(copy.executionRoot, "unsaved.bin"), unsavedBytes);
+      await fs.writeFile(path.join(copy.executionRoot, entryFile), "only surviving sandbox bytes");
+      await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: new Date(),
+        errorCode: "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE" }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      await copies.release(companyId, copy.runId);
+      const before = await copies.get(companyId, copy.runId);
+      const execute = target.runner.execute.bind(target.runner);
+      const moving = vi.spyOn(target.runner, "execute").mockImplementation(async input => {
+        if (input.args?.some(arg => arg.includes("then mv --"))) {
+          if (failure === "throw") throw new Error("sandbox move unavailable");
+          return { exitCode: failure === "nonzero" ? 1 : 0, signal: null, timedOut: failure === "timeout",
+            stdout: "", stderr: "sandbox move unavailable", pid: null, startedAt: new Date().toISOString() };
+        }
+        return execute(input);
+      });
+      try {
+        await expect(copies.prepare({ companyId, agentId, runId: copy.runId, cwd: home, target }))
+          .rejects.toMatchObject({ status: 409,
+            message: "The unsaved agent-file copy in the sandbox could not be moved aside; preparation stopped to keep it" });
+        expect(await copies.get(companyId, copy.runId)).toEqual(before);
+        expect(await fs.readFile(path.join(copy.executionRoot, "unsaved.bin"))).toEqual(unsavedBytes);
+        expect(await fs.readFile(path.join(copy.executionRoot, entryFile), "utf8")).toBe("only surviving sandbox bytes");
+        expect((await fs.readdir(path.dirname(copy.executionRoot))).filter(name => name.startsWith(`${path.basename(copy.executionRoot)}.unsaved-`))).toEqual([]);
+        await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+        await expect(fs.stat(path.join(root, "unsaved.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+      } finally { moving.mockRestore(); }
+    });
+
+    it.each([false, true])("retains both host and sandbox siblings after a remote save failure and same-run preparation (warm=%s)", async warm => {
+      const remote = await remoteCopies(warm);
+      const { copy, target } = await remote.prepare();
+      const unsavedBytes = Buffer.from([0, 128, 255, 42]);
+      await fs.writeFile(path.join(copy.executionRoot, "unsaved.bin"), unsavedBytes);
+      await fs.rm(path.join(copy.executionRoot, entryFile));
+      expect(await copies.collectStopped({ companyId, runId: copy.runId, target })).toMatchObject({ state: "unavailable",
+        errorCode: "AGENT_FILES_SAVE_FAILED", receipt: { cleanupPending: true, retainedForRecovery: true } });
+
+      const fresh = (await copies.prepare({ companyId, agentId, runId: copy.runId, cwd: home, target, warm }))!;
+      expect(fresh).toMatchObject({ state: "prepared", localRoot: copy.localRoot, executionRoot: copy.executionRoot,
+        processStoppedAt: null, errorCode: null, errorMessage: null });
+      const retainedHost = path.join(await unsavedSibling(path.dirname(copy.localRoot)), "live");
+      const retainedSandbox = await unsavedSibling(copy.executionRoot);
+      expect((await fs.stat(retainedHost)).isDirectory()).toBe(true);
+      expect(path.basename(path.dirname(retainedHost)).split(".unsaved-")[1]).toBe(path.basename(retainedSandbox).split(".unsaved-")[1]);
+      expect(await fs.readFile(path.join(retainedSandbox, "unsaved.bin"))).toEqual(unsavedBytes);
+      await expect(fs.stat(path.join(retainedSandbox, entryFile))).rejects.toMatchObject({ code: "ENOENT" });
+      if (!warm) expect(await fs.readFile(path.join(retainedHost, "unsaved.bin"))).toEqual(unsavedBytes);
+      for (const directory of [fresh.localRoot, fresh.executionRoot, root]) {
+        expect(await fs.readFile(path.join(directory, entryFile), "utf8")).toBe(initial);
+        await expect(fs.stat(path.join(directory, "unsaved.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      await copies.collectStopped({ companyId, runId: copy.runId, target });
+      await copies.release(companyId, copy.runId);
+      expect((await fs.stat(retainedHost)).isDirectory()).toBe(true);
+      expect(await fs.readFile(path.join(retainedSandbox, "unsaved.bin"))).toEqual(unsavedBytes);
+    });
+
+    it.each(["saved", "AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE", "INSTRUCTION_COLLECTION_UNAVAILABLE"])("removes the host projection and retains only uncollected sandbox changes for %s", async outcome => {
+      const remote = await remoteCopies(false);
+      const { copy, target } = await remote.prepare();
+      await fs.writeFile(path.join(copy.executionRoot, "tail.txt"), "provider changes");
+      if (outcome === "saved") {
+        expect((await copies.collectStopped({ companyId, runId: copy.runId, target }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, "tail.txt"), "utf8")).toBe("provider changes");
+      } else {
+        await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: new Date(), errorCode: outcome })
+          .where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      }
+      await copies.release(companyId, copy.runId);
+      await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      if (outcome === "saved") {
+        await expect(fs.stat(copy.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(await fs.readFile(path.join(copy.executionRoot, "tail.txt"), "utf8")).toBe("provider changes");
+        expect(remote.commands.some(command => command.startsWith("rm -rf --") && command.includes(`'${copy.executionRoot}'`))).toBe(false);
+        expect((await copies.get(companyId, copy.runId))?.receipt?.sandboxCopyRetained).toBe(true);
+        await expect(fs.stat(path.join(root, "tail.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      expect((await copies.get(companyId, copy.runId))?.receipt?.cleanupPending).toBe(false);
+      expect((await copies.get(companyId, copy.runId))?.nextAttemptAt).toBeNull();
+    });
+
+    it.each(["AGENT_FILES_FINAL_COLLECTION_UNAVAILABLE", "INSTRUCTION_COLLECTION_UNAVAILABLE"])("retains uncollected sandbox changes on an active lease after restart for %s", async errorCode => {
+      // A persisted remote row without a cached transport exercises the fallback
+      // that would otherwise call cleanupRemoteAfterRestart on the active lease.
+      const copy = await run();
+      const environmentId = randomUUID(), leaseId = randomUUID(), remoteCwd = path.join(home, randomUUID());
+      const executionRoot = path.join(remoteCwd, ".paperclip-runtime", "agent-files", agentId, copy.runId);
+      await fs.mkdir(executionRoot, { recursive: true });
+      await fs.writeFile(path.join(executionRoot, "tail.txt"), "uncollected after restart");
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId,
+        provider: "daytona", providerLeaseId: "retained-after-restart", status: "active" });
+      await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", errorCode, processStoppedAt: new Date(),
+        location: `remote:${environmentId}`, executionRoot, nextAttemptAt: new Date(),
+        receipt: { ...copy.receipt, cleanupPending: true, cleanup: { leaseId, remoteCwd } } })
+        .where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const execute = vi.fn(async (input: Parameters<EnvironmentRuntimeService["execute"]>[0]) => {
+        await execFile(input.command, input.args ?? [], { cwd: input.cwd });
+        return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+      });
+      const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand");
+      copies = agentInstructionWorkingCopyService(db, { environmentRuntime: { execute } as unknown as EnvironmentRuntimeService });
+      try {
+        await copies.release(companyId, copy.runId);
+        await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await fs.readFile(path.join(executionRoot, "tail.txt"), "utf8")).toBe("uncollected after restart");
+        await expect(fs.stat(path.join(root, "tail.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+        const released = (await copies.get(companyId, copy.runId))!;
+        expect(released).toMatchObject({ state: "unavailable", errorCode, nextAttemptAt: null,
+          receipt: { cleanupPending: false, sandboxCopyRetained: true } });
+        expect(released.receipt?.baseline).toBeUndefined();
+        await copies.release(companyId, copy.runId);
+        await copies.recoverCaptured();
+        expect(await copies.get(companyId, copy.runId)).toEqual(released);
+        expect(await fs.readFile(path.join(executionRoot, "tail.txt"), "utf8")).toBe("uncollected after restart");
+        expect(execute).not.toHaveBeenCalled();
+        expect(shell).not.toHaveBeenCalled();
+      } finally { shell.mockRestore(); }
+    });
+  });
+
   it("uses the workspace transport to restore after destruction of the remote filesystem", async () => {
     const remoteCwd = path.join(home, "remote-task");
     await fs.mkdir(remoteCwd, { recursive: true });
