@@ -209,6 +209,8 @@ export class CodexHarnessSession
     message: NativeUserMessage;
     /** Set by orchestration only after successful provider-session recovery. */
     continuation?: true;
+    /** Explicit semantic-result repair; ordinary prepared turns never set this. */
+    dispositionOnlyRecovery?: true;
     requestedCollaborationMode?: "default" | "plan";
     /** OpenCode/OpenRouter only. Applies to this turn, never subsequent turns. */
     reasoningMode?: "default" | "disabled";
@@ -221,7 +223,7 @@ export class CodexHarnessSession
     effectiveCollaborationMode: "default" | "plan";
   }> {
     this.assertProtocolIntegrity();
-    if (input.compact === true && (input.reasoningMode !== undefined || this.dispositionOnlyRecoveryAvailable)) {
+    if (input.compact === true && (input.reasoningMode !== undefined || this.dispositionOnlyRecoveryAvailable || input.dispositionOnlyRecovery === true)) {
       throw this.unsupported("context compaction", "compaction cannot combine with reasoning or disposition recovery");
     }
     // A compaction-only run resumes the session without a fresh usage report;
@@ -248,7 +250,8 @@ export class CodexHarnessSession
           : `session failed protocol validation: ${this.protocolFailureCode} (${this.protocolFailureMessage ?? "no detail"})`,
       );
     }
-    const dispositionOnlyRecovery = this.dispositionOnlyRecoveryAvailable;
+    const dispositionOnlyRecoveryAvailable = this.dispositionOnlyRecoveryAvailable;
+    const dispositionOnlyRecovery = dispositionOnlyRecoveryAvailable || input.dispositionOnlyRecovery === true;
     // A native continuation already carries just new events and the current
     // completion IDs. Do not wrap it in the prior task objective/constraints
     // or re-invoke a skill whose instructions are already in this session.
@@ -343,9 +346,9 @@ export class CodexHarnessSession
       this.turnStarted = false;
       if (dispositionOnlyRecovery) {
         if (error instanceof CodexRpcError) {
-          // A JSON-RPC error is a definite provider rejection: no turn was
-          // accepted, so the one-shot recovery allowance remains available.
-          this.dispositionOnlyRecoveryAvailable = true;
+          // A definite rejection accepted no turn. Restore only the prior
+          // allowance; explicit repair must not arm ordinary prepared turns.
+          this.dispositionOnlyRecoveryAvailable = dispositionOnlyRecoveryAvailable;
           this.dispositionOnlyRecoveryConsumed = false;
           this.dispositionOnlyRecoveryTurnId = null;
         } else {
