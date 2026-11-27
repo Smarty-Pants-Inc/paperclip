@@ -336,6 +336,9 @@ function Setup({
     environmentError =
       describeError(cause).body;
   }
+  // Pi RPC is a Runner provider, not an adapter registry entry. Its routed
+  // connection owns model discovery; while absent/loading, keep manual entry.
+  const connectionOnlyCatalog = brandType === "pi_rpc";
   const accountBoundCatalog = brandType === "copilot_runtime" || brandType === "antigravity_runtime";
   const accountCatalogAvailable = brandType === "copilot_runtime" || (brandType === "antigravity_runtime" && aiBinding?.method === "subscription");
   const requestAccountModels = accountCatalogAvailable && showModel && !connectionModels && Boolean(aiBinding)
@@ -348,7 +351,7 @@ function Setup({
       ? { provider: "acpx", acpxAgent: runnerProvider, aiConnection: aiBinding, environmentId }
       : { provider: aiBinding?.provider, environmentId }),
     ...(accountBoundCatalog ? ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
-    enabled: Boolean(brandType) && showModel && !connectionModels && (!accountBoundCatalog || requestAccountModels),
+    enabled: Boolean(brandType) && showModel && !connectionOnlyCatalog && !connectionModels && (!accountBoundCatalog || requestAccountModels),
     });
   const refreshAccountModels = models.refetch;
   useEffect(() => {
