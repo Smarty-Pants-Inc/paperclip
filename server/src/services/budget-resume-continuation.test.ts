@@ -150,6 +150,28 @@ describe.skipIf(!support.supported)("resuming after a budget hard stop", () => {
     expect(queued[0].contextSnapshot).toMatchObject({ issueId: task.issue.id });
   });
 
+  it("a budget resume of a cannot-resume chat does not choose a new session without a person's Retry", async () => {
+    const scope = await seedScope("chat-no-person-retry");
+    const task = await seedTask(scope, { issueStatus: "blocked" });
+    await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, task.issue.id));
+    await db.update(heartbeatRuns).set({ errorCode: "native_provider_state_incompatible", sessionIdBefore: "previous-chat-session" })
+      .where(eq(heartbeatRuns.id, task.run.id));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, scope.agent.id));
+    await db.insert(heartbeatRuns).values({ companyId: scope.company.id, agentId: scope.agent.id, status: "running" });
+    await resume(scope);
+    const heartbeat = heartbeatService(db);
+    await deliverBudgetResumeContinuations(db, {
+      resumeTaskRetry: (companyId, requestId) => heartbeat.resumeTaskRetry(companyId, requestId) });
+    const [saved] = await continuations(scope.company.id);
+    expect(saved?.payload?.taskRetry).not.toHaveProperty("personRetry");
+    const queued = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, scope.company.id),
+      eq(heartbeatRuns.status, "queued")));
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.contextSnapshot?.explicitFreshSession).toBeUndefined();
+    expect(queued[0]?.contextSnapshot?.previousRunId).toBe(task.run.id);
+    expect(await claimOf(task.run.id)).toMatchObject({ state: "delivered" });
+  });
+
   it("continues every task of a large scope", async () => {
     const scope = await seedScope("large");
     for (let index = 0; index < 30; index += 1) await seedTask(scope);

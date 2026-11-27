@@ -6,7 +6,7 @@ import { getServerAdapter } from "../../adapters/index.js";
 import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
-import { decideNativeContinuation, resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { decideNativeContinuation, resolveSessionContinuity, SavedSessionUnavailableError } from "../native-runtime/continued-session.js";
 import { deriveTaskKey } from "./run-preparation.js";
 import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 import { agentInstructionsService } from "../agent-instructions.js";
@@ -249,12 +249,18 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     managedAiRuntime.sessionIdentity,
     managedAiRuntime.identity,
   );
+  if (continuousPi && taskSession && context.explicitFreshSession !== true && context.conversationReset !== true) {
+    if (!taskSessionCredentialCompatible) throw new SavedSessionUnavailableError("credential_changed", "The credential for the saved session changed.");
+    if (resetTaskSession) throw new SavedSessionUnavailableError("configuration_reset",
+      `The saved session requires a configuration reset: ${sessionResetReason || (context.workspaceSelectionChanged ? "workspace selection changed" : "session reset required")}.`);
+  }
   const taskSessionId = readNonEmptyString(taskSessionDecodedParams?.sessionId);
   const taskResumeSessionId = taskSessionCredentialCompatible && taskSessionForRun?.lastRunId &&
     taskSessionForRun.lastRunId !== run.id && isNativeSessionId(taskSessionId) ? taskSessionId : null;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
     continuation: context.executionContinuation as ExecutionContinuationEnvelope | undefined,
+    sourceRunId: readNonEmptyString(context.previousRunId),
     mode: resolveSessionContinuity(runtimeConfig.provider, runtimeConfig.sessionContinuity) === "continuous" ? "whole" : "bounded",
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
     excludeCommentIds: [...new Set([...queuedCommentIdsFromRunContext(context),

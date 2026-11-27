@@ -7,8 +7,20 @@ import { currentRunFailureText } from "./native-exact-resume-failure.js";
  * error finalized under a generic code, so the run's current failure text must be exactly it.
  */
 export function sessionCannotContinue(run: { error?: string | null; errorCode?: string | null; resultJson?: unknown } | undefined) {
-  return run?.errorCode === "native_provider_state_incompatible"
+  return ["saved_session_unavailable", "native_provider_side_effect_pending", "native_provider_state_incompatible"].includes(run?.errorCode ?? "")
     || currentRunFailureText(run)?.trim() === "native_controller_recovery_missing_evidence:retained_sandbox_binding";
+}
+
+export type RetryReasonCode = "saved_session_unavailable" | "side_effect_pending" | "session_cannot_continue" | "configuration_reset" | "credential_changed";
+
+/** A pre-dispatch refusal, not a provider failure and never an automatic fork. */
+export class SavedSessionUnavailableError extends Error {
+  readonly code = "saved_session_unavailable";
+  constructor(readonly retryReasonCode: RetryReasonCode = "saved_session_unavailable", readonly retryReason = "The saved session could not be continued.") {
+    super(`saved_session_unavailable: ${retryReason}`);
+    this.name = "SavedSessionUnavailableError";
+  }
+  get resultJson() { return { retryReasonCode: this.retryReasonCode, retryReason: this.retryReason }; }
 }
 
 export function resolveSessionContinuity(provider: unknown, setting: unknown) {

@@ -247,6 +247,25 @@ describe("shared Runner execution driver", () => {
     expect(transport.register).not.toHaveBeenCalled();
   });
 
+  it.each(["ssh", "sandbox"])("waits for committed process identity after %s transport authentication", async mode => {
+    let committed!: () => void;
+    const processIdentityReady = new Promise<void>(resolve => { committed = resolve; });
+    const driver = createNativeRunnerExecutionDriver({
+      target: mode === "ssh" ? ssh : { ...sandbox(), getRunnerIngressEndpoint: async () => endpoint() } as AdapterExecutionTarget,
+      binding, runnerPublicUrl: "wss://core.example", runnerIngressAuthorized: true, prepareRemote: async () => {},
+      processStarted: Promise.resolve(), processIdentityReady,
+    });
+    const connection = await driver.controlPlaneRegistration!(authority);
+    await connection.activate?.();
+    let providerAdmitted = false;
+    const admission = connection.ready!().then(() => { providerAdmitted = true; });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(providerAdmitted).toBe(false);
+    committed(); await admission;
+    expect(providerAdmitted).toBe(true);
+    await connection.release();
+  });
+
   it("requires exact process identity before admitting an external provider", async () => {
     const driver = createNativeRunnerExecutionDriver({
       target: ssh, binding, runnerPublicUrl: "wss://core.example", prepareRemote: async () => {},

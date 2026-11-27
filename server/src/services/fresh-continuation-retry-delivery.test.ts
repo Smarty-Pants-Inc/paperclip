@@ -15,6 +15,7 @@ import { queuedRunDispatchClass } from "./heartbeat/queued-run-dispatch-order.js
 import { ASSIGNED_WORK_CONTINUED_ACTION } from "./recovery/task-automatic-attempts.js";
 import { CONTINUATION_CAP } from "./recovery/assigned-work-invariant.js";
 import { requestTaskRetry } from "./task-retry.js";
+import { currentProcessSpaceHash } from "./controller-process-identity.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -22,7 +23,8 @@ const suite = support.supported ? describe : describe.skip;
 const KINDS = ["fresh_isolated_workspace", "writer_ended", "native"] as const;
 type Kind = (typeof KINDS)[number];
 const RECORDED_ISOLATION: Record<Kind, string> = {
-  fresh_isolated_workspace: "fresh_isolated_workspace", writer_ended: "writer_ended", native: "remote_epoch" };
+  // A remote-looking profile without a matching workspace authority is not an epoch fence.
+  fresh_isolated_workspace: "fresh_isolated_workspace", writer_ended: "writer_ended", native: "fresh_isolated_workspace" };
 
 suite("a person's Retry while a continuation waits for delivery", () => {
   let db!: ReturnType<typeof createDb>;
@@ -66,7 +68,9 @@ suite("a person's Retry while a continuation waits for delivery", () => {
         state: "prepared", snapshotId: null } } }
         : { runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } } }),
       ...(kind === "fresh_isolated_workspace"
-        ? { processPid: 4242, processHostHash: "replaced-server", processStartedAt: new Date(Date.now() - 600_000) } : {}) });
+        ? { processPid: 4242, processHostHash: "replaced-server", processStartedAt: new Date(Date.now() - 600_000) }
+        : kind === "writer_ended" ? { processPid: 2147483647, processHostHash: currentProcessSpaceHash(),
+          processStartedAt: new Date(Date.now() - 600_000) } : {}) });
     if (native) {
       await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "terminal_failure",
         recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation", leaseOwner: null });
@@ -95,7 +99,7 @@ suite("a person's Retry while a continuation waits for delivery", () => {
   async function deliver() { await deliveryPass(); await deliveryPass(); }
   async function requestRetry(issueId: string, observedRunId: string) {
     const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: userId, observedRunId,
-      idempotencyKey: randomUUID(), actorSource: "local_implicit" });
+      idempotencyKey: randomUUID(), actorSource: "local_implicit", personRetry: { userId } });
     expect(receipt).toMatchObject({ accepted: true });
     return receipt.requestId!;
   }
@@ -159,6 +163,29 @@ suite("a person's Retry while a continuation waits for delivery", () => {
     const joined = await requestRetry(f.issueId, runs[0]!.id);
     expect(await wake(joined)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
     expect(await taskRuns(f)).toHaveLength(1);
+  }, 60_000);
+
+  it.each(["person", "budget_automatic", "restart_recovery"] as const)("freshens a folded chat Retry only for a positive person's choice (%s)", async caller => {
+    const f = await pendingContinuation("native");
+    await db.update(issues).set({ originKind: "chat_channel" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ errorCode: "native_provider_state_incompatible" }).where(eq(heartbeatRuns.id, f.runId));
+    await occupySlot();
+    const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, observedRunId: f.runId,
+      idempotencyKey: randomUUID(), actorSource: "local_implicit",
+      ...(caller === "person" ? { personRetry: { userId } } : caller === "restart_recovery"
+        ? { initiatedBy: caller, personRetry: { userId, expectedStartsNewSession: true } } : {}) });
+    expect(receipt).toMatchObject({ accepted: true });
+    const savedWake = await wake(receipt.requestId!);
+    const savedIntent = savedWake.payload!.taskRetry as { personRetry?: unknown; initiatedBy?: string };
+    expect(savedIntent.personRetry).toEqual(caller === "person" ? { userId } : undefined);
+    if (caller === "restart_recovery") expect(savedIntent.initiatedBy).toBe("restart_recovery");
+    process.stdout.write("person-authority-proof " + JSON.stringify({ caller, requestId: savedWake.id,
+      initiatedBy: savedIntent.initiatedBy, positivePersonMarker: savedIntent.personRetry !== undefined,
+      stockWakeSource: savedWake.source, stockWakeTrigger: savedWake.triggerDetail, stockActorType: savedWake.requestedByActorType }) + "\n");
+    await deliver();
+    await heartbeatService(db).resumeTaskRetry(companyId, receipt.requestId!);
+    const run = await expectSingleContinuationRun(f, receipt.requestId!);
+    expect(run.contextSnapshot?.explicitFreshSession).toBe(caller === "person" ? true : undefined);
   }, 60_000);
 
   it.each(KINDS)("starts exactly one run when a Retry and the delivery pass race (%s)", async kind => {

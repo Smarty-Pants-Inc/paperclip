@@ -1,4 +1,7 @@
 import { hasCommittedNativeControllerContainment } from "../native-runtime/native-failed-run-owner-release.js";
+import { FRESH_CONTINUATION_SUPERSEDED_KEY } from "../../agent-run-cancellation.js";
+import { continueFreshInTransaction, FRESH_CONTINUATION_SCHEMA } from "../fresh-continuation-fallback.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
 import { notifyStrandedAgentStatus } from "../live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork, notifyTaskRetrySettlement } from "../deferred-execution-notifications.js";
 import { notifyNativeResponsePresentation } from "../native-response-presentation-notifications.js";
@@ -59,6 +62,7 @@ import {
   nativeRunResults,
   environmentLeases,
   issueComments,
+  issueRecoveryActions,
   issueThreadInteractions,
   issueQuestionResponseDeliveries,
   issues,
@@ -125,6 +129,11 @@ type ChatFailedRunRetryOptions = {
   isShuttingDown: () => boolean;
   wakeup: IssueAssignmentWakeupDeps["wakeup"];
 };
+
+export function readPersonRetry(payload: Record<string, unknown>): { userId: string; expectedStartsNewSession?: boolean } | null {
+  const marker = z.object({ userId: z.string().min(1), expectedStartsNewSession: z.boolean().optional() }).safeParse(payload.personRetry);
+  return marker.success && marker.data.userId === payload.initiatedByUserId ? marker.data : null;
+}
 
 export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOptions) {
   const {
@@ -387,6 +396,17 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
         ),
       )
       .for("share", { noWait: true });
+    // This is a person's recorded replacement decision, NOT stop proof.
+    // Its transaction revoked the source token before any new admission.
+    if (run.resultJson?.[FRESH_CONTINUATION_SUPERSEDED_KEY]) {
+      const [choice] = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+        sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,schema}' = ${FRESH_CONTINUATION_SCHEMA}`,
+        sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' = ${run.id}`,
+        sql`length(${issueRecoveryActions.evidence}#>>'{freshContinuation,personRetry,userId}') > 0`,
+      )).limit(1);
+      if (choice) return { coordinator, leases: [], retiredOwner: null, personChoseFresh: true };
+    }
     if (coordinator && await hasCommittedNativeControllerContainment(tx, run, issueId)) {
       return { coordinator, leases: [], retiredOwner: null, operatorContained: true };
     }
@@ -700,7 +720,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
     }
     if (run.runtimeMode !== "native") return;
     const state = await failedNativeRetryCoordinator(tx, run, source.issueId);
-    if ("operatorContained" in state && state.operatorContained) return;
+    if (("operatorContained" in state && state.operatorContained) || ("personChoseFresh" in state && state.personChoseFresh)) return;
     const { coordinator, leases, retiredOwner } = state;
     if (retiredOwner) {
       if (
@@ -1488,6 +1508,8 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       failedRunId: string;
       initiatedByUserId: string;
       retryIntentId?: string;
+      /** Only the authenticated per-run Retry route supplies this authority. */
+      personRetry?: { userId: string; expectedStartsNewSession?: boolean };
     },
   ): Promise<{ actionId: string; issueId: string }> {
     let taskRetryInput: TaskRetryInput | undefined;
@@ -1498,6 +1520,17 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
     const onIdentityContention = (binding: PendingRetryBinding) => { pending.binding = binding; };
     try {
       source = await tx.transaction(async sourceTx => {
+        if (input.personRetry?.userId && input.personRetry.userId === input.initiatedByUserId) {
+          const { assertRetryExpectation, retryChoiceAllowsFresh } = await import("../run-retry-presentation.js");
+          const retry = await assertRetryExpectation(sourceTx as unknown as Db,
+            input.companyId, input.failedRunId, input.personRetry.expectedStartsNewSession);
+          const offered = await getExecutionBlocker(sourceTx as unknown as Db, input.companyId, input.issueId);
+          if (retryChoiceAllowsFresh(retry, input.personRetry.expectedStartsNewSession) && offered?.runId === input.failedRunId && offered.canRetry &&
+              (await (await import("../run-retry-presentation.js")).readRetrySelectorFacts(sourceTx as unknown as Db, input.companyId, input.failedRunId))?.requiresIsolatedWorkspace) {
+            await continueFreshInTransaction(sourceTx as unknown as Db, { companyId: input.companyId,
+              runId: input.failedRunId, trigger: "continuation_wake", delivery: "record", personRetry: input.personRetry });
+          }
+        }
         taskRetryInput = input.retryIntentId ? await selectTaskRetryInput(sourceTx, input) : undefined;
         if (input.retryIntentId && taskRetryInput && !taskRetryInput.sourceActionIds.length) {
           pending.restoreUnstartedInput = true;
@@ -1511,7 +1544,8 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
     }
     const binding = source ?? pending.binding!;
     const payload = source ? { version: 1, ...source, initiatedByUserId: input.initiatedByUserId,
-      ...(input.retryIntentId ? { taskRetryIntentId: input.retryIntentId } : {}) }
+      ...(input.retryIntentId ? { taskRetryIntentId: input.retryIntentId } : {}),
+      ...(input.personRetry?.userId && input.personRetry.userId === input.initiatedByUserId ? { personRetry: input.personRetry } : {}) }
       : pendingRetrySourceSchema.parse({ version: 1, sourceAuthorizationPending: true,
         failedRunId: input.failedRunId, issueId: input.issueId, agentId: input.agentId,
         initiatedByUserId: input.initiatedByUserId, taskRetryIntentId: input.retryIntentId, taskRetryInput,
@@ -1536,6 +1570,10 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           : JSON.stringify(existing.payload) !== JSON.stringify(payload))
       )
         throw failedChatRetryDenied();
+      if (input.personRetry?.userId && input.personRetry.userId === input.initiatedByUserId && !readPersonRetry(existing.payload)) {
+        await tx.update(chatActions).set({ payload: { ...existing.payload, initiatedByUserId: input.initiatedByUserId,
+          personRetry: input.personRetry } }).where(eq(chatActions.id, existing.id));
+      }
       return { actionId: existing.id, issueId: input.issueId };
     }
     if (!input.retryIntentId) {
@@ -1996,6 +2034,9 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           source: "on_demand",
           triggerDetail: "manual",
           reason: "retry_failed_run",
+          // Absence of taskRetryIntentId is NOT person authority: recovery
+          // resolution creates these actions too. Require the positive field.
+          ...(readPersonRetry(claimed.payload) ? { personRetry: readPersonRetry(claimed.payload)! } : {}),
           payload: context,
           contextSnapshot: context,
           allowRunCoalescing: false,

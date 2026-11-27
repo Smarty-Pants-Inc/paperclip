@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { chatActions, type Db } from "@paperclipai/db";
 import { chatChannelService, type ChatChannelService, type ChatChannelServiceOptions } from "../services/chat-channels.js";
 import { authorizeCommittedChatResponse, CommittedChatResponseAuthorizationError } from "../services/durable-chat-wakeup.js";
+import { readPersonRetry } from "../services/chat-channels/failed-run-retry.js";
 
 const services = new Set<ChatChannelService>();
 afterEach(async () => {
@@ -27,6 +28,14 @@ function deferred<T>() {
 }
 
 describe("failed chat retry service lifetime", () => {
+  it("requires positive per-run authority: recovery-actions/resolve is not a person's Retry", () => {
+    // The third route supplies precisely initiatedByUserId, with no task intent.
+    expect(readPersonRetry({ initiatedByUserId: "board-user" })).toBeNull();
+    expect(readPersonRetry({ initiatedByUserId: "board-user", taskRetryIntentId: "intent" })).toBeNull();
+    expect(readPersonRetry({ initiatedByUserId: "board-user", personRetry: { userId: "someone-else" } })).toBeNull();
+    expect(readPersonRetry({ initiatedByUserId: "board-user", personRetry: { userId: "board-user" } }))
+      .toEqual({ userId: "board-user" });
+  });
   it("shares an in-flight retry and observes shutdown after its candidate read", async () => {
     const candidate = deferred<unknown[]>();
     const reads = vi.fn((table: unknown) => table === chatActions ? candidate.promise : Promise.resolve([]));

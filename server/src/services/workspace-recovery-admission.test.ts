@@ -1,5 +1,11 @@
 import { createWakeAdmissionReader, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
 import { heartbeatService } from "./heartbeat.js";
+import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
+import { issueService } from "./issues.js";
+import { deliverConversationComments } from "./agent-conversations.js";
+import { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
+import { registerWorkspaceRecoveryWork } from "./workspace-recovery-work.js";
+import { activityLog, authUsers, companyMemberships } from "@paperclipai/db";
 import { mergeCoalescedContextSnapshot } from "./heartbeat/run-preparation.js";
 import { recoveryService } from "./recovery/index.js";
 import { inspectWorkspaceSource } from "./workspace-source-inspection.js";
@@ -2016,6 +2022,310 @@ describe("automatic retained workspace recovery", () => {
     const cleanup = () => { deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId); };
     return { f, original, reset, wake, deps, control, execution, cleanup };
   }
+
+  async function commentBackoffFixture(stopProvable: boolean) {
+    const t = stopProvable ? await heldStoppedEvidence() : await stoppedEvidenceFixture();
+    if (!stopProvable) await recoverRetainedWorkspace(t.f.input);
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, t.wake.id));
+    await db.delete(issueComments).where(eq(issueComments.id, t.reset.id));
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, t.f.issueId));
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    const before = readSystemRecovery((await action(t.f.actionId)).evidence)!;
+    const held = { ...before, revision: before.revision + 1, nextAttemptAt: Date.now() + 210_000 };
+    await updateSystemRecovery(db, t.f.input, before, held);
+    const add = (body = "/new", clientRequestId = randomUUID()) => issueService(db).addComment(t.f.issueId,
+      body, { userId: "operator" }, { clientRequestId });
+    return { ...t, held, add };
+  }
+
+  it("pulls a person's /new forward from 3.5 minutes through the real recovery worker and new-session admission", async () => {
+    const t = await commentBackoffFixture(true), { f, original } = t;
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: original.agentId, status: "running" }).returning();
+    const heartbeat = heartbeatService(db, { environmentRuntime: f.environmentRuntime }), errors = vi.fn();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: errors });
+    const worker = registerWorkspaceRecoveryWork(db, coordinator, f.environmentRuntime, heartbeat.resumeRemoteStopComments);
+    try {
+      await worker.ready;
+      expect(readSystemRecovery((await action(f.actionId)).evidence)?.nextAttemptAt).toBe(t.held.nextAttemptAt);
+      const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+      const at = Date.now(), comment = await t.add();
+      await deliverConversationComments(db, { id: f.issueId, companyId: f.companyId, conversationAgentId: original.agentId }, heartbeat.wakeup);
+      const successors = () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`, eq(heartbeatRuns.status, "queued")));
+      await expect.poll(async () => (await successors()).length, { timeout: 10_000 }).toBe(1);
+      expect(blocker?.workspaceRecovery).toMatchObject({ message: "Recovering saved work. Re-checking the previous run.",
+        nextCheckAt: new Date(t.held.nextAttemptAt!).toISOString() });
+      expect(readSystemRecovery((await action(f.actionId)).evidence)).toMatchObject({ state: "complete",
+        generationId: t.held.generationId, attempts: t.held.attempts + 1 });
+      expect(await readFile(path.join(f.host, "saved.txt"), "utf8")).toBe("finished work\n");
+      expect((await action(f.actionId)).evidence).toMatchObject({ automaticRecovery: { replay: "explicit_user_continuation" } });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId, { conversationResetCommentId: comment.id })).toBeNull();
+      const events = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+      expect(events.map(event => event.action)).toEqual(expect.arrayContaining(["issue.workspace_recovered", "issue.execution_recovery_settled"]));
+      const [successor] = await successors();
+      expect(successor.contextSnapshot).toMatchObject({ forceFreshSession: true, previousRunId: f.runId, wakeCommentIds: [comment.id] });
+      expect(successor.sessionIdBefore).toBeNull();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy.id));
+      const deps = createHeartbeatQueueTestDependencies(db);
+      deps.getAgent.mockResolvedValue((await db.select().from(agents).where(eq(agents.id, original.agentId)))[0]);
+      deps.instanceSettings.getExperimental.mockResolvedValue({ enableAgentChat: true, enableNativeRunner: true } as Awaited<ReturnType<typeof deps.instanceSettings.getExperimental>>);
+      const claimed = await createHeartbeatQueue(db, deps).claimQueuedRun(successor);
+      expect(claimed).toMatchObject({ id: successor.id, status: "running" });
+      const elapsedMs = Date.now() - at;
+      expect(elapsedMs).toBeLessThan(10_000);
+      expect(errors).not.toHaveBeenCalled();
+      console.info("comment-recheck-proof", JSON.stringify({ scenario: "stop_proven", sourceRunId: f.runId,
+        recoveryActionId: f.actionId, commentId: comment.id, previousNextAttemptAt: t.held.nextAttemptAt,
+        elapsedMs, successorRunId: claimed!.id, successorStatus: claimed!.status,
+        forceFreshSession: successor.contextSnapshot?.forceFreshSession, sessionIdBefore: successor.sessionIdBefore }));
+    } finally { await coordinator.stop(); await worker.stop(); t.cleanup(); }
+  }, 30_000);
+
+  it("after release, /new resets once and the second pending message gets exactly one answer in the new session", async () => {
+    const started = performance.now(), phases: Array<[string, number]> = [];
+    const mark = (phase: string) => phases.push([phase, Math.round(performance.now() - started)]);
+    const t = await commentBackoffFixture(false), { f, original } = t;
+    mark("fixture_ready");
+    const adapterType = "codex_local", executed: AdapterExecutionContext[] = [];
+    registerServerAdapter({ type: adapterType, supportsLocalAgentJwt: false,
+      execute: async input => {
+        executed.push(input);
+        await issueService(db).addComment(f.issueId, "The second message was answered in the new session.",
+          { agentId: original.agentId, runId: input.runId }, { completionReply: true });
+        return { exitCode: 0, signal: null, timedOut: false, sessionId: "new-chat-session",
+          sessionParams: { sessionId: "new-chat-session" }, resultJson: {} };
+      },
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
+    });
+    const heartbeat = heartbeatService(db);
+    try {
+      await db.insert(authUsers).values({ id: "operator", name: "Chat owner", email: "chat-owner@example.test",
+        createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: "operator", principalType: "user",
+        status: "active", membershipRole: "member" });
+      await db.update(agents).set({ adapterType, adapterConfig: { cwd: f.host } }).where(eq(agents.id, original.agentId));
+      const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: original.agentId, status: "running" }).returning();
+      const reset = await t.add("/new"), second = await t.add("Please answer this second pending message.");
+      mark("both_comments_saved");
+      const delivery = () => deliverConversationComments(db, { id: f.issueId, companyId: f.companyId,
+        conversationAgentId: original.agentId }, heartbeat.wakeup);
+      await delivery();
+      expect(executed).toHaveLength(0);
+      expect(await hasVerifiedWorkspaceRepair(db, await run(f.runId))).toBe(false);
+      mark("held_delivery_returned");
+      await t.control.acknowledgeRemoteStop(f.runId, f.companyId); t.cleanup();
+      mark("stop_acknowledged");
+      await recoverRetainedWorkspace(f.input);
+      mark("workspace_recovered");
+      expect(readSystemRecovery((await action(f.actionId)).evidence)?.state).toBe("complete");
+      await heartbeat.resumeRemoteStopComments(await run(f.runId));
+      await delivery();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy.id));
+      // Do not run instance-wide deferred-receipt/recovery scans in this row.
+      // Only this fixture's queue belongs to the synthetic adapter above.
+      await heartbeat.resumeQueuedRunsForAgent(f.companyId, original.agentId);
+      await heartbeat.drainActiveRunExecutions();
+      await delivery(); await heartbeat.resumeQueuedRunsForAgent(f.companyId, original.agentId);
+      await heartbeat.drainActiveRunExecutions();
+      mark("answer_drained");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(issue).toMatchObject({ conversationSessionGeneration: 1, conversationBoundaryCommentId: reset.id });
+      expect(executed).toHaveLength(1);
+      expect(executed[0].runtime.sessionId).toBeNull();
+      expect(executed[0].context).toMatchObject({ wakeCommentId: second.id, conversationSessionGeneration: 1 });
+      const replies = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+        eq(issueComments.authorAgentId, original.agentId)));
+      expect(replies.map(reply => reply.body)).toEqual(["The second message was answered in the new session."]);
+      const events = await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
+        eq(activityLog.action, "issue.conversation_session_started")));
+      expect(events).toHaveLength(1);
+      const before = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+      await delivery(); await delivery(); await heartbeat.resumeQueuedRunsForAgent(f.companyId, original.agentId);
+      await heartbeat.drainActiveRunExecutions();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(before.length);
+      expect(executed).toHaveLength(1);
+      mark("duplicate_delivery_checked");
+      process.stdout.write("two-input-release-proof " + JSON.stringify({ sourceRunId: f.runId, resetCommentId: reset.id,
+        secondCommentId: second.id, answerRunId: executed[0].runId, generation: issue.conversationSessionGeneration,
+        resets: events.length, answers: replies.length, providerTurns: executed.length, noExtraRunsAfterRepeatedDelivery: true, phases }) + "\n");
+    } finally {
+      // Retire synthetic blockers even when an assertion throws before release;
+      // do not let finally drain resurrect a deferred input in another row.
+      t.cleanup();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, original.agentId));
+      await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.companyId, f.companyId),
+        inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"])));
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(and(
+        eq(heartbeatRuns.companyId, f.companyId), inArray(heartbeatRuns.status, ["queued", "running"])));
+      try { await heartbeat.drainActiveRunExecutions(); }
+      finally { unregisterServerAdapter(adapterType); }
+    }
+  }, 60_000);
+
+  it("coalesces two quick human comments, keeps an unproven stop held, and resumes normal backoff without replay", async () => {
+    const t = await commentBackoffFixture(false), { f } = t;
+    try {
+      let wakes = 0;
+      const stop = subscribeDeliveryWork(db, DELIVERY_QUEUES.workspaceRecovery, () => { wakes += 1; });
+      const requestId = randomUUID(), errors = vi.fn();
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: errors });
+      let worker: ReturnType<typeof registerWorkspaceRecoveryWork> | undefined;
+      let first: Awaited<ReturnType<typeof t.add>>;
+      try {
+        [first] = await Promise.all([t.add("/new", requestId), t.add("Please continue")]);
+        const advanced = readSystemRecovery((await action(f.actionId)).evidence)!;
+        expect(advanced).toEqual({ ...t.held, revision: t.held.revision + 1, nextAttemptAt: expect.any(Number),
+          commentRecheck: { scheduledAt: t.held.nextAttemptAt, retriesUsed: t.held.retriesUsed, pending: true } });
+        expect(advanced.nextAttemptAt!).toBeLessThanOrEqual(Date.now());
+        expect(wakes).toBe(1);
+        worker = registerWorkspaceRecoveryWork(db, coordinator, f.environmentRuntime, async () => {});
+        await worker.ready;
+        await expect.poll(async () => readSystemRecovery((await action(f.actionId)).evidence)?.attempts,
+          { timeout: 5_000 }).toBe(t.held.attempts + 1);
+        await expect.poll(async () => readSystemRecovery((await action(f.actionId)).evidence)?.state,
+          { timeout: 5_000 }).toBe("awaiting_evidence");
+        const failed = readSystemRecovery((await action(f.actionId)).evidence)!;
+        expect(failed).toMatchObject({ state: "awaiting_evidence", generationId: t.held.generationId,
+          attempts: t.held.attempts + 1, retriesUsed: t.held.retriesUsed,
+          firstFailureAt: t.held.firstFailureAt, deadlineAt: t.held.deadlineAt,
+          failure: { code: "agent_stop_unconfirmed", retryClass: "recheck_evidence" } });
+        expect(failed.nextAttemptAt).toBe(t.held.nextAttemptAt);
+        expect(await t.add("/new", requestId)).toMatchObject({ id: first.id });
+        await recoverRetainedWorkspace(f.input);
+        expect(readSystemRecovery((await action(f.actionId)).evidence)).toEqual(failed);
+        expect(await hasVerifiedWorkspaceRepair(db, await run(f.runId))).toBe(false);
+        await expect(readFile(path.join(f.host, "saved.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await readFile(path.join(f.remote, "saved.txt"), "utf8")).toBe("finished work\n");
+        expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+        expect((await action(f.actionId)).evidence).toMatchObject({ automaticRecovery: { replay: "blocked" } });
+        expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")))).toHaveLength(0);
+        expect((await getExecutionBlocker(db, f.companyId, f.issueId))?.workspaceRecovery?.nextCheckAt)
+          .toBe(new Date(failed.nextAttemptAt!).toISOString());
+        expect(errors).not.toHaveBeenCalled();
+        console.info("comment-recheck-proof", JSON.stringify({ scenario: "stop_unproven_two_comments", sourceRunId: f.runId,
+          recoveryActionId: f.actionId, forcedAttempts: failed.attempts - t.held.attempts,
+          generationId: failed.generationId, nextAttemptAt: failed.nextAttemptAt, retryDueInMs: failed.nextAttemptAt! - Date.now(),
+          state: failed.state, failureCode: failed.failure?.code }));
+      } finally { stop(); await coordinator.stop(); await worker?.stop(); }
+    } finally { t.cleanup(); }
+  });
+
+  it("five spaced comments preserve the no-comment retry budget and absolute schedule; new stop proof recovers immediately", async () => {
+    const t = await commentBackoffFixture(false), { f } = t;
+    const at = Date.now(), clock = vi.spyOn(Date, "now");
+    try {
+      for (let i = 1; i <= 5; i++) {
+        clock.mockReturnValue(at + i * 10_000);
+        await t.add(`Still waiting ${i}`);
+        await recoverRetainedWorkspace(f.input);
+        const state = readSystemRecovery((await action(f.actionId)).evidence)!;
+        expect(state).toMatchObject({ state: "awaiting_evidence", retriesUsed: t.held.retriesUsed,
+          nextAttemptAt: t.held.nextAttemptAt, attempts: t.held.attempts + 1 });
+      }
+      expect(await hasVerifiedWorkspaceRepair(db, await run(f.runId))).toBe(false);
+      await t.control.acknowledgeRemoteStop(f.runId, f.companyId);
+      t.cleanup();
+      clock.mockReturnValue(at + 60_000);
+      await t.add("Now continue");
+      expect(readSystemRecovery((await action(f.actionId)).evidence)?.nextAttemptAt).toBeLessThanOrEqual(Date.now());
+      await recoverRetainedWorkspace(f.input);
+      expect(readSystemRecovery((await action(f.actionId)).evidence)?.state).toBe("complete");
+      expect(await readFile(path.join(f.host, "saved.txt"), "utf8")).toBe("finished work\n");
+      console.info("comment-recheck-proof", JSON.stringify({ scenario: "five_spaced_comments", sourceRunId: f.runId,
+        unchangedRetries: t.held.retriesUsed, unchangedSchedule: t.held.nextAttemptAt, forcedChecksBeforeProof: 1,
+        afterProof: "complete" }));
+    } finally { clock.mockRestore(); t.cleanup(); }
+  });
+
+  it.each(["workspace_writer_active", "effect_unresolved"] as const)(
+    "five spaced comments refund any forced evidence recheck: %s", async code => {
+      const t = await commentBackoffFixture(false), { f } = t;
+      const inspect = vi.spyOn(recoverySources, "inspectWorkspaceRecoverySource").mockRejectedValue(new SystemRecoveryFailure(code, "recheck_evidence"));
+      const at = Date.now(), clock = vi.spyOn(Date, "now");
+      try {
+        const held = { ...t.held, revision: t.held.revision + 1, failure: { ...t.held.failure!, code } };
+        await updateSystemRecovery(db, f.input, t.held, held);
+        for (let i = 1; i <= 5; i++) {
+          clock.mockReturnValue(at + i * 14_000);
+          await t.add(`Evidence still pending ${i}`);
+          await recoverRetainedWorkspace(f.input);
+          const state = readSystemRecovery((await action(f.actionId)).evidence)!;
+          expect(state).toMatchObject({ state: "awaiting_evidence", retriesUsed: held.retriesUsed,
+            nextAttemptAt: held.nextAttemptAt, attempts: held.attempts + 1 });
+          console.info("forced-evidence-refund", JSON.stringify({ code, comment: i, runId: f.runId,
+            retriesUsed: state.retriesUsed, nextAttemptAt: state.nextAttemptAt }));
+        }
+        expect(await hasVerifiedWorkspaceRepair(db, await run(f.runId))).toBe(false);
+      } finally { inspect.mockRestore(); clock.mockRestore(); t.cleanup(); }
+    }, 30_000);
+
+  it.each(["retry_transient", "service_required"] as const)("a real comment restores the transient schedule but keeps a terminal failure: %s", async retryClass => {
+    const t = await commentBackoffFixture(false), { f } = t;
+    const inspect = vi.spyOn(recoverySources, "inspectWorkspaceRecoverySource")
+      .mockRejectedValue(new SystemRecoveryFailure("export_interrupted", retryClass));
+    try {
+      await t.add("Please check now");
+      await recoverRetainedWorkspace(f.input);
+      const state = readSystemRecovery((await action(f.actionId)).evidence)!;
+      if (retryClass === "retry_transient") expect(state).toMatchObject({ state: "awaiting_evidence",
+        retriesUsed: t.held.retriesUsed, nextAttemptAt: t.held.nextAttemptAt, deadlineAt: t.held.deadlineAt,
+        commentRecheck: { pending: false } });
+      else expect(state).toMatchObject({ state: "exhausted", nextAttemptAt: null, failure: { retryClass: "service_required" } });
+      process.stdout.write("comment-class-proof " + JSON.stringify({ runId: f.runId, retryClass,
+        before: { retriesUsed: t.held.retriesUsed, nextAttemptAt: t.held.nextAttemptAt },
+        after: { retriesUsed: state.retriesUsed, nextAttemptAt: state.nextAttemptAt, state: state.state } }) + "\n");
+    } finally { inspect.mockRestore(); t.cleanup(); }
+  }, 60_000);
+
+  it.each(["non_chat", "wrong_user", "not_blocked", "system_comment", "exhausted", "deadline", "budget", "other_failure", "already_due"] as const)(
+    "does not expedite comment recovery outside its scope or budget: %s", async fault => {
+      const t = await commentBackoffFixture(false), { f } = t;
+      try {
+        if (fault === "non_chat") await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null }).where(eq(issues.id, f.issueId));
+        if (fault === "not_blocked") await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+        const changed = { ...t.held, revision: t.held.revision + 1,
+          ...(fault === "exhausted" ? { state: "exhausted" as const, nextAttemptAt: null } : {}),
+          ...(fault === "deadline" ? { deadlineAt: Date.now() - 1 } : {}),
+          ...(fault === "budget" ? { retriesUsed: 5 } : {}),
+          ...(fault === "other_failure" ? { failure: { ...t.held.failure!, retryClass: "retry_transient" as const } } : {}),
+          ...(fault === "already_due" ? { nextAttemptAt: Date.now() - 1 } : {}),
+        };
+        await updateSystemRecovery(db, f.input, t.held, changed);
+        const before = (await action(f.actionId)).evidence;
+        await issueService(db).addComment(f.issueId, "Continue", fault === "system_comment" ? {} : {
+          userId: fault === "wrong_user" ? "other-user" : "operator",
+        }, { clientRequestId: randomUUID() });
+        expect((await action(f.actionId)).evidence).toEqual(before);
+      } finally { t.cleanup(); }
+    });
+
+  it("keeps the provider cooldown and rolls back the comment and acceleration atomically", async () => {
+    const t = await commentBackoffFixture(false), { f } = t;
+    try {
+      const cooldown = Date.now() + 60_000;
+      const held = { ...t.held, revision: t.held.revision + 1, providerCooldownAt: cooldown };
+      await updateSystemRecovery(db, f.input, t.held, held);
+      let wakes = 0;
+      const stop = subscribeDeliveryWork(db, DELIVERY_QUEUES.workspaceRecovery, () => { wakes += 1; });
+      try {
+        await expect(db.transaction(async tx => {
+          await issueService(db).addComment(f.issueId, "/new", { userId: "operator" }, { clientRequestId: randomUUID() }, tx);
+          throw new Error("abort accepted input");
+        })).rejects.toThrow("abort accepted input");
+        expect(readSystemRecovery((await action(f.actionId)).evidence)).toEqual(held);
+        expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+        // Rollback still settles work-signal intent so a worker can reconcile
+        // uncertainty. It must find the original, future backoff and no input.
+        const settledRollback = wakes;
+        await t.add();
+        expect(readSystemRecovery((await action(f.actionId)).evidence)).toEqual({ ...held,
+          revision: held.revision + 1, nextAttemptAt: cooldown,
+          commentRecheck: { scheduledAt: held.nextAttemptAt, retriesUsed: held.retriesUsed, pending: true } });
+        expect(wakes).toBe(settledRollback + 1);
+      } finally { stop(); }
+    } finally { t.cleanup(); }
+  });
 
   async function heldStoppedEvidence() {
     const prepared = await stoppedEvidenceFixture();

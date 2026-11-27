@@ -258,6 +258,7 @@ export { parseRemoteExecutableCandidate } from "./codex-model-fallback.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { readRemoteUserHome } from "./remote-user-home.js";
 import { NativeRunnerIngressAcquisitionError, prepareNativeRemoteRunner, createNativeRunnerExecutionDriver, resolveRemoteRunnerTransportMode } from "./native-runner-execution-driver.js";
+import { recordReusedRunProcessIdentity } from "../run-process-owner.js";
 import type { Db } from "@paperclipai/db";
 import {
   and,
@@ -12594,6 +12595,7 @@ async function executePaperclipNativeSessionAttempt(
     `native-warm-session:${input.execution.binding.runId}`,
   );
   let existingWarmSession: NativeSession | undefined;
+  let warmProcessSourceRunId: string | undefined;
   let reusingReleasedRunner = false;
   let relaunchReleased: { owner?: ReturnType<typeof createPluginRunnerTaskOwner>; source: DurableRecoveryIdentity;
     runner: { version: string; digest: string }; published?: true } | undefined;
@@ -12704,6 +12706,7 @@ async function executePaperclipNativeSessionAttempt(
         if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
         entry.idleTimer = null;
         existingWarmSession = entry.session;
+        warmProcessSourceRunId = entry.pluginTaskId ? undefined : entry.runId;
         const relaunchOwner = reusingReleasedRunner && pluginTaskDescription?.resumeIdentityVersion === 1
           ? pluginTaskSessionOwners.get(entry.session) : undefined;
         if (relaunchOwner?.driver.releaseResume && releasedSource) {
@@ -13182,6 +13185,13 @@ async function executePaperclipNativeSessionAttempt(
                 // the work-based budget (provider-attempt-outcome.ts).
                 payload: { hostname: hostname(), providerAttempt: attempt, requestedAt: new Date().toISOString() },
               });
+              // A live warm transport is reused without spawning. Its previous
+              // callback belonged to the previous heartbeat run, so stamp this
+              // run too before another provider turn can execute tools.
+              if (existingWarmSession && warmProcessSourceRunId && input.onSpawn) {
+                await recordReusedRunProcessIdentity(input.db, { companyId: input.execution.binding.companyId,
+                  agentId: input.execution.binding.agentId, sourceRunId: warmProcessSourceRunId, onSpawn: input.onSpawn });
+              }
               // Fail mode (restart chaos only) is a runnerd start that failed before the process existed.
               crashPoint("native.process_start.after_requested_before_spawn", { fail: () => Object.assign(
                 new Error("spawn paperclip-runnerd EAGAIN"), { code: "EAGAIN", syscall: "spawn paperclip-runnerd" }) });
@@ -18018,6 +18028,12 @@ async function createRunnerdBackendWithinSessionClaim(
   let remoteCaBundleMapping: { sourcePath: string; targetPath: string } | null =
     null;
   let resolveRemoteRunnerProcessSpawned: (() => void) | null = null;
+  let remoteIdentityRecorded: () => void = () => {};
+  let remoteIdentityFailed: (error: unknown) => void = () => {};
+  const remoteProcessIdentityReady = remoteTarget ? new Promise<void>((resolve, reject) => {
+    remoteIdentityRecorded = resolve; remoteIdentityFailed = reject;
+  }) : Promise.resolve();
+  void remoteProcessIdentityReady.catch(() => {});
   const remoteRunnerProcessSpawned = remoteTarget
     ? new Promise<void>((resolveSpawned) => {
         resolveRemoteRunnerProcessSpawned = resolveSpawned;
@@ -19183,7 +19199,7 @@ async function createRunnerdBackendWithinSessionClaim(
         }
       : undefined;
 
-  const remoteProcessLauncher =
+  const launchRemoteProcess =
     remoteTarget && remoteCommandRunner && remoteBinary && remoteStateDirectory
       ? createRemoteRunnerProcessLauncher({
           target: remoteTarget,
@@ -19203,12 +19219,19 @@ async function createRunnerdBackendWithinSessionClaim(
               && !("homeMode" in input.execution && input.execution.homeMode === "preconfigured");
             return ensureRemoteRunner(sourceRun ? isolatedCodex ? "recovery" : "none" : "launch");
           },
-          onSpawn: input.onSpawn,
+          // Transport authentication may finish before the detached marker RPC.
+          // Do not admit a provider turn until the metadata transaction commits.
+          onSpawn: async meta => { await input.onSpawn?.(meta); remoteIdentityRecorded(); },
           onLog: input.onLog,
           trace: input.trace,
           onRunnerProcessSpawned: () => resolveRemoteRunnerProcessSpawned?.(),
         })
       : undefined;
+  const remoteProcessLauncher: typeof launchRemoteProcess = launchRemoteProcess ? spec => {
+    const handle = launchRemoteProcess(spec);
+    void handle.completion.then(() => remoteIdentityFailed(new Error("runner_remote_process_identity_unavailable")), remoteIdentityFailed);
+    return handle;
+  } : undefined;
   const runnerExecution: NativeExecutionInput = remoteTarget
     ? {
         ...input.execution,
@@ -19380,6 +19403,8 @@ async function createRunnerdBackendWithinSessionClaim(
   if (adoptedProcess && remoteTarget) {
     const markSpawned = resolveRemoteRunnerProcessSpawned as (() => void) | null;
     markSpawned?.();
+    await input.onSpawn?.({ pid: adoptedProcess.pid, processGroupId: null, startedAt: adoptedProcess.startedAt });
+    remoteIdentityRecorded();
   }
   const executeCurrentToolAuthority = (
     call: Parameters<SessionAuthorityEpoch["execute"]>[0],
@@ -19759,6 +19784,7 @@ async function createRunnerdBackendWithinSessionClaim(
           runnerCaBundlePath: input.runnerCaBundlePath,
           prepareRemote: prepareRemoteRunner,
           processStarted: remoteRunnerProcessSpawned,
+          processIdentityReady: remoteProcessIdentityReady,
           checkpoint: checkpointRemoteRunner,
           trace: input.trace,
           onLog: input.onLog,

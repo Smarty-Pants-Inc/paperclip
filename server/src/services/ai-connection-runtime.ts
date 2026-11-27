@@ -17,6 +17,7 @@ import {
 } from "@paperclipai/shared";
 import { managedProviderRouting } from "./ai-provider-routing.js";
 import { aiConnectionService } from "./ai-connections.js";
+import { managedAiSessionIdentity } from "./ai-connection-session.js";
 import { subscriptionService } from "./subscriptions.js";
 import { refreshSubscriptionConnection } from "./subscription-refresh.js";
 import { secretService } from "./secrets.js";
@@ -405,7 +406,8 @@ export async function prepareManagedAiRuntime(
       .digest("hex")
       .slice(0, 16);
     const identity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${generation}`;
-    const sessionIdentity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${noAuth ? "no-auth" : `${credentialRef!.secretId}:${freshness!.epoch}`}`;
+    const sessionIdentity = managedAiSessionIdentity(selection.grant.id, input.responsibleUserId,
+      noAuth ? null : { secretId: credentialRef!.secretId, epoch: freshness!.epoch });
     let homeRemoved = false;
     let ownsGoogleRecovery = false;
     let removalOnly = false;

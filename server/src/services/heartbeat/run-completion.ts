@@ -1,6 +1,6 @@
 import { PI_MODEL_PROVIDER_REQUIRED } from "../../adapters/pi-model-selection.js";
 import { ensurePiModelSelectionFailureNotice } from "../pi-model-selection-failure.js";
-import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { resolveSessionContinuity, SavedSessionUnavailableError } from "../native-runtime/continued-session.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { NativeProviderStateIncompatibleError, providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
@@ -191,7 +191,7 @@ export interface FailHeartbeatRunSetupInput {
 }
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
-  if (error instanceof NativeProviderStateIncompatibleError) return error.code;
+  if (error instanceof NativeProviderStateIncompatibleError || error instanceof SavedSessionUnavailableError) return error.code;
   if (error instanceof ProjectAccessDeniedError) return PROJECT_ACCESS_DENIED;
   if (error instanceof ChatControlRecoveryUnresolvedError)
     return CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE;
@@ -1768,6 +1768,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const connectionFailure = readGitConnectionFailure(outerErr);
     const setupFailureResultJson = {
       ...setupFailureDetails,
+      ...(outerErr instanceof SavedSessionUnavailableError ? outerErr.resultJson : {}),
       ...(nonRetryablePreflightCode === PI_MODEL_PROVIDER_REQUIRED && outerErr instanceof HttpError
         ? { modelSelection: { model: parseObject(outerErr.details).model, retryability: "requires_action" } } : {}),
       ...(failureCause ? { failureCause } : {}),

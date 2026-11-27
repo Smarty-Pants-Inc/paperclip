@@ -228,6 +228,8 @@ export function errorHandler(
         ? { error: "Internal server error" }
         : {
             error: sanitizeSecretSensitiveResponse(req, err.message),
+            ...(err.status === 409 && err.message === "retry_expectation_changed" && responseDetails?.retry
+              ? { retry: responseDetails.retry } : {}),
             ...(typeof responseDetails?.code === "string"
               ? { code: responseDetails.code }
               : {}),
@@ -262,6 +264,7 @@ export function errorHandler(
             ...(!redactedSkillPolicyDenial &&
             !workspaceRepairPreconditionFailure &&
             !boardAccessDenial &&
+            !(err.status === 409 && err.message === "retry_expectation_changed") &&
             responseDetailsValue
               ? { details: responseDetailsValue }
               : {}),

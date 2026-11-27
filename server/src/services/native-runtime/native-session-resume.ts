@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { resolveSessionContinuity } from "./continued-session.js";
+import { resolveSessionContinuity, SavedSessionUnavailableError } from "./continued-session.js";
 import { OWN_PROCESS_START_EVENT_TYPES } from "../native-process-start-events.js";
 import { and, desc, eq, exists, inArray, isNotNull, ne, not, notInArray, or, sql } from "drizzle-orm";
 import {
@@ -590,6 +590,10 @@ export function buildNativeExecutionWithCheckpoint(input: {
     Parameters<typeof rebindNativeSessionCheckpoint>[0]["previousRun"] | null;
   normalizedSessionId: string;
   sessionContinuity?: unknown;
+  /** The selector expected a saved session, even if its source row is missing. */
+  savedSessionExpected?: boolean;
+  /** Only the person's disclosed fresh-session choice can authorize this fork. */
+  allowFreshSession?: boolean;
   executionTargetKind?: NativeToolExecutionTargetKind;
   toolRefreshOnResume?: boolean;
   refreshTools?: boolean;
@@ -641,6 +645,12 @@ export function buildNativeExecutionWithCheckpoint(input: {
       checkpoint,
       normalizedSessionId: input.normalizedSessionId,
     };
+  if (!input.allowFreshSession && (input.savedSessionExpected ?? input.previousRun !== null) &&
+    execution.provider.kind === "pi_rpc" && resolveSessionContinuity("pi_rpc", input.sessionContinuity ?? execution.provider.sessionContinuity) === "continuous") {
+    if (input.previousRun?.errorCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING) throw new SavedSessionUnavailableError("side_effect_pending",
+      "The last action may or may not have run. Check it before you continue.");
+    throw new SavedSessionUnavailableError();
+  }
   // Rebuild both task context and wake instructions. Merely rotating the ID
   // leaves a fresh provider with a compact delta and missing task context.
   const normalizedSessionId = randomUUID();

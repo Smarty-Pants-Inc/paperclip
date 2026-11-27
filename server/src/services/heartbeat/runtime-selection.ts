@@ -1,4 +1,4 @@
-import { resolveSessionContinuity } from "../native-runtime/continued-session.js";
+import { resolveSessionContinuity, SavedSessionUnavailableError } from "../native-runtime/continued-session.js";
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
@@ -122,6 +122,7 @@ export interface HeartbeatRuntimeSelectionInput {
     persistedNativeExecutionInput: NativeExecutionInput | null;
     persistedRunnerProfile: Record<string, unknown>;
     taskResumeSessionId: string | null;
+    savedSessionExpected?: boolean;
     isFailedChatRunRetry: boolean;
     getFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   };
@@ -918,7 +919,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                   : null,
               ...nativeProvider,
               lifecyclePolicy: effectiveLifecyclePolicy,
-              sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
+              sessionContinuity: runtimeConfig.sessionContinuity,
               interactionResponses,
               completionContract: {
                 id: completionContract.row.id,
@@ -936,7 +937,9 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       const nativeExecutionWithCheckpoint = buildNativeExecutionWithCheckpoint({
         previousRun: previousNativeRun,
         normalizedSessionId: nativeSessionId,
-        sessionContinuity: parseObject(agent.adapterConfig).sessionContinuity,
+        sessionContinuity: runtimeConfig.sessionContinuity,
+        savedSessionExpected: Boolean(input.session.savedSessionExpected || resumableTaskSessionId || previousNativeRun),
+        allowFreshSession: context.explicitFreshSession === true,
         executionTargetKind: executionTarget?.kind ?? "local",
         toolRefreshOnResume,
         refreshTools: context.refreshTools === true,
@@ -952,8 +955,13 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       }
       nativeSessionId = nativeExecutionWithCheckpoint.normalizedSessionId;
     }
+    // Persisted bootstrap inputs take a different construction path. The same
+    // late refusal applies there; a retained normalized ID is not a checkpoint.
+    if (!nativeResumeCheckpoint && (input.session.savedSessionExpected || resumableTaskSessionId || previousNativeRun) && context.explicitFreshSession !== true &&
+      nativeExecution.provider.kind === "pi_rpc" && resolveSessionContinuity("pi_rpc", runtimeConfig.sessionContinuity) === "continuous")
+      throw new SavedSessionUnavailableError();
     if (nativeResumeCheckpoint && previousNativeRun && nativeExecution.provider.kind === "pi_rpc" &&
-      resolveSessionContinuity("pi_rpc", parseObject(agent.adapterConfig).sessionContinuity) === "continuous" &&
+      resolveSessionContinuity("pi_rpc", runtimeConfig.sessionContinuity) === "continuous" &&
       (executionTarget?.kind ?? "local") === "local") {
       const previous = parseNativeExecutionInput(parseObject(previousNativeRun.runnerProfileJson).nativeExecutionInput);
       if (JSON.stringify(previous.workspace) !== JSON.stringify(nativeExecution.workspace) ||
@@ -961,8 +969,9 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
           (previous.binding.executionWorkspaceId !== previous.binding.runId || nativeExecution.binding.executionWorkspaceId !== nativeExecution.binding.runId)))
         workspaceContinuationSource = previous;
     }
-    if (nativeResumeCheckpoint && nativeExecution.provider.kind === "acpx"
-      && nativeExecution.provider.agent === "antigravity") {
+    if (nativeResumeCheckpoint && ((nativeExecution.provider.kind === "pi_rpc" &&
+      resolveSessionContinuity("pi_rpc", runtimeConfig.sessionContinuity) === "continuous") ||
+      (nativeExecution.provider.kind === "acpx" && nativeExecution.provider.agent === "antigravity"))) {
       nativeResumeCheckpoint = { ...nativeResumeCheckpoint, providerRecoveryPolicy: "same_session_only" };
     }
     const nativeSandboxLifecycle = resolveNativeSandboxLifecycle({

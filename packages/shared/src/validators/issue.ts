@@ -647,6 +647,7 @@ export const retryWorkspaceExportSchema = z.object({
 export const taskRetrySchema = z.object({
   idempotencyKey: z.string().guid(),
   observedRunId: z.string().guid().nullable(),
+  expectedStartsNewSession: z.boolean().optional(),
   retryAction: z.literal("move_forward").optional(),
 }).strict();
 

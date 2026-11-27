@@ -1,3 +1,4 @@
+import { retryStartsNewSessionColumn, withRetryConsequence, type RetryConsequence } from "../run-retry-presentation.js";
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
 import { preservedAccountRuntimeState } from "../agent-provider-rate-limits.js";
 import { readRuntimeAccountingTotals } from "../runtime-accounting-totals.js";
@@ -67,6 +68,7 @@ const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
 
 const heartbeatRunListColumns = {
+  retryStartsNewSession: retryStartsNewSessionColumn,
   id: heartbeatRuns.id,
   responsibleUserId: heartbeatRuns.responsibleUserId,
   companyId: heartbeatRuns.companyId,
@@ -338,12 +340,14 @@ const heartbeatRunExecutionEvidenceColumn = sql<Record<string, unknown> | null>`
 `.as("resultJson");
 
 const heartbeatRunSafeColumns = {
+  retryStartsNewSession: retryStartsNewSessionColumn,
   ...getTableColumns(heartbeatRuns),
   processGroupId: heartbeatRunProcessGroupIdColumn,
   resultJson: heartbeatRunSafeResultJsonColumn,
 } as const;
 
 const heartbeatRunSqlAsciiSafeColumns = {
+  retryStartsNewSession: retryStartsNewSessionColumn,
   ...getTableColumns(heartbeatRuns),
   processGroupId: heartbeatRunProcessGroupIdColumn,
   error: sql<string | null>`NULL`.as("error"),
@@ -384,6 +388,8 @@ const heartbeatRunIssueControlColumns = {
 } as const;
 
 const heartbeatRunIssueSummaryColumns = {
+  companyId: heartbeatRuns.companyId,
+  retryStartsNewSession: retryStartsNewSessionColumn,
   id: heartbeatRuns.id,
   runtimeMode: heartbeatRuns.runtimeMode,
   wakeupRequestId: heartbeatRuns.wakeupRequestId,
@@ -1133,11 +1139,11 @@ export function createHeartbeatRunState(db: Db) {
   async function getRun(
     runId: string,
     opts?: { unsafeFullResultJson?: boolean; includeExecutionEvidence?: boolean },
-  ) {
+  ): Promise<typeof heartbeatRuns.$inferSelect & Partial<RetryConsequence>> {
     const safeForLegacyEncoding =
       !opts?.unsafeFullResultJson && (await hasUnsafeTextProjectionDatabase());
     const columns = opts?.unsafeFullResultJson
-      ? getTableColumns(heartbeatRuns)
+      ? { ...getTableColumns(heartbeatRuns), retryStartsNewSession: retryStartsNewSessionColumn }
       : safeForLegacyEncoding ? heartbeatRunSqlAsciiSafeColumns : heartbeatRunSafeColumns;
     return db
       .select(opts?.includeExecutionEvidence
@@ -1145,7 +1151,7 @@ export function createHeartbeatRunState(db: Db) {
         : columns)
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
+      .then(async (rows) => (await Promise.all(rows.map(row => withRetryConsequence(db, row.companyId, row))))[0] ?? null);
   }
 
   async function getRunExecutionWait(companyId: string, runId: string) {
@@ -1843,7 +1849,8 @@ export function createHeartbeatRunState(db: Db) {
           : HEARTBEAT_RUN_LIST_DEFAULT_LIMIT;
         return await query.limit(boundedLimit);
       });
-      return rows.map((row) => {
+      const projectedRows = await Promise.all(rows.map(row => withRetryConsequence(db, companyId, row)));
+      return projectedRows.map((row) => {
         const {
           contextIssueId,
           contextTaskId,
@@ -2030,7 +2037,7 @@ export function createHeartbeatRunState(db: Db) {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId))
         .limit(1);
-      return run ?? null;
+      return run ? withRetryConsequence(db, run.companyId, run) : null;
     },
 
     getRunIssueControl: async (runId: string) => {
@@ -2085,7 +2092,7 @@ export function createHeartbeatRunState(db: Db) {
         )
         .orderBy(desc(heartbeatRuns.startedAt))
         .limit(1);
-      return run ?? null;
+      return run ? withRetryConsequence(db, run.companyId, run) : null;
     },
   };
 }

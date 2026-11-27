@@ -54,7 +54,14 @@ export function completedWorkspaceRecoveryCondition(runId: string | AnyColumn | 
   );
 }
 
+export function newSessionRetryNextAction(chat: boolean) {
+  const subject = chat ? "conversation" : "task";
+  return `Retry starts a new session. It gets this ${subject}'s messages and replies (the oldest are left out if the ${subject} is very long), not the agent's tool steps; the old session is not resumed.`;
+}
+// Task wording is the safe default; chat callers classify the issue explicitly.
+export const NEW_SESSION_RETRY_NEXT_ACTION = newSessionRetryNextAction(false);
 export const RECOVERED_WORK_RETRY_MESSAGE = "Saved work recovered. Retry continues from it.";
+export const RECOVERED_WORK_NEW_SESSION_MESSAGE = `Saved work recovered. ${NEW_SESSION_RETRY_NEXT_ACTION}`;
 
 export function recoveredWorkMessage(runStatus: string | null | undefined, retryOffered: boolean) {
   if (retryOffered) return RECOVERED_WORK_RETRY_MESSAGE;
@@ -77,9 +84,14 @@ export function workspaceRecoveryDisplay(evidence: Record<string, unknown>, runI
   run?: { status: string | null; retryOffered: boolean }): ExecutionBlocker["workspaceRecovery"] {
   const state = readWorkspaceRecovery(evidence);
   if (!state || state.runId !== runId) return undefined;
+  const system = readSystemRecovery(evidence);
+  const rechecking = system?.sourceRunId === runId && system.failure?.retryClass === "recheck_evidence"
+    && (system.state === "awaiting_evidence" || system.state === "running");
   return { status: state.status, stage: state.stage,
+    ...(rechecking && system.nextAttemptAt !== null ? { nextCheckAt: new Date(system.nextAttemptAt).toISOString() } : {}),
     canRetry: state.status === "blocked" && state.retryable === true,
-    message: state.status === "queued" || state.status === "recovering" ? "Recovering saved work…"
+    message: rechecking ? "Recovering saved work. Re-checking the previous run."
+      : state.status === "queued" || state.status === "recovering" ? "Recovering saved work…"
       : state.status === "recovered" ? recoveredWorkMessage(run?.status, run?.retryOffered ?? false)
         : blockedWorkspaceRecoveryMessage(evidence) ?? state.message ?? "Recovery of this task's saved work has not finished.",
   };

@@ -796,6 +796,8 @@ export interface WakeupOptions {
   taskRetryRequestId?: string;
   /** Exact failed run selected by an authenticated board Retry request. */
   failedRunId?: string | null;
+  /** Server-owned board authorization; never copied from wake payload/context. */
+  personRetry?: { userId: string; expectedStartsNewSession?: boolean };
   durableChatRequest?: DurableChatWakeupRequest;
   /** Server-owned Dot admission receipt; never accepted from API payloads. */
   durableDotRequest?: {

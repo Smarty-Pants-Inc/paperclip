@@ -1,3 +1,4 @@
+import { retryStartsNewSessionColumn, readRetryConsequence } from "./run-retry-presentation.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { skillAccessService } from "./skill-access.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
@@ -520,6 +521,7 @@ export function activityService(db: Db) {
       const runsQuery = db
         .select({
           runId: heartbeatRuns.id,
+          retryStartsNewSession: retryStartsNewSessionColumn,
           runtimeMode: heartbeatRuns.runtimeMode,
           wakeupRequestId: heartbeatRuns.wakeupRequestId,
           status: heartbeatRuns.status,
@@ -690,7 +692,7 @@ export function activityService(db: Db) {
         }
       }
 
-      return runs.map((run) => {
+      return Promise.all(runs.map(async (run) => {
         const leaseRow = leaseByRunId.get(run.runId);
         const leaseMetadata = leaseRow?.lease.metadata ?? null;
         const workspacePath =
@@ -701,6 +703,7 @@ export function activityService(db: Db) {
               : null;
         return {
           ...run,
+          ...await readRetryConsequence(db, companyId, run.runId),
           failureCause: normalizeRunFailureCause(run.failureCause),
           resultJson: run.resultJson ? {
             ...run.resultJson,
@@ -737,7 +740,7 @@ export function activityService(db: Db) {
           retryExhaustedReason: retryExhaustedReasonByRunId.get(run.runId) ?? null,
           retriedBy: retriedBy(run),
         };
-      });
+      }));
     },
 
     issuesForRun: async (runId: string, readCondition: SQL<boolean>) => {

@@ -1,3 +1,4 @@
+import { retryStartsNewSessionColumn, readRetryConsequence, assertRetryExpectation } from "../services/run-retry-presentation.js";
 import { resolveLoginEnvironmentTarget } from "../services/login-environment.js";
 import { checkAgentProtectedEnvironmentKeys } from "../services/protected-environment-keys.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
@@ -6387,6 +6388,7 @@ export function agentRoutes(
 
     let wakePayload = req.body.payload ?? null;
     let retryConversationContext: Record<string, unknown> = {};
+    let personRetry: { userId: string; expectedStartsNewSession?: boolean } | undefined;
     let retryNativeReviewContext: NativeReviewAssignmentContext | null = null;
     if (req.body.failedRunId) {
       assertBoard(req);
@@ -6426,8 +6428,10 @@ export function agentRoutes(
           (await getExecutionBlocker(db, agent.companyId, issueId))?.runId !== failedRun.id)) {
         throw conflict("The stopped run no longer owns this task's recovery hold.");
       }
+      let nativeAgentChat = false;
       if (issueId) {
         const issue = await issueService(db).getById(issueId);
+        nativeAgentChat = !!issue?.conversationAgentId;
         if (!issue || issue.companyId !== agent.companyId) throw notFound("Task not found");
         if (issue.conversationAgentId && issue.conversationUserId !== req.actor.userId) {
           throw forbidden("Only the conversation owner can retry a chat run");
@@ -6484,20 +6488,12 @@ export function agentRoutes(
           }
         }
       }
-      const chatBinding = issueId
-        ? await db
-            .select({ id: chatConversations.id })
-            .from(chatConversations)
-            .where(
-              and(
-                eq(chatConversations.companyId, agent.companyId),
-                eq(chatConversations.issueId, issueId),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0])
-        : null;
-      if (chatBinding) {
+      await assertRetryExpectation(db, agent.companyId, failedRun.id, req.body.expectedStartsNewSession);
+      personRetry = req.actor.userId ? { userId: req.actor.userId, expectedStartsNewSession: req.body.expectedStartsNewSession } : undefined;
+      const { isChatTask } = await import("../services/fresh-continuation-retry-fold.js");
+      // Agent Chat uses its owner/generation checks above. Connected chats must
+      // still pass the durable conversation authorization, even if binding vanished.
+      if (issueId && await isChatTask(db, agent.companyId, issueId) && !nativeAgentChat) {
         if (failedRun.status === "cancelled") {
           throw conflict("Send a new chat message to continue this stopped conversation.");
         }
@@ -6513,6 +6509,7 @@ export function agentRoutes(
             agentId: agent.id,
             failedRunId: failedRun.id,
             initiatedByUserId: req.actor.userId!,
+            personRetry,
           }),
         );
         let receipt;
@@ -6553,6 +6550,7 @@ export function agentRoutes(
     }
     const run = await heartbeat.wakeup(id, {
       failedRunId: req.body.failedRunId ?? null,
+      personRetry,
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
       source: opts.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
@@ -7366,6 +7364,7 @@ export function agentRoutes(
     const distinctTasks = req.query.distinctTasks === "true";
 
     const columns = {
+      retryStartsNewSession: retryStartsNewSessionColumn,
       id: heartbeatRuns.id,
       runtimeMode: heartbeatRuns.runtimeMode,
       companyId: heartbeatRuns.companyId,
@@ -7459,10 +7458,12 @@ export function agentRoutes(
     const projections = await executionProjectionsForRuns(db, companyId, rows.map(run => run.id));
     const readDecisions = await getHeartbeatRunReadDecisions(db, access, req.actor, rows);
     const readableRuns = rows.filter((_, index) => readDecisions[index]);
+    const consequences = new Map(await Promise.all(readableRuns.map(async run => [run.id, await readRetryConsequence(db, companyId, run.id)] as const)));
     const silences = await heartbeat.buildRunOutputSilences(readableRuns);
     const silenceByRun = new Map(readableRuns.map((run, index) => [run.id, silences[index]!]));
     res.json(await runRedactions.redactForRuns(companyId, rows.map((run, index) => !readDecisions[index] ? redactHeartbeatRunListRow(run) : ({
       ...heartbeat.decorateActiveRunStatus(run),
+      ...consequences.get(run.id),
       agentAppearance: resolveAgentAppearance(run.agentAppearance, run.agentId),
       avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
       execution: projections.get(run.id) ?? null,

@@ -201,7 +201,7 @@ async function issueBoundToWorkspace(db: Db | Parameters<Parameters<Db["transact
   return Boolean(bound);
 }
 
-async function storeTaskDirectoryRestorePoint(db: Db, storage: StorageService, workspace: Workspace, generation: number,
+export async function storeTaskDirectoryRestorePoint(db: Db, storage: StorageService, workspace: Workspace, generation: number,
   captured: Awaited<ReturnType<typeof captureTaskDirectorySnapshot>>, signal?: AbortSignal) {
   const id = randomUUID();
   const sealed = await sealRestorePoint(captured.payload, { companyId: workspace.companyId, workspaceId: workspace.id, restorePointId: id, generation });
