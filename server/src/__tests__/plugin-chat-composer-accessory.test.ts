@@ -39,7 +39,7 @@ describe("chat composer accessory capability contract", () => {
     ["unrelated issue read", ["issues.read"], false],
     ["unrelated sidebar", ["ui.sidebar.register"], false],
   ] as const)("agrees at install and runtime with %s capabilities", (_label, capabilities, allowed) => {
-    const parsed = pluginManifestV1Schema.parse({ ...manifest, capabilities: [...capabilities] });
+    const parsed = pluginManifestV1Schema.parse({ ...manifest, capabilities: [...capabilities] }) as PaperclipPluginManifestV1;
     const expected = { allowed, missing: allowed ? [] : ["ui.action.register"], pluginId: manifest.id };
     expect(validator.validateManifestCapabilities(parsed)).toMatchObject(expected);
     expect(validator.checkUiSlot(parsed, "chatComposerAccessory")).toEqual({
@@ -60,7 +60,7 @@ describe("chat composer accessory capability contract", () => {
   });
 
   it("preserves the accepted slot through the contribution metadata used by the discovery route", () => {
-    const parsed = pluginManifestV1Schema.parse(manifest);
+    const parsed = pluginManifestV1Schema.parse(manifest) as PaperclipPluginManifestV1;
     expect(validator.validateManifestCapabilities(parsed).allowed).toBe(true);
     const contribution = getPluginUiContributionMetadata(parsed);
     expect(contribution).toEqual({ uiEntryFile: "index.js", slots: manifest.ui!.slots, launchers: [] });
