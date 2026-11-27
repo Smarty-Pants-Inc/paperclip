@@ -769,11 +769,11 @@ describe("native status authority", () => {
     ]);
   });
 
-  it("continues a system environment blocker in a fresh session, bounded, and never for a paused task or chat", () => {
+  it("continues a system environment blocker, bounded, and never for a paused task or chat", () => {
     const blocked = assessment({ reportedDisposition: "blocked", objectiveSatisfied: false, allCriteriaSatisfied: false,
       blocker: { unblockAction: "Retry the run.", boardOwned: false, ownerKind: "system", scope: "task_wide" } });
     expect(arbitrate({ assessment: blocked, environmentBlocker: true })).toMatchObject({ statusAction: "preserve",
-      reasonCode: "native_environment_blocker", effects: [{ kind: "schedule_retry", cause: "native_environment_blocker", agentId: "agent" }] });
+      reasonCode: "native_environment_blocker", effects: [{ kind: "schedule_retry", cause: "native_environment_blocker", summary: "Continue the task.", agentId: "agent" }] });
     expect(arbitrate({ assessment: blocked, environmentBlocker: true, failureRetryCount: 2 })).toMatchObject({ toStatus: "blocked",
       reasonCode: "native_environment_blocker_exhausted", unblockDescriptor: { owner: "board" } });
     for (const held of [{ hasActivePauseHold: true }, { isConversation: true }, { environmentBlocker: false }]) {
@@ -781,7 +781,7 @@ describe("native status authority", () => {
     }
   });
 
-  it("hands the next turn to a queued chat request instead of continuing a blocker in a fresh session", () => {
+  it("hands the next turn to a queued chat request instead of continuing a blocker", () => {
     // A GitHub push that arrives during a review waits as a chat wake. A
     // self-continuation would keep the older request's head and never publish.
     const blocked = (ownerKind: "system" | "agent") => assessment({ reportedDisposition: "blocked", objectiveSatisfied: false,
@@ -810,7 +810,7 @@ describe("native status authority", () => {
     const blocked = (ownerKind: "agent" | "external") => assessment({ reportedDisposition: "blocked", objectiveSatisfied: false,
       allCriteriaSatisfied: false, blocker: { unblockAction: "Save the ledger.", boardOwned: false, ownerKind, scope: "task_wide" } });
     expect(arbitrate({ assessment: blocked("agent"), agentBlockerRecoverable: true })).toMatchObject({ statusAction: "preserve",
-      reasonCode: "native_agent_blocker_continuation", effects: [{ kind: "schedule_retry", cause: "native_agent_blocker_continuation", agentId: "agent" }] });
+      reasonCode: "native_agent_blocker_continuation", effects: [{ kind: "schedule_retry", cause: "native_agent_blocker_continuation", summary: "Continue the task once.", agentId: "agent" }] });
     const handoff = { toStatus: "blocked", reasonCode: "native_agent_blocker_needs_person",
       unblockDescriptor: { owner: "board", action: "Save the ledger." },
       effects: [{ kind: "bind_blocker", owner: "board", action: "Save the ledger." }] };

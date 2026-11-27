@@ -57,6 +57,9 @@ import { buildNativeExecutionInput } from "../services/native-runtime/native-exe
 import { buildNativeExecutionWithCheckpoint, nativeToolContractFingerprintForTarget } from "../services/native-runtime/native-session-resume.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { requestTaskRetry } from "../services/task-retry.js";
+import { materializeNativeAgentBlockerContinuation, materializeNativeEnvironmentBlockerRetry } from "../services/native-runtime/native-provider-capacity-retry.js";
+import { NATIVE_AGENT_BLOCKER_HINT } from "../services/native-runtime/native-agent-blocker.js";
+import { NATIVE_ENVIRONMENT_BLOCKER_HINT } from "../services/native-runtime/native-environment-blocker.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
 import { createPluginWorkspaceFixture } from "./helpers/plugin-workspaces.js";
@@ -158,6 +161,52 @@ describePostgres("heartbeat session preparation through adapter dispatch", () =>
     expect(captured.has(run!.id)).toBe(true);
     return { input: captured.get(run!.id)!, finished };
   }
+
+  it.each([
+    { lane: "agent", provider: "pi_rpc", fresh: false },
+    { lane: "environment", provider: "pi_rpc", fresh: false },
+    { lane: "agent", provider: "codex", fresh: true },
+    { lane: "environment", provider: "codex", fresh: true },
+  ])("native blocker retry session: lane=$lane provider=$provider fresh=$fresh", async ({ lane, provider, fresh }) => {
+    const f = await seed(), sessionId = randomUUID();
+    await db.update(agents).set({ adapterConfig: { provider, model: "fixture/model",
+      sessionContinuity: provider === "pi_rpc" ? "continuous" : "paperclip", fixtureSessionId: sessionId } })
+      .where(eq(agents.id, f.agentId));
+    const first = await execute(f);
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId,
+      nativeSessionId: sessionId, status: "failed", error: "Agent-reported blocker" })
+      .where(eq(heartbeatRuns.id, first.finished.id));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+    const materialize = lane === "agent" ? materializeNativeAgentBlockerContinuation : materializeNativeEnvironmentBlockerRetry;
+    const retryId = await db.transaction(tx => materialize({ tx: tx as unknown as Db,
+      ...f, runId: first.finished.id }));
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    const context = retry.contextSnapshot!;
+    expect(context.forceFreshSession).toBe(true);
+    expect(context.livenessContinuationInstruction).toBe(lane === "agent" ? NATIVE_AGENT_BLOCKER_HINT : NATIVE_ENVIRONMENT_BLOCKER_HINT);
+    // Advance only this durable retry's deadline; dispatch the actual materialized run.
+    await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1_000) }).where(eq(heartbeatRuns.id, retryId));
+    await heartbeat.promoteDueScheduledRetries();
+    await heartbeat.resumeQueuedRunsForAgent(f.companyId, f.agentId);
+    await heartbeat.drainActiveRunExecutions();
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const input = captured.get(retryId)!;
+    expect(input).toBeDefined();
+    process.stdout.write(`BLOCKER-SESSION ${JSON.stringify({ lane, provider, sourceRunId: first.finished.id, retryRunId: retryId,
+      savedSessionId: sessionId, resumedSessionId: input.runtime.sessionId, forceFreshSession: context.forceFreshSession,
+      explicitFreshSession: context.explicitFreshSession ?? null, message: retry.error, hint: context.livenessContinuationInstruction,
+      freshness: finished.resultJson?.configFreshness })}\n`);
+    expect(input.runtime.sessionId).toBe(fresh ? null : sessionId);
+    expect(finished.resultJson).toMatchObject({ configFreshness: { session: { reset: fresh, taskSessionReused: !fresh } } });
+    expect(input.context.livenessContinuationInstruction).toBe(context.livenessContinuationInstruction);
+    if (provider === "pi_rpc") expect(context.explicitFreshSession).not.toBe(true);
+    expect(retry.error).toBe(lane === "agent"
+      ? "The agent reported a blocker it owns. Paperclip continues the task once."
+      : "The agent reported a blocker in its execution environment, tools or platform. Paperclip continues the task.");
+    expect(context.livenessContinuationInstruction).toContain("Paperclip continued this task after that blocker. Earlier attempts may already have completed some steps:");
+    expect(context.livenessContinuationInstruction).not.toContain("fresh session");
+  });
 
   it.each(["continuous", "paperclip"])("a Pi workspace change preserves resume fields only in %s mode", async sessionContinuity => {
     const f = await seed(), cwd = await mkdtemp(join(tmpdir(), "workspace-continuation-"));
