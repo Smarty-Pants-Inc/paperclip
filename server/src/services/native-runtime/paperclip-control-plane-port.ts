@@ -2,7 +2,7 @@ import { notifyNativeResultCommit } from "../native-result-commit-notifications.
 import { settleProviderReturnedStopInput } from "../person-stop-before-turn.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
-import { and, asc, eq, gt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   heartbeatRunEvents,
@@ -47,6 +47,7 @@ import { crashPoint } from "@paperclipai/shared/crash-points";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-retired-backup-source.js";
 import { recordRunEventCommitted } from "../server-metrics.js";
 import { NATIVE_FRESH_SESSION_MARKER } from "./continued-session.js";
+import { queuedCommentIdsFromRunContext } from "../../lib/queued-comment-context.js";
 
 export interface PaperclipControlPlaneBinding {
   companyId: string;
@@ -521,13 +522,33 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
             sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
             sql`${issueComments.metadata}->>'sourceRunId' = ${run.id}`)).limit(1);
           if (prior && !marker) {
+            const context = record(run.contextSnapshot);
+            const wakeIds = [...new Set([...queuedCommentIdsFromRunContext(context),
+              ...[context.wakeCommentId, context.commentId].filter((id): id is string => typeof id === "string" && id.length > 0)])];
+            const [wake] = wakeIds.length ? await tx.select({ createdAt: issueComments.createdAt }).from(issueComments)
+              .where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+                inArray(issueComments.id, wakeIds)))
+              .orderBy(asc(issueComments.createdAt), asc(issueComments.id)).limit(1) : [];
+            let markerAt = run.createdAt;
+            if (wake) {
+              const [previous] = await tx.select({ createdAt: issueComments.createdAt }).from(issueComments)
+                .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issueComments.createdByRunId))
+                .where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+                  eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, run.agentId),
+                  eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.runtimeMode, "native"),
+                  lt(heartbeatRuns.createdAt, run.createdAt)))
+                .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+              // Strict millisecond gaps avoid depending on the thread's UUID tie-breaker.
+              markerAt = new Date(Math.max(wake.createdAt.getTime() - 1,
+                previous ? previous.createdAt.getTime() + 1 : -Infinity));
+            }
             const [comment] = await insertIssueComment(tx, {
               companyId: issue.companyId, issueId: issue.id, authorType: "system",
               authorAgentId: null, authorUserId: null, createdByRunId: null,
               conversationSessionGeneration: issue.conversationSessionGeneration,
               body: NATIVE_FRESH_SESSION_MARKER,
               presentation: { kind: "system_notice", tone: "neutral", detailsDefaultOpen: false },
-              metadata: { version: 1, sourceRunId: run.id, sections: [] }, createdAt: run.createdAt,
+              metadata: { version: 1, sourceRunId: run.id, sections: [] }, createdAt: markerAt,
             });
             publication = (await persistActivity(tx as unknown as Db, {
               companyId: issue.companyId, actorType: "system", actorId: "conversation",
