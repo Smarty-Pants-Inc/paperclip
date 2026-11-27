@@ -909,7 +909,9 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       } else {
         expect(error).toMatchObject({ code: "replacement_deferred_unexported_conversation" });
         expect(String(error)).toMatch(/conversation.*source sandbox/i);
-        expect(String(error)).toMatch(/operator.*handoff/i);
+        expect(String(error)).toMatch(/restore.*original configuration/i);
+        expect(String(error)).toMatch(/reset.*conversation/i);
+        expect(String(error)).not.toMatch(/operator.*handoff/i);
         expect(releases).toBe(0); expect(creates).toBe(0);
         const lease = (await environmentService(db).getLeaseById(f.lease.id))!;
         const result = await f.runtime.execute({ environment: { ...f.environment, driver: "sandbox" }, lease,

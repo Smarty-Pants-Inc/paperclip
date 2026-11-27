@@ -1193,11 +1193,19 @@ async function reusableLeaseTaskMatches(db: Db, lease: EnvironmentLease, issueId
   return (run?.issueId ?? null) === issueId;
 }
 
+async function terminalTaskIssueId(db: Db, input: { companyId: string; issueId: string | null; heartbeatRunId?: string | null }) {
+  if (input.issueId || !input.heartbeatRunId) return input.issueId;
+  const [run] = await db.select({ issueId: boundRunIssueIdSql() }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.heartbeatRunId), eq(heartbeatRuns.runtimeMode, "native")));
+  return run?.issueId ?? null;
+}
+
 async function reusableTerminalLeaseMatchesTask(db: Db, lease: EnvironmentLease, input: {
-  companyId: string; issueId: string | null; agentId: string | null;
+  companyId: string; issueId: string | null; agentId: string | null; heartbeatRunId?: string | null;
 }) {
   if (!lease.metadata?.sandboxStopAndRetainReceipt && !lease.metadata?.terminalPiSandboxPreviousRunId
     && !lease.metadata?.terminalPiSandboxOrigin) return true;
+  input = { ...input, issueId: await terminalTaskIssueId(db, input) };
   const reset = await terminalPiTaskResetBoundary(db, input);
   const sources = (await terminalPiSandboxSources(db, lease)).filter(source => !reset || source.createdAt >= reset);
   const source = await latestDurableTerminalPiSource(db, sources) ?? sources[0];
@@ -1210,6 +1218,7 @@ async function waitForSettlingReusableLease(db: Db, input: {
   companyId: string; environmentId: string; executionWorkspaceId: string | null; issueId: string | null;
   agentId: string; heartbeatRunId: string;
 }): Promise<EnvironmentLease | null> {
+  input = { ...input, issueId: await terminalTaskIssueId(db, input) };
   const deadline = Date.now() + SETTLING_REUSABLE_LEASE_WAIT_MS;
   let terminalStop: { lease: typeof environmentLeases.$inferSelect; deadline: number } | null = null;
   const unsettled = (lease: typeof environmentLeases.$inferSelect) => new ReusableSandboxResumeError({
@@ -2143,6 +2152,10 @@ function createSandboxEnvironmentDriver(
         let deferredLease: EnvironmentLease | undefined = deferred[0];
         if (deferredLease) {
           const scope = deferredLease.metadata?.reusableSandboxLease;
+          // A present but malformed identity is not authority to hand off an
+          // allocation. Preserve it untouched and name the reset/config action.
+          if (isRecord(scope) && scope.leaseFingerprint != null && !readLeaseFingerprint(scope.leaseFingerprint))
+            throw new ReusableConversationHeldError("source_identity_unverifiable");
           // A different provider/plugin/agent cannot operate the exact source.
           if (!isRecord(scope) || scope.provider !== parsed.config.provider || scope.adapterType !== input.adapterType
             || deferredLease.metadata?.pluginId !== pluginProvider.resolved.plugin.id) {

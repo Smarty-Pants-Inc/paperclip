@@ -5,7 +5,7 @@ export type HeldConversationFailureCode = typeof HELD_BOX_LOST | typeof REPLACEM
 
 export const HELD_BOX_LOST_MESSAGE = "The sandbox holding this task's conversation is gone and no backup could be restored. "
   + "Retry starts a fresh conversation; the earlier messages stay on the task. You can also reset the conversation to start again.";
-export const REUSABLE_CONVERSATION_HELD_MESSAGE = "The original sandbox still holds this task's conversation. "
+export const REUSABLE_CONVERSATION_HELD_MESSAGE = "This task's conversation is still in its source sandbox. "
   + "Restore the original configuration to continue, or reset the conversation if you intend to start again. "
   + "A saved backup alone does not allow Paperclip to release the sandbox.";
 
