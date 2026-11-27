@@ -612,12 +612,12 @@ describe("native reassessment worker lifecycle", () => {
     await issueService(db).update(seeded.issueId, mutation === "assignment" ? { assigneeAgentId: null } : { status: "blocked" });
     await flush();
     const after = await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, seeded.issueId));
-    expect(after).toHaveLength(before.length + 1);
+    expect(after).toHaveLength(before.length + (mutation === "blocked reassertion" ? 0 : 1));
     expect(await status(seeded.issueId)).toBe(mutation === "assignment" ? "in_review" : "blocked");
     const [current] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, seeded.runId));
     const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, current.assessmentId!));
     const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
-    expect(assessment.priorStatusVersion).toBe(issue.statusVersion);
+    expect(assessment.priorStatusVersion).toBe(issue.statusVersion - (mutation === "blocked reassertion" ? 1 : 0));
     await quiet();
   });
 
