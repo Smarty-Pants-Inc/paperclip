@@ -683,7 +683,7 @@ export function arbitrateNativeStatus(input: {
         statusAction: "preserve", toStatus: input.priorIssueStatus,
         reasonCode: NATIVE_ENVIRONMENT_BLOCKER_CODE, unblockDescriptor: null,
         effects: [{ kind: "schedule_retry", cause: NATIVE_ENVIRONMENT_BLOCKER_CODE,
-          summary: "Continue the task in a fresh session.", agentId: input.agentId }],
+          summary: "Continue the task.", agentId: input.agentId }],
       };
     }
     return {
@@ -709,7 +709,7 @@ export function arbitrateNativeStatus(input: {
         statusAction: "preserve", toStatus: input.priorIssueStatus,
         reasonCode: NATIVE_AGENT_BLOCKER_CONTINUATION_CODE, unblockDescriptor: null,
         effects: [{ kind: "schedule_retry", cause: NATIVE_AGENT_BLOCKER_CONTINUATION_CODE,
-          summary: "Continue the task once in a fresh session.", agentId: input.agentId }],
+          summary: "Continue the task once.", agentId: input.agentId }],
       };
     }
     const action = input.assessment.blocker.unblockAction;
