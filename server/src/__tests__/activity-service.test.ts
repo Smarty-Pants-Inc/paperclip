@@ -25,6 +25,7 @@ import { activityService } from "../services/activity.ts";
 import { issueReadSqlCondition } from "../services/authorization.ts";
 import { issueService } from "../services/issues.ts";
 import { documentService } from "../services/documents.ts";
+import { requestedRunCancellation } from "../services/run-cancellation.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -438,6 +439,58 @@ describeEmbeddedPostgres("activity service", () => {
       nextAction: "Review the completed output.",
     });
     expect(runs[0]).not.toHaveProperty("contextSnapshot");
+  });
+
+  // Keep reason: cancellation provenance and identity minimization in reload history.
+  it.each([
+    { name: "budget pause", cancellation: requestedRunCancellation({}, "Cancelled due to budget pause"),
+      expected: { source: "control_plane", reason: "Cancelled due to budget pause", initiatorType: "system" } },
+    { name: "agent lifecycle stop", cancellation: requestedRunCancellation({}, "Agent paused"),
+      expected: { source: "control_plane", reason: "Agent paused", initiatorType: "system" } },
+    { name: "general system cancel", cancellation: requestedRunCancellation({}, "Execution stopped"),
+      expected: { source: "control_plane", reason: "Execution stopped", initiatorType: "system" } },
+    { name: "person Stop", cancellation: requestedRunCancellation({ cancelledByActorType: "user" }, "Stopped by user"),
+      expected: { source: "operator", reason: "Stopped by user", initiatorType: "user" } },
+    { name: "operator cancel", cancellation: { source: "operator", reason: "operator_requested" },
+      expected: { source: "operator", reason: "operator_requested", initiatorType: null } },
+    { name: "agent cancel", cancellation: { source: "api", reason: "agent_requested", initiator: { type: "agent" } },
+      expected: { source: "api", reason: "agent_requested", initiatorType: "agent" } },
+    { name: "bounded strings", cancellation: { source: "s".repeat(65), reason: "r".repeat(121), initiator: { type: "user" } },
+      expected: { source: "s".repeat(64), reason: "r".repeat(120), initiatorType: "user" } },
+    { name: "invalid initiator type", cancellation: { source: "system", reason: "cancelled", initiator: { type: "plugin" } },
+      expected: { source: "system", reason: "cancelled", initiatorType: null } },
+    { name: "non-string fields", cancellation: { source: 42, reason: { private: "must-not-leak" }, initiator: { type: ["user"] } },
+      expected: { source: null, reason: null, initiatorType: null } },
+    { name: "empty object", cancellation: {}, expected: { source: null, reason: null, initiatorType: null } },
+    { name: "no cancellation", cancellation: undefined, expected: undefined },
+    { name: "null cancellation", cancellation: null, expected: undefined },
+    { name: "string cancellation", cancellation: "user", expected: undefined },
+    { name: "array cancellation", cancellation: [{ source: "operator" }], expected: undefined },
+  ])("preserves bounded cancellation provenance in reloaded task runs: $name", async ({ cancellation, expected }) => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Cancellation history", issuePrefix: `C${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "process" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Reload cancelled run", assigneeAgentId: agentId });
+    const stored = cancellation && typeof cancellation === "object" && !Array.isArray(cancellation)
+      ? { ...cancellation, id: "must-not-leak", userId: "must-not-leak", name: "must-not-leak", email: "must-not-leak",
+        initiator: { ...("initiator" in cancellation ? cancellation.initiator : {}),
+          id: "must-not-leak", userId: "must-not-leak", name: "must-not-leak", email: "must-not-leak" } }
+      : cancellation;
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, scopeKind: "issue",
+      status: "cancelled", livenessState: "advanced", finishedAt: new Date(),
+      resultJson: cancellation === undefined ? {} : { cancellation: stored } });
+
+    // The task chat's recent-run read uses this exact service path after reload.
+    const [row] = await activityService(db).runsForIssue(companyId, issueId, null, 2, undefined,
+      { skipLivenessBackfill: true });
+    expect(row?.runId).toBe(runId);
+    expect(row!.resultJson).toEqual(expected === undefined ? {} : { cancellation: expected });
+    if (expected !== undefined) {
+      expect(Object.keys((row!.resultJson as Record<string, unknown>).cancellation as object).sort()).toEqual(["initiatorType", "reason", "source"]);
+    } else {
+      expect(row!.resultJson).not.toHaveProperty("cancellation");
+    }
+    expect(JSON.stringify(row!.resultJson)).not.toContain("must-not-leak");
   });
 
   it("preserves continuous reply placement in the runsForIssue summary", async () => {
