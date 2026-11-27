@@ -424,6 +424,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
             : null,
       ...(typeof parsed.config.runnerIdleTimeoutMs === "number" ? { runnerIdleTimeoutMs: parsed.config.runnerIdleTimeoutMs } : {}),
       reusableLeaseConfigured: parsed.config.reuseLease === true,
+      callbackBridgeLogContext: {
+        providerLeaseId: input.lease?.providerLeaseId ?? null,
+        issueId: input.lease?.issueId ?? null,
+      },
       sandboxLeaseAcquisition: sandboxLeaseAcquisitionFromMetadata(
         input.lease?.metadata?.sandboxLeaseAcquisition,
         input.lease?.providerLeaseId,
