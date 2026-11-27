@@ -16,7 +16,7 @@ vi.mock("../chat-completion-delivery.js", async importOriginal => ({
   offerHeldChatCompletions: heldCompletionOffers.invoke,
 }));
 import * as resetWakeQueue from "../../modules/wake-queue/index.js";
-import { closeHeldNativeTurn, forgetDestroyedWarmNativeSessions } from "./native-session-executor.js";
+import { closeHeldNativeTurn, forgetDestroyedWarmNativeSessions, nativeControllerMigrationDescriptor } from "./native-session-executor.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { onRetainedNativeSessionCleanupRelease } from "../retained-native-session-cleanup-notifications.js";
@@ -14943,16 +14943,20 @@ describe("native warm session supervision", () => {
         .toMatchObject({ [marker]: "2026-11-25T13:00:00.000Z" });
     });
 
-    it.each(["closed", "closed-missing-checkpoint", "rebootedAt", "restoredFromSnapshotAt", "healthy"] as const)("handles a dead cached owner without silently starting a fresh session: %s", async mode => {
+    it.each(["closed", "closed-missing-checkpoint", "rebootedAt", "restoredFromSnapshotAt", "healthy", "v19-closed", "v19-cold"] as const)("handles a dead cached owner without silently starting a fresh session: %s", async scenario => {
+      const mode = scenario === "v19-closed" || scenario === "v19-cold" ? "closed" : scenario;
+      const retainedV19 = scenario.startsWith("v19-");
       const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>("../../vendor/paperclip-runner/index.js");
-      if (mode === "closed-missing-checkpoint") {
+      if (mode === "closed-missing-checkpoint" || retainedV19) {
         const issues = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({
           update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })),
         } as unknown as ReturnType<typeof issueServiceModule.issueService>);
         onTestFinished(() => issues.mockRestore());
       }
-      const { base } = fixture(`dead-owner-${mode}`);
-      const next = { ...base, binding: { ...base.binding, runId: `dead-owner-${mode}-second` } };
+      const { base } = fixture(`dead-owner-${scenario}`);
+      const next = { ...base, binding: { ...base.binding, runId: `dead-owner-${scenario}-second` } };
+      const fingerprint = nativeToolContractFingerprintForTarget("remote", base.provider.kind, retainedV19 ? "v19" : "v20");
+      const profile = { nativeToolContractFingerprint: fingerprint };
       const detach = vi.fn(async () => undefined), close = vi.fn(async () => undefined);
       const snapshot = vi.fn(async () => ({ schema: "test", retained: "conversation" }));
       const owner = { close, detachControllerForRestart: detach, snapshot,
@@ -14981,7 +14985,10 @@ describe("native warm session supervision", () => {
       }).mockImplementationOnce(async options => {
         expect(options.input.binding.runId).toBe(next.binding.runId);
         expect(options.input.session.normalizedSessionId).toBe(base.session.normalizedSessionId);
-        if (mode === "closed" || mode === "closed-missing-checkpoint" || mode === "healthy") {
+        if (scenario === "v19-cold") {
+          expect(options.existingSession).toBeUndefined();
+          expect(options.persistedSession).toMatchObject({ identity: { runId: next.binding.runId }, retained: "conversation" });
+        } else if (mode === "closed" || mode === "closed-missing-checkpoint" || mode === "healthy") {
           expect(options.existingSession).toBe(owner);
           attachmentAttempts++;
           if (mode !== "healthy") {
@@ -15003,11 +15010,20 @@ describe("native warm session supervision", () => {
         expect(restore).toHaveBeenCalled();
         return { ...result, normalizedSessionId: base.session.normalizedSessionId };
       });
-      await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner", useRunnerd: true, runnerExecutionTarget: target() });
+      await executePaperclipNativeSession({ db: leaseDb(base, {}, {}, [], profile), execution: base, runnerInstanceId: "runner", useRunnerd: true, runnerExecutionTarget: target() });
+      if (retainedV19) {
+        // Exact v19-server file digest, not the running server's default catalog.
+        const descriptor = nativeControllerMigrationDescriptor(base, fingerprint);
+        const checkpoint = JSON.parse(await readFile(descriptor.supervisorPath, "utf8"));
+        checkpoint.configDigest = descriptor.configDigest;
+        await writeFile(descriptor.supervisorPath, JSON.stringify(checkpoint));
+        if (scenario === "v19-cold") await forgetDestroyedWarmNativeSessions({ companyId: base.binding.companyId, environmentId: "environment", providerLeaseId: "same-box" });
+        console.info(JSON.stringify({ row: "V18-v19-warm-file", scenario, fingerprint, configDigest: descriptor.configDigest, checkpointIdentity: checkpoint.snapshot.identity }));
+      }
       restore.mockClear();
-      const currentDb = leaseDb(next);
+      const currentDb = leaseDb(next, {}, {}, [], profile);
       const nextDb = { ...currentDb, select: (columns?: Record<string, unknown>) => columns?.status && columns?.runnerProfileJson
-        ? { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ status: "succeeded", runnerProfileJson: { nativeExecutionInput: base } }]) }) }) }
+        ? { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ status: "succeeded", runnerProfileJson: { ...profile, nativeExecutionInput: base } }]) }) }) }
         : currentDb.select(columns as never) } as unknown as Db;
       const followUp = executePaperclipNativeSession({ db: nextDb, execution: next, runnerInstanceId: "runner", useRunnerd: true, runnerExecutionTarget: target(true) });
       if (mode === "closed-missing-checkpoint") {
@@ -15020,8 +15036,9 @@ describe("native warm session supervision", () => {
       }
       const answer = await followUp;
       expect(answer.summary).toBe("completed");
-      expect(state.execute).toHaveBeenCalledTimes(mode === "closed" ? 3 : 2);
-      expect(attachmentAttempts).toBe(mode === "closed" || mode === "healthy" ? 1 : 0);
+      expect(state.execute).toHaveBeenCalledTimes(mode === "closed" && scenario !== "v19-cold" ? 3 : 2);
+      expect(attachmentAttempts).toBe(scenario !== "v19-cold" && (mode === "closed" || mode === "healthy") ? 1 : 0);
+      if (retainedV19) console.info(JSON.stringify({ row: "V18-v19-warm-loaded", scenario, sameSessionId: next.session.normalizedSessionId, branch: scenario === "v19-cold" ? "cold-warm-loader" : "after_closed_owner" }));
       expect(close).not.toHaveBeenCalled();
       if (mode === "healthy") expect(detach).not.toHaveBeenCalled();
     });
