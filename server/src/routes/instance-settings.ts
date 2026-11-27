@@ -354,7 +354,10 @@ export function instanceSettingsRoutes(
   // shutdown budget); repeat until closed and busy are 0, then stop the controller (smarty-dev#4605, 11-27).
   router.post("/instance/warm-native-sessions/suspend-idle", async (req, res) => {
     assertCanManageInstanceSettings(req);
-    res.json(await heartbeat.suspendIdleWarmNativeSessions());
+    const result = await heartbeat.suspendIdleWarmNativeSessions();
+    logger.info({ closed: result.closed, busy: result.busy, failed: result.failed, released: result.released },
+      "operator suspended idle warm native sessions");
+    res.json(result);
   });
   router.post("/instance/task-drain/status", async (req, res, next) => {
     if (req.actor.source !== "cloud_control" || verifiedCloudControlClaims(req)?.action !== "task-drain:read-body") {
