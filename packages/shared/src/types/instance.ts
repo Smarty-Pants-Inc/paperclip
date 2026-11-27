@@ -28,7 +28,16 @@ export const DEFAULT_BACKUP_RETENTION: BackupRetentionPolicy = {
  */
 export type InstanceExecutionMode = "kubernetes" | "any";
 
+/** Administrator-chosen report destination. It must be a private place on this instance; a run link and a task title are private content.
+ * Use a root-relative URL so diagnostics cannot be directed off-instance. */
+export interface DefectReportDestination {
+  label: string;
+  url: string;
+}
+
 export interface InstanceGeneralSettings {
+  /** Optional; absent/null uses the plain instance-admin handoff sentence. */
+  defectReportDestination?: DefectReportDestination | null;
   censorUsernameInLogs: boolean;
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
   backupRetention: BackupRetentionPolicy;

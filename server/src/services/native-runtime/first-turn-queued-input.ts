@@ -198,12 +198,21 @@ function renderWholeFirstTurnQueuedInput(messages: readonly QueuedMessage[], val
   ].join("\n\n");
   // Decide whether this composition can claim anything before applying a size
   // limit: even an oversized message stays owed on an unmeasured composition.
-  if (validate?.(text) === false) return null;
+  try {
+    if (validate?.(text) === false) return null;
+  } catch (error) {
+    // The pre-seal command measure counts this exact rendered prefix. Attach
+    // its real target IDs here, where they exist, rather than parsing prose.
+    if (error instanceof NativeTurnPromptExceedsCommandBoundError && error.promptCause?.kind === "queued_input")
+      throw new NativeTurnPromptExceedsCommandBoundError({ ...error.promptCause,
+        commentIds: messages.filter(message => message.kind !== "interaction").map(message => message.id) });
+    throw error;
+  }
   // A person's words are indivisible, including card answers.
   const bytes = commandTextBytes(text);
   if (bytes > FIRST_TURN_QUEUED_INPUT_MAX_BYTES)
     throw new NativeTurnPromptExceedsCommandBoundError(messages.length === 1 && messages[0]!.kind === "interaction"
-      ? { kind: "human_response", bytes: Buffer.byteLength(messages[0]!.body), remedies: nativePromptRefusalRemedies("human_response") } : { kind: "queued_input", bytes, remedies: nativePromptRefusalRemedies("queued_input") });
+      ? { kind: "human_response", bytes: Buffer.byteLength(messages[0]!.body), remedies: nativePromptRefusalRemedies("human_response") } : { kind: "queued_input", bytes, commentIds: messages.filter(message => message.kind !== "interaction").map(message => message.id), remedies: nativePromptRefusalRemedies("queued_input") });
   return text;
 }
 

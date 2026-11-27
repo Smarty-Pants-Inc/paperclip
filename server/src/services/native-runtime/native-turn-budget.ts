@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import type { DefectReportDestination, ExecutionContinuationEnvelope, NativePromptRefusalCause, NativePromptRefusalKind, NativePromptRefusalRemedy } from "@paperclipai/shared";
+export type { NativePromptRefusalCause } from "@paperclipai/shared";
 import type { DurablePrpControlPlane, NativeSession } from "../../vendor/paperclip-runner/index.js";
 
 // One split, in encoded UTF-8 journal-command bytes (not prompt characters).
@@ -30,32 +31,7 @@ export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND = "native_turn_prompt_exce
 export const NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE = "The task input could not be sent, but this run has no readable explanation. Give your instance admin this run and the task title to check the agent's runtime and Paperclip versions; if you are the instance admin, check those versions directly. After the cause is fixed, send a message to continue. Saved messages and answers are kept.";
 const nativePromptMeasures = ["command", "command_upper_bound", "prompt", "envelope", "handoff_note"] as const;
 const nativePromptRemedies = ["edit_task_description", "edit_message", "delete_own_message", "new_followup_task", "report_defect", "check_versions"] as const;
-export type Remedy = typeof nativePromptRemedies[number];
-/** The known kind list lives here; title coverage is checked against it.
- * For command refusals, bytes names the measured thing through measure:
- * command = the WHOLE serialized guard command (including its conservative
- * sequence/identity shell); command_upper_bound = pre-seal command plus reserves;
- * prompt/envelope/handoff_note = that part's command-encoded bytes, NOT a turn.
- * Missing measure is supported only for older saved causes; never label those
- * bytes as a complete command. stale_copy.bytes is raw UTF-8 prompt evidence,
- * not evidence that the turn exceeds its byte limit. protected_inputs uses
- * protected_parts for the raw sum of located parts, or envelope_with_reserve
- * for the encoded envelope plus its reserved room. Readers retain unknown
- * kind/measure labels across version skew without guessing their meaning. */
-type NativePromptRefusalKind = "task_description" | "newest_message" | "unread_message" | "unread_messages" | "queued_input" | "human_response" | "protected_input" | "protected_inputs" | "command" | "unmeasured_composition" | "stale_copy";
-export type NativePromptRefusalCause = {
-  kind: NativePromptRefusalKind | (string & {});
-  bytes: number;
-  /** Supported routes, not permission grants. edit_message requires an editable
-   * queued message written by the reader; delete_own_message is author-only.
-   * For command, edit_task_description applies only if it contains the long text;
-   * report_defect applies when the task inputs are already small. A defect report
-   * includes this run and the task title. new_followup_task stays short and links
-   * to the saved context; it does not split the same text into more messages. */
-  remedies: Array<Remedy>;
-  count?: number;
-  measure?: typeof nativePromptMeasures[number] | "protected_parts" | "envelope_with_reserve" | (string & {});
-};
+export type Remedy = NativePromptRefusalRemedy;
 const nativePromptRefusalTitles: Record<string, string> = {
   task_description: "Task description is too large", newest_message: "Newest message is too large",
   unread_message: "Unread message is too large", unread_messages: "Unread messages are too large",
@@ -87,10 +63,13 @@ export function nativePromptRefusalRemedies(kind: NativePromptRefusalCause["kind
 export function nativePromptRefusalTitle(cause?: NativePromptRefusalCause): string {
   return cause && Object.hasOwn(nativePromptRefusalTitles, cause.kind) ? nativePromptRefusalTitles[cause.kind]! : "Task input could not be sent";
 }
-export function nativePromptRefusalDetail(cause?: NativePromptRefusalCause): string {
+export function nativePromptRefusalDetail(cause?: NativePromptRefusalCause, destination?: DefectReportDestination | null): string {
   if (!cause) return NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND_MESSAGE;
-  const followUp = "Create and assign a new short follow-up task linking to the long text or this task's saved context, rather than copying the long text into its description or messages. Send a short message there to start the work; this task stays stopped. Saved messages and answers are kept.";
-  const defectReport = "This is a defect in the agent's runtime or Paperclip, not an admin setting you can repair. Report this run and the task title to the developers maintaining the agent's runtime or Paperclip. Your instance admin can pass on the report; if that is you, report it directly. After the fix is installed, send a message to continue. Saved messages and answers are kept.";
+  const followUp = "Create and assign a new short follow-up task linking to the long text or this task's saved context, rather than copying the long text into its description or messages. This task stays stopped. Saved messages and answers are kept.";
+  const reportTo = destination
+    ? `Report it to ${destination.label} (${destination.url}) and give them the run link and the task title.`
+    : "Tell your instance admin (on most instances that is the person who set it up) and give them the run link and the task title; they report it to whoever maintains this instance's Paperclip.";
+  const defectReport = `This is a defect in the agent's runtime or Paperclip, not an admin setting you can repair. ${reportTo} After the fix is installed, send a message to continue. Saved messages and answers are kept.`;
   if (!Object.hasOwn(nativePromptRefusalTitles, cause.kind)) return `This Paperclip version does not recognize the saved input-refusal reason. The saved diagnostic byte count is ${cause.bytes} bytes; its meaning is not known here. Give your instance admin this run and the task title to check the agent's runtime and Paperclip versions; if you are the instance admin, check those versions directly. After the cause is fixed, send a message to continue. Saved messages and answers are kept.`;
   if (cause.kind === "unmeasured_composition") return `Paperclip could not check the complete turn's size before taking the queued input. No queued messages or answers were consumed; they remain saved. ${defectReport}`;
   if (cause.kind === "stale_copy") return `The agent's input still includes an old copy of task history that Paperclip left out to make room. ${defectReport}`;
@@ -120,28 +99,41 @@ export function nativePromptRefusalDetail(cause?: NativePromptRefusalCause): str
 }
 export function nativePromptRefusalCause(value: unknown): NativePromptRefusalCause | undefined {
   const v = record(value);
-  // A newer writer may know a kind or measure this reader does not. Preserve
-  // the readable evidence; only the unknown label's presentation falls back.
-  return typeof v.kind === "string" && /^[^\s:\[\]]+$/.test(v.kind) && Number.isSafeInteger(v.bytes) && Number(v.bytes) >= 0
+  if (!(typeof v.kind === "string" && /^[^\s:\[\]]+$/.test(v.kind) && Number.isSafeInteger(v.bytes) && Number(v.bytes) >= 0
     && (v.count === undefined || Number.isSafeInteger(v.count) && Number(v.count) > 0)
     && (v.measure === undefined || typeof v.measure === "string" && /^[^\s:\[\]]+$/.test(v.measure))
+    && (v.commentIds === undefined || Array.isArray(v.commentIds) && v.commentIds.every(id => typeof id === "string" && /^[a-zA-Z0-9_-]+$/.test(id)))
     && (v.remedies === undefined || Array.isArray(v.remedies)
-      && v.remedies.every(remedy => typeof remedy === "string" && /^[a-z_]+$/.test(remedy)))
-    // A future route must not erase the readable kind/bytes. Do not advertise
-    // an unsupported action; legacy causes keep an empty, non-inferred list.
-    ? { ...v, remedies: (v.remedies as string[] | undefined ?? []).filter(remedy => nativePromptRemedies.some(known => known === remedy)) } as NativePromptRefusalCause : undefined;
+      && v.remedies.every(remedy => typeof remedy === "string" && /^[a-z_]+$/.test(remedy))))) return undefined;
+  const cause: NativePromptRefusalCause = { kind: v.kind, bytes: Number(v.bytes),
+    ...(v.count === undefined ? {} : { count: Number(v.count) }),
+    ...(v.measure === undefined ? {} : { measure: v.measure as string }),
+    ...(v.commentIds === undefined ? {} : { commentIds: [...v.commentIds as string[]] }) };
+  // Missing differs from an explicitly saved empty list. Preserve that absence
+  // across decode/save/decode, so legacy unknown labels still mean text only.
+  if (v.remedies === undefined) return cause;
+  const supported = nativePromptRefusalRemedies(cause.kind, cause.measure);
+  const knownKind = Object.hasOwn(nativePromptRefusalTitles, cause.kind);
+  const knownMeasure = !cause.measure || (cause.kind === "command" ? nativePromptMeasures.some(measure => measure === cause.measure)
+    : cause.kind === "protected_inputs" && ["protected_parts", "envelope_with_reserve"].includes(cause.measure));
+  // A writer's list is not authoritative on a version mix. Use this reader's
+  // kind/measure-specific text contract; for known rows suppress incompatible
+  // actions as well as unknown labels, without inventing absent actions.
+  cause.remedies = !knownKind || !knownMeasure ? supported
+    : (v.remedies as string[]).filter((remedy): remedy is Remedy => nativePromptRemedies.some(known => known === remedy) && supported.includes(remedy as Remedy));
+  return cause;
 }
 export function nativePromptCauseFromError(error: unknown): NativePromptRefusalCause | undefined {
   const direct = nativePromptRefusalCause(record(error).promptCause);
   if (direct) return direct;
   // Read unfamiliar labels too; presentation, not parsing, owns known labels.
-  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([^\s:\[\]]+):(\d+)(?::count=(\d+))?(?::measure=([^\s:\[\]]+))?(?::remedies=([a-z_,]*))?(?=\]|$|\s)/);
-  return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}), ...(match[5] === undefined ? {} : { remedies: match[5] ? match[5].split(",") : [] }) }) : undefined;
+  const match = (error instanceof Error ? error.message : "").match(/native_prompt_cause=([^\s:\[\]]+):(\d+)(?::count=(\d+))?(?::measure=([^\s:\[\]]+))?(?::remedies=([a-z_,]*))?(?::commentIds=([a-zA-Z0-9_,\-]*))?(?=\]|$|\s)/);
+  return match ? nativePromptRefusalCause({ kind: match[1], bytes: Number(match[2]), ...(match[3] ? { count: Number(match[3]) } : {}), ...(match[4] ? { measure: match[4] } : {}), ...(match[5] === undefined ? {} : { remedies: match[5] ? match[5].split(",") : [] }), ...(match[6] === undefined ? {} : { commentIds: match[6] ? match[6].split(",") : [] }) }) : undefined;
 }
 export class NativeTurnPromptExceedsCommandBoundError extends Error {
   readonly code = NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND;
   constructor(readonly promptCause?: NativePromptRefusalCause) {
-    super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(promptCause)}${promptCause ? ` [native_prompt_cause=${promptCause.kind}:${promptCause.bytes}${promptCause.count === undefined ? "" : `:count=${promptCause.count}`}${promptCause.measure === undefined ? "" : `:measure=${promptCause.measure}`}:remedies=${promptCause.remedies.join(",")}]` : ""}`);
+    super(`${NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND}: ${nativePromptRefusalDetail(promptCause)}${promptCause ? ` [native_prompt_cause=${promptCause.kind}:${promptCause.bytes}${promptCause.count === undefined ? "" : `:count=${promptCause.count}`}${promptCause.measure === undefined ? "" : `:measure=${promptCause.measure}`}${promptCause.remedies === undefined ? "" : `:remedies=${promptCause.remedies.join(",")}`}${promptCause.commentIds === undefined ? "" : `:commentIds=${promptCause.commentIds.join(",")}`}]` : ""}`);
   }
 }
 

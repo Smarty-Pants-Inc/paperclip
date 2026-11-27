@@ -226,6 +226,7 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
   const parsed = instanceGeneralSettingsStorageSchema.safeParse(raw ?? {});
   if (parsed.success) {
     return {
+      ...(parsed.data.defectReportDestination === undefined ? {} : { defectReportDestination: parsed.data.defectReportDestination }),
       censorUsernameInLogs: parsed.data.censorUsernameInLogs ?? false,
       feedbackDataSharingPreference:
         parsed.data.feedbackDataSharingPreference ?? DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,

@@ -489,11 +489,11 @@ function protectedNativePromptCause(description: string, assignment: string, con
   // Raw sanitized UTF-8 is a LOWER bound on the bytes saved by removing a
   // rendered part (the journal adds JSON escaping). Never blame one part unless
   // removing it ALONE demonstrably leaves room, after all eligible cuts.
-  const part = (kind: NativePromptRefusalCause["kind"], text: string, unread = false) => {
+  const part = (kind: NativePromptRefusalCause["kind"], text: string, unread = false, commentIds?: string[]) => {
     const sanitized = text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
     const encoded = JSON.stringify(sanitized).slice(1, -1).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
     const present = sanitized.length > 0 && [sanitized, encoded, JSON.stringify(encoded).slice(1, -1)].some(value => rendered.includes(value));
-    return { kind, bytes: Buffer.byteLength(text), saving: present ? Buffer.byteLength(sanitized) : 0, unread };
+    return { kind, bytes: Buffer.byteLength(text), saving: present ? Buffer.byteLength(sanitized) : 0, unread, commentIds };
   };
   const candidates = [
     part("task_description", description), part("protected_input", description ? assignment.replace(description, "") : assignment),
@@ -502,13 +502,14 @@ function protectedNativePromptCause(description: string, assignment: string, con
     ...(continuation?.messages.filter(message => message === newest || !read.has(message.id) || continuation.originCommentIds.includes(message.id)
       || !Number.isFinite(lastRunAt) || !Number.isFinite(Date.parse(message.updatedAt)) || Date.parse(message.updatedAt) >= lastRunAt
       || !Number.isFinite(Date.parse(message.createdAt)) || Date.parse(message.createdAt) >= lastRunAt).map(message =>
-      part(message === newest ? "newest_message" : !read.has(message.id) ? "unread_message" : "protected_input", message.body, !read.has(message.id))) ?? []),
+      part(message === newest ? "newest_message" : !read.has(message.id) ? "unread_message" : "protected_input", message.body, !read.has(message.id), [message.id])) ?? []),
   ].filter(candidate => candidate.saving > 0).sort((a, b) => b.bytes - a.bytes);
   const single = candidates.find(candidate => totalBytes - candidate.saving <= NATIVE_TURN_KNOWN_MAX_BYTES);
-  if (single) return { kind: single.kind, bytes: single.bytes, remedies: nativePromptRefusalRemedies(single.kind) };
+  if (single) return { kind: single.kind, bytes: single.bytes, remedies: nativePromptRefusalRemedies(single.kind),
+    ...(single.commentIds ? { commentIds: single.commentIds } : {}) };
   const unread = candidates.filter(candidate => candidate.unread);
   if (unread.length > 1 && totalBytes - unread.reduce((sum, candidate) => sum + candidate.saving, 0) <= NATIVE_TURN_KNOWN_MAX_BYTES)
-    return { kind: "unread_messages", bytes: unread.reduce((sum, candidate) => sum + candidate.bytes, 0), count: unread.length, remedies: nativePromptRefusalRemedies("unread_messages") };
+    return { kind: "unread_messages", bytes: unread.reduce((sum, candidate) => sum + candidate.bytes, 0), count: unread.length, commentIds: unread.flatMap(candidate => candidate.commentIds ?? []), remedies: nativePromptRefusalRemedies("unread_messages") };
   const locatedBytes = candidates.reduce((sum, candidate) => sum + candidate.bytes, 0);
   return { kind: "protected_inputs", bytes: locatedBytes || totalBytes,
     measure: locatedBytes ? "protected_parts" : "envelope_with_reserve", remedies: nativePromptRefusalRemedies("protected_inputs") };

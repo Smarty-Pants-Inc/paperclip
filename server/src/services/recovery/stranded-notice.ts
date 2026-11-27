@@ -1,5 +1,5 @@
-import { NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, nativePromptRefusalCause, nativePromptRefusalDetail, nativePromptRefusalTitle, type NativePromptRefusalCause } from "../native-runtime/native-turn-budget.js";
-import type { IssueCommentMetadata, IssueCommentPresentation, TaskInterruptionPresentation } from "@paperclipai/shared";
+import { NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND, nativePromptRefusalCause, nativePromptRefusalDetail, nativePromptRefusalTitle } from "../native-runtime/native-turn-budget.js";
+import type { DefectReportDestination, IssueCommentMetadata, IssueCommentPresentation, TaskInterruptionPresentation } from "@paperclipai/shared";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
 import { PROJECT_STORAGE_ENVIRONMENT_INCOMPATIBLE } from "../project-storage-environment-reason.js";
 import {
@@ -70,11 +70,13 @@ export function classifiedRunFailure(run: {
   failedStage?: string | null;
   previousSessionUnconfirmed?: boolean;
   resultJson?: Record<string, unknown> | null;
-}): NonNullable<TaskInterruptionPresentation["failure"]> & { cause?: NativePromptRefusalCause } {
+}, destination?: DefectReportDestination | null): NonNullable<TaskInterruptionPresentation["failure"]> {
   let code = run.errorCode ?? "run_failed";
   if (code === NATIVE_TURN_PROMPT_EXCEEDS_COMMAND_BOUND) {
     const cause = nativePromptRefusalCause(run.resultJson?.nativeTurnPromptRefusalCause);
-    return { code, title: nativePromptRefusalTitle(cause), detail: nativePromptRefusalDetail(cause), ...(cause ? { cause } : {}) };
+    return { code, title: nativePromptRefusalTitle(cause), detail: nativePromptRefusalDetail(cause, destination),
+      ...(cause ? { cause: { ...cause, remedies: (cause.remedies ?? []).map(remedy => remedy === "report_defect"
+        ? { kind: "report_defect" as const, destination: destination ?? null } : remedy) } } : {}) };
   }
   if (code === "native_predecessor_retirement_unproven"
       || code === "native_session_interrupted" && run.previousSessionUnconfirmed)

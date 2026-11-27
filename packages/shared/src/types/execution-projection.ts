@@ -145,7 +145,14 @@ export interface TaskInterruptionPresentation {
   unansweredCommentId?: string;
   /** Latest failed attempt at the unanswered input. Stable classified copy only;
    * never raw run/provider text. Present only on a failed, retryable projection. */
-  failure?: { code: string; title: string; detail: string };
+  failure?: {
+    code: string;
+    title: string;
+    detail: string;
+    /** Size-refusal routes and exact causal messages. [] means text only;
+     * the page still applies target/author/queued/deleted checks. */
+    cause?: import("./native-prompt-refusal.js").NativePromptRefusalPresentationCause;
+  };
   providerFailure?: import("../provider-failure.generated.js").ProviderFailure;
   workspaceFailure?: { message: string };
   /**
