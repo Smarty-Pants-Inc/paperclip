@@ -22,6 +22,8 @@ import { githubRecoveryReceipts } from "./chat-channels/github/recovery-receipts
 import { readTaskRetryIntent } from "./task-retry.js";
 import { readByEarlierTurnCommentIds } from "./queued-comment-delivery.js";
 import type { NativeContinuationReadState } from "./native-runtime/native-turn-budget.js";
+import { continuationResultIdentityKeys } from "./execution-continuation-identity.js";
+export { continuationResultIdentityKeys } from "./execution-continuation-identity.js";
 
 const retryWakeReasons = new Set(["task_retry", "retry_failed_run"]);
 const maxRequeueChain = 32;
@@ -42,8 +44,7 @@ function continuationApiResult(operationId: string, result: unknown, companyId: 
   const serialized = JSON.stringify(data);
   if (Buffer.byteLength(serialized) <= 4 * 1024) return result;
   const reference: Record<string, unknown> = {};
-  for (const key of ["id", "companyId", "issueId", "key", "latestRevisionId", "latestRevisionNumber",
-    "identifier", "status", "statusVersion", "createdAt", "updatedAt"]) {
+  for (const key of continuationResultIdentityKeys) {
     const value = data[key];
     if (value === null || typeof value === "string" && value.length <= 256
       || typeof value === "number" && Number.isSafeInteger(value)) reference[key] = value;
