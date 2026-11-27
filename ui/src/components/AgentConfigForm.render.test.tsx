@@ -334,6 +334,7 @@ async function renderForm(
     onSaveActionChange?: (save: (() => void) | null) => void;
     onCancelActionChange?: (cancel: (() => void) | null) => void;
     cloud?: boolean;
+    cachedEnvironments?: Environment[];
   } = {},
 ) {
   mockEnvironmentsApi.list.mockResolvedValue(environments);
@@ -344,6 +345,7 @@ async function renderForm(
   const onSave = vi.fn();
   const queryClient = createFormQueryClient();
   if (options.cloud) queryClient.setQueryData(queryKeys.health, { status: "ok", cloud: { managed: true, availableHarnesses: sampleHarnesses } });
+  if (options.cachedEnvironments) queryClient.setQueryData(queryKeys.environments.list("company-1"), options.cachedEnvironments);
 
   await act(async () => {
     renderFormView(root, queryClient,
@@ -1041,6 +1043,100 @@ describe("AgentConfigForm environment selector", () => {
     expect(result.container.querySelector('[aria-label="Runner"]')).toBeNull();
     await clickByText(result.container, "Save");
     expect(result.onSave).toHaveBeenLastCalledWith({ defaultEnvironmentId: null });
+  });
+
+  // Regression: an unresolved list must not look like a complete Local/current-only list.
+  it.each([false, true])("shows loading environments while the list is pending (cached current: %s)", async cached => {
+    let resolveList!: (environments: Environment[]) => void;
+    mockEnvironmentsApi.list.mockImplementationOnce(() => new Promise<Environment[]>(resolve => { resolveList = resolve; }));
+    const current = daytonaEnvironments()[1]!;
+    const result = await renderForm([], { defaultEnvironmentId: current.id }, {
+      cachedEnvironments: cached ? [current] : undefined,
+    });
+    roots.push(result.root);
+
+    const section = result.container.querySelector('[data-config-section="environment"]')!;
+    expect(section.querySelector('[role="status"]')?.textContent).toBe("Loading environments…");
+    const options = await environmentOptions(result.container);
+    expect([...options.querySelectorAll('[role="option"]')].map(option => option.textContent)).toEqual(
+      cached ? ["Default: Local", "Daytona · sandbox"] : ["Default: Local"],
+    );
+    expect(options.querySelector<HTMLButtonElement>('[data-value=""]')?.disabled).toBe(false);
+    expect(result.onSave).not.toHaveBeenCalled();
+
+    await act(async () => resolveList(daytonaEnvironments()));
+    await flushReact();
+    expect(section.querySelector('[role="status"]')).toBeNull();
+    expect(options.textContent).toContain("Daytona · sandbox");
+    await clickElement(options.querySelector('[data-value=""]'));
+    await clickByText(result.container, "Save");
+    expect(result.onSave).toHaveBeenCalledWith({ defaultEnvironmentId: null });
+  });
+
+  it.each([false, true])("shows an environment load failure and retries in place (cached current: %s)", async cached => {
+    mockEnvironmentsApi.list.mockRejectedValueOnce(new Error("offline"));
+    const current = daytonaEnvironments()[1]!;
+    const dirty = vi.fn();
+    const result = await renderForm([], {
+      defaultEnvironmentId: current.id,
+      adapterConfig: { model: "saved-model", env: { CODEX_HOME: { type: "secret_ref", secretId: "saved-account" } } },
+    }, { cachedEnvironments: cached ? [current] : undefined, onDirtyChange: dirty });
+    roots.push(result.root);
+
+    const section = result.container.querySelector('[data-config-section="environment"]')!;
+    expect(section.querySelector('[role="alert"]')?.textContent).toContain("Couldn't load environments.");
+    const options = await environmentOptions(result.container);
+    expect(options.textContent).toContain("Default: Local");
+    if (cached) expect(options.textContent).toContain("Daytona · sandbox");
+    await clickElement(result.container.querySelector('[aria-label="Environment override"]'));
+
+    let resolveRetry!: (environments: Environment[]) => void;
+    mockEnvironmentsApi.list.mockImplementationOnce(() => new Promise<Environment[]>(resolve => { resolveRetry = resolve; }));
+    await clickByText(section as HTMLElement, "Try again");
+    expect(section.querySelector('[role="status"]')?.textContent).toBe("Loading environments…");
+    const other = makeEnvironment({ id: "workers", name: "workers", driver: "sandbox", config: { provider: "boat" } });
+    await act(async () => resolveRetry([current, other]));
+    await flushReact();
+    expect(section.querySelector('[role="alert"]')).toBeNull();
+    expect(section.querySelector('[role="status"]')).toBeNull();
+    expect(dirty).toHaveBeenLastCalledWith(false);
+    expect(result.onSave).not.toHaveBeenCalled();
+    await selectEnvironment(result.container, other.id);
+    await clickByText(result.container, "Save");
+    expect(result.onSave).toHaveBeenCalledWith({ defaultEnvironmentId: other.id });
+  });
+
+  it("keeps the successful empty environment list unchanged", async () => {
+    const result = await renderForm([], { defaultEnvironmentId: "saved-environment" });
+    roots.push(result.root);
+    const section = result.container.querySelector('[data-config-section="environment"]')!;
+    expect(section.querySelector('[role="status"], [role="alert"]')).toBeNull();
+    const options = await environmentOptions(result.container);
+    expect([...options.querySelectorAll('[role="option"]')].map(option => option.textContent)).toEqual(["Default: Local"]);
+    expect(result.container.querySelector('[aria-label="Environment override"]')?.textContent).toContain("saved-environment");
+  });
+
+  it("keeps the successful environment choices and save payload unchanged", async () => {
+    const other = makeEnvironment({ id: "workers", name: "workers", driver: "sandbox", config: { provider: "boat" } });
+    const result = await renderForm([...daytonaEnvironments(), other], { defaultEnvironmentId: "sandbox-1" });
+    roots.push(result.root);
+    const section = result.container.querySelector('[data-config-section="environment"]')!;
+    expect(section.querySelector('[role="status"], [role="alert"]')).toBeNull();
+    const options = await environmentOptions(result.container);
+    expect([...options.querySelectorAll('[role="option"]')].map(option => option.textContent)).toEqual([
+      "Default: Local", "Daytona · sandbox", "workers · sandbox",
+    ]);
+    await clickElement(options.querySelector('[data-value="workers"]'));
+    await clickByText(result.container, "Save");
+    expect(result.onSave).toHaveBeenCalledWith({ defaultEnvironmentId: "workers" });
+  });
+
+  it("keeps Local available while an environment list without a saved override is pending", async () => {
+    mockEnvironmentsApi.list.mockImplementationOnce(() => new Promise<Environment[]>(() => {}));
+    const result = await renderForm([]);
+    roots.push(result.root);
+    expect(result.container.textContent).toContain("Loading environments…");
+    expect((await environmentOptions(result.container)).textContent).toBe("Default: Local");
   });
 
   it("clears a new agent's environment override to the empty draft value", async () => {

@@ -454,7 +454,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     queryFn: () => instanceSettingsApi.get(),
   });
 
-  const { data: environments = [] } = useQuery<Environment[]>({
+  const {
+    data: environments = [],
+    isPending: environmentsPending,
+    isFetching: environmentsFetching,
+    isError: environmentsError,
+    refetch: refetchEnvironments,
+  } = useQuery<Environment[]>({
     queryKey: selectedCompanyId ? queryKeys.environments.list(selectedCompanyId) : ["environments", "none"],
     queryFn: () => environmentsApi.list(selectedCompanyId!),
     // Load environments when the picker is enabled OR when execution is forced
@@ -1038,7 +1044,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const showEnvironmentOverrideControl = environmentsEnabled && (
     forcedKubernetes ||
     currentDefaultEnvironmentId.length > 0 ||
-    runnableEnvironments.length >= 1
+    runnableEnvironments.length >= 1 ||
+    environmentsPending ||
+    environmentsError
   );
   const inheritedEnvironmentLabel = instanceDefaultEnvironment
     ? environmentDisplayLabel(instanceDefaultEnvironment)
@@ -1786,6 +1794,16 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           <div data-agent-tile={panels ? "" : undefined} className={cn(cards ? cardBody : "px-4 pb-3 space-y-3")}>
             <Field label="Environment override">
               <div className="space-y-2">
+                {environmentsPending || environmentsFetching ? (
+                  <p role="status" className="text-sm text-muted-foreground">Loading environments…</p>
+                ) : environmentsError ? (
+                  <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+                    <span>Couldn't load environments.</span>
+                    <Button type="button" variant="outline" size="xs" onClick={() => void refetchEnvironments()}>
+                      Try again
+                    </Button>
+                  </div>
+                ) : null}
                 <SelectPopover
                   aria-label="Environment override"
                   value={currentDefaultEnvironmentId}
