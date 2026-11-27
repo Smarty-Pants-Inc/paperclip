@@ -88,6 +88,41 @@ process.exit(result.status ?? 98);
     expect(captures).toBe(0);
   });
 
+  it.each([false, true])("preserves explicit commit dates through the generated launcher (broker file: %s)", async (brokerFile) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-commit-dates-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    const launcher = path.join(bin, "git");
+    await writeFile(launcher, githubLauncherSource({ brokerFile, interpreterPath: process.execPath }), { mode: 0o700 });
+    const env = { ...githubBrokerEnvironment({}, { url: "", token: "" }), HOME: root,
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      GIT_AUTHOR_DATE: "2001-02-03T04:05:06Z", GIT_COMMITTER_DATE: "2002-03-04T05:06:07Z" };
+    const git = async (...args: string[]) => (await exec(launcher, args, { cwd: root, env })).stdout.trim();
+    await git("init", "-q");
+    await git("commit", "--allow-empty", "-m", "Dated fixture");
+    expect(await git("log", "-1", "--format=%aI|%cI"))
+      .toBe("2001-02-03T04:05:06+00:00|2002-03-04T05:06:07+00:00");
+  });
+
+  it("strips ambient author and committer identity at the launcher boundary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-ambient-identity-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    const launcher = path.join(bin, "git");
+    await writeFile(launcher, githubLauncherSource({ interpreterPath: process.execPath }), { mode: 0o700 });
+    const env = { ...githubBrokerEnvironment({}, { url: "", token: "" }), HOME: root,
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      GIT_AUTHOR_NAME: "Ambient Author", GIT_AUTHOR_EMAIL: "ambient-author@example.test",
+      GIT_COMMITTER_NAME: "Ambient Committer", GIT_COMMITTER_EMAIL: "ambient-committer@example.test" };
+    const git = async (...args: string[]) => (await exec(launcher, args, { cwd: root, env })).stdout.trim();
+    await git("init", "-q");
+    await git("commit", "--allow-empty", "-m", "Identity fixture");
+    expect(await git("log", "-1", "--format=%an <%ae>|%cn <%ce>"))
+      .toBe("Paperclip <noreply@paperclip.ing>|Paperclip <noreply@paperclip.ing>");
+  });
+
   it.each(["missing", "absent", "unavailable", "rejected"])("commits local work without an identity when GitHub access is %s", async (access) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-default-author-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
