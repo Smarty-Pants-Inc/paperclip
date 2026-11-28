@@ -18675,14 +18675,21 @@ async function createRunnerdBackendWithinSessionClaim(
       .then((rows) => rows[0] ?? null), { companyId: leaseRow.companyId, runId: leaseRow.heartbeatRunId ?? undefined, leaseId });
     if (!updated) throw new Error("runner_harness_backup_lease_missing");
     // Smarty seam: a later run that reused this runner owns the sandbox's tip row, which the restore roads read.
-    const tip = alsoTip ? await nativeBackupTipLease(input.db, { stampedLeaseId: leaseId, companyId: leaseRow.companyId,
-      providerLeaseId: leaseRow.providerLeaseId, executionWorkspaceId: leaseRow.executionWorkspaceId,
-      normalizedSessionId: backup.manifest.normalizedSessionId, completedAt: backup.manifest.completedAt,
-      currentRunId: input.execution.binding.runId }) : null;
-    if (tip) await writeEnvironmentCleanup(input.db, tx => tx.update(environmentLeases)
-      .set({ metadata: { ...(tip.metadata ?? {}), nativeHarnessBackup: stamp }, updatedAt: new Date() })
-      .where(eq(environmentLeases.id, tip.id)),
-    { companyId: leaseRow.companyId, runId: tip.heartbeatRunId ?? undefined, leaseId: tip.id });
+    // The launch row's stamp above is the save; a failed tip write leaves today's state and is logged, not thrown.
+    if (!alsoTip) return;
+    try {
+      const tip = await nativeBackupTipLease(input.db, { stampedLeaseId: leaseId, companyId: leaseRow.companyId,
+        providerLeaseId: leaseRow.providerLeaseId, executionWorkspaceId: leaseRow.executionWorkspaceId,
+        normalizedSessionId: backup.manifest.normalizedSessionId, completedAt: backup.manifest.completedAt,
+        currentRunId: input.execution.binding.runId });
+      if (tip) await writeEnvironmentCleanup(input.db, tx => tx.update(environmentLeases)
+        .set({ metadata: { ...(tip.metadata ?? {}), nativeHarnessBackup: stamp }, updatedAt: new Date() })
+        .where(eq(environmentLeases.id, tip.id)),
+      { companyId: leaseRow.companyId, runId: tip.heartbeatRunId ?? undefined, leaseId: tip.id });
+    } catch (error) {
+      const detail = redactSensitiveText(error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, " ").slice(0, 512);
+      await input.onLog?.("stderr", `[paperclip-runner] the backup stamp was not copied to the sandbox's current lease row: ${detail}\n`);
+    }
   };
 
   // A lease without this session's state may restore the backup when its
