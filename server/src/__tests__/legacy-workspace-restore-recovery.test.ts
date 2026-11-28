@@ -52,7 +52,7 @@ const support = externalTestDatabaseUrl ? { supported: true } : await getEmbedde
   it.each([
     { cause: "backup_without_reusable_lease", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease", nextAction:
-      "The sandbox's previous conversation could not be reused. Press Retry to try again; it may start a new conversation." },
+      "The sandbox's previous conversation could not be reused. Press Retry to continue the work in a new conversation." },
     { cause: "runner_remote_provider_verification_unavailable", errorCode: "runner_remote_provider_verification_unavailable",
       error: "runner_remote_provider_verification_unavailable: pack unavailable after 2 verification attempts (exitCode=null; timedOut=true)", nextAction:
       "The sandbox's tool pack could not be checked. Press Retry to check it again." },
