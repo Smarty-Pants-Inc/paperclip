@@ -17,6 +17,7 @@ import { nativePostResultFailureCategory, type NativePostResultFailureCategory }
 import { logger } from "../../middleware/logger.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
+import { nativeBackupTipLease } from "./native-backup-tip-lease.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
@@ -18644,6 +18645,7 @@ async function createRunnerdBackendWithinSessionClaim(
 
   const recordHarnessBackupStampForCurrentLease = async (
     backup: VerifiedHarnessBackup,
+    alsoTip = false,
   ) => {
     if (remoteTarget?.transport !== "sandbox" || !remoteTarget.leaseId) {
       return;
@@ -18654,6 +18656,7 @@ async function createRunnerdBackendWithinSessionClaim(
         providerLeaseId: environmentLeases.providerLeaseId,
         companyId: environmentLeases.companyId,
         heartbeatRunId: environmentLeases.heartbeatRunId,
+        executionWorkspaceId: environmentLeases.executionWorkspaceId,
       })
       .from(environmentLeases)
       .where(eq(environmentLeases.id, remoteTarget.leaseId))
@@ -18690,6 +18693,15 @@ async function createRunnerdBackendWithinSessionClaim(
       .returning({ id: environmentLeases.id })
       .then((rows) => rows[0] ?? null), { companyId: leaseRow.companyId, runId: leaseRow.heartbeatRunId ?? undefined, leaseId });
     if (!updated) throw new Error("runner_harness_backup_lease_missing");
+    // Smarty seam: a later run that reused this runner owns the sandbox's tip row, which the restore roads read.
+    const tip = alsoTip ? await nativeBackupTipLease(input.db, { stampedLeaseId: leaseId, companyId: leaseRow.companyId,
+      providerLeaseId: leaseRow.providerLeaseId, executionWorkspaceId: leaseRow.executionWorkspaceId,
+      normalizedSessionId: backup.manifest.normalizedSessionId, completedAt: backup.manifest.completedAt,
+      currentRunId: input.execution.binding.runId }) : null;
+    if (tip) await writeEnvironmentCleanup(input.db, tx => tx.update(environmentLeases)
+      .set({ metadata: { ...(tip.metadata ?? {}), nativeHarnessBackup: stamp }, updatedAt: new Date() })
+      .where(eq(environmentLeases.id, tip.id)),
+    { companyId: leaseRow.companyId, runId: tip.heartbeatRunId ?? undefined, leaseId: tip.id });
   };
 
   // A lease without this session's state may restore the backup when its
@@ -19266,7 +19278,7 @@ async function createRunnerdBackendWithinSessionClaim(
                   stamp: remoteTarget?.transport === "sandbox" && remoteTarget.leaseId ? async currentRoot => {
                     await recordHarnessBackupStampForCurrentLease({
                       root: currentRoot, manifest, bytes: backupSpanAttributes.bytesTransferred,
-                    });
+                    }, true);
                   } : undefined,
                 });
               } finally {
