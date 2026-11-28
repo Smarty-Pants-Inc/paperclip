@@ -1,6 +1,6 @@
-import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { createCapabilityRunnerdCodexTransport } from "./runnerd-codex-transport.js";
 import { isRunnerResumeStateUnavailable, NativeRunnerResumeStateUnavailableError } from "../contracts/harness-driver.js";
@@ -114,10 +114,16 @@ const bootstrapIdentityFields = ["runnerInstanceId", "environmentLeaseId", "runI
 const bootstrapFailures = ["lease_expired_requires_bootstrap", "transport_reconnect_deadline_exceeded", "transport_reconnect_grace_exceeded",
   "legacy:lease_expired_requires_bootstrap"];
 const bootstrapRefusals = ["outbox", "terminal", "cleanup", "transition", "other-failure", "failure-array", "failure-object", "ready", "missing-terminal",
-  ...bootstrapIdentityFields.map(field => `identity-${field}`)];
+  ...bootstrapIdentityFields.map(field => `identity-${field}`), ...bootstrapIdentityFields.map(field => `exit-proof-${field}`)];
+// A copied lifecycle, allocation change, adoption or completed retirement is
+// never process-exit authority. Exercise both rotation and PRP source attachment.
+const unverifiedBootstrapPaths = ["road-c-copy", "environment-move", "resize", "carried-run", "adopted-run", "warm-retirement", "plugin-task", "ssh", "local"];
 it.each([
   ...bootstrapFailures.flatMap(reason => ["local", "external"].map(placement => ({ mode: "restore", reason, placement }))),
   ...bootstrapRefusals.map(mode => ({ mode, reason: bootstrapFailures[0]!, placement: "external" })),
+  ...unverifiedBootstrapPaths.flatMap(path => ["local", "external", "prp-local", "prp-external"].map(placement =>
+    ({ mode: `no-exit-proof-${path}`, reason: bootstrapFailures[0]!, placement }))),
+  ...bootstrapFailures.slice(1, 3).map(reason => ({ mode: "no-exit-proof-reconnect", reason, placement: "external" })),
 ])("cold continuation loads only settled fresh-bootstrap state: $placement / $mode / $reason", async ({ mode, reason, placement }) => {
   const root = await mkdtemp(join(tmpdir(), "runnerd-bootstrap-cold-"));
   const callsPath = join(root, "calls.log"), requestsPath = join(root, "requests.jsonl");
@@ -150,10 +156,16 @@ it.each([
     const controlBefore = await readFile(controlPath), callsBefore = await readFile(callsPath, "utf8");
     const read = async () => JSON.parse(await readFile(runnerPath, "utf8"));
     const archived: Record<string, unknown>[] = [];
+    const proof = { ...identity };
+    if (mode.startsWith("exit-proof-")) proof[mode.slice(11) as typeof bootstrapIdentityFields[number]] = "foreign-owner";
     resumed = createCapabilityRunnerdCodexTransport({ ...options,
+      // The fixture has awaited the first real runnerd's exit. Production's
+      // server must obtain the equivalent authority from its exact-box verifier.
+      ...(!mode.startsWith("no-exit-proof-") ? { freshBootstrapExitVerified: proof } : {}),
+      ...(placement.startsWith("prp-") ? { onStagedRunAttachment: async () => {} } : {}),
       prpIdentity: { ...identity, runId: "next-run", turnId: "next-turn", itemId: "next-item" },
       resumeProviderSession: { driverSessionId: thread.id, providerSessionId: thread.sessionId },
-      ...(placement === "external" ? { readRunnerState: read, prepareExternalRunnerState: async () => {},
+      ...(placement.endsWith("external") ? { readRunnerState: read, prepareExternalRunnerState: async () => {},
         archiveExternalRunnerState: async ({ archiveKey }: { archiveKey: string }) => {
           const state = await read(); archived.push(state);
           const directory = join(root, "authority-epochs", `epoch-${archiveKey}`);
@@ -165,9 +177,11 @@ it.each([
     if (mode !== "restore") {
       await expect(resumed.transport.request("thread/read", {})).rejects.toThrow("native_runner_authority_rotation_requires_settled_state");
       expect(archived).toEqual([]);
-      expect(await readFile(controlPath)).toEqual(controlBefore);
-      expect(await readFile(callsPath, "utf8")).toBe(callsBefore);
-      expect(await read()).toEqual(saved);
+      const quarantine = (await readdir(dirname(root))).find(name => name.startsWith(`${basename(root)}.quarantine-`));
+      const preserved = quarantine ? join(dirname(root), quarantine) : root;
+      expect(await readFile(join(preserved, "control-plane/control-plane-state.json"))).toEqual(controlBefore);
+      expect(await readFile(join(preserved, "calls.log"), "utf8")).toBe(callsBefore);
+      expect(JSON.parse(await readFile(join(preserved, "runner/runner-state.json"), "utf8"))).toEqual(saved);
       return;
     }
     expect((await resumed.transport.request("thread/read", {})).thread).toMatchObject({ id: thread.id, sessionId: thread.sessionId });
@@ -189,6 +203,8 @@ it.each([
   } finally {
     await Promise.allSettled([first.transport.close(), resumed?.transport.close()]);
     await rm(root, { recursive: true, force: true });
+    for (const name of await readdir(dirname(root))) if (name.startsWith(`${basename(root)}.quarantine-`))
+      await rm(join(dirname(root), name), { recursive: true, force: true });
   }
 }, 30_000);
 

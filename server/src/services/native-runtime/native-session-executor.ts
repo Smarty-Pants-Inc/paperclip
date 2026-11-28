@@ -11194,7 +11194,7 @@ export async function executePaperclipNativeSession(input: {
     if (error instanceof Error && error.message === "runner_state_identity_mismatch: remote_warm_session_not_idle") {
       await input.db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "remote_warm_session_not_idle",
         nextAttemptAt: null, failureDetail: { sourceFailureCode: "remote_warm_session_not_idle",
-          nextAction: "The saved conversation is not safely idle. Your message remains unanswered. Use Reset sessions in the agent menu before continuing, or Start fresh context here (/new) to discard the old context. Automatic retries are stopped." } })
+          nextAction: "Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent; /new does not carry your unanswered message, so send it again. Automatic retries are stopped." } })
         .where(and(eq(nativeRunFinalizations.runId, runId), eq(nativeRunFinalizations.companyId, input.execution.binding.companyId),
           eq(nativeRunFinalizations.issueId, input.execution.binding.issueId), isNull(nativeRunFinalizations.leaseOwner),
           inArray(nativeRunFinalizations.phase, ["observed", "retryable_failure"])));
@@ -14217,7 +14217,7 @@ async function executePaperclipNativeSessionAttempt(
                   : sourceFailureCode === "native_provider_output_without_result"
                   ? "The provider produced output but no complete answer could be saved. This question remains unanswered. Automatic retries are stopped; nothing was re-sent."
                   : sourceFailureCode === "remote_warm_session_not_idle"
-                  ? "The saved conversation is not safely idle. Your message remains unanswered. Use Reset sessions in the agent menu before continuing, or Start fresh context here (/new) to discard the old context. Automatic retries are stopped."
+                  ? "Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent; /new does not carry your unanswered message, so send it again. Automatic retries are stopped."
                   : sourceFailureCode === "native_permission_declined"
                   ? "Provider permission was declined. Inspect the task and give explicit direction before starting further provider work. Automatic recovery is stopped."
                   : sourceFailureCode === "native_provider_approval_required"
@@ -19646,6 +19646,11 @@ async function createRunnerdBackendWithinSessionClaim(
       await synchronizeCredentials();
     } : undefined,
   })) : null;
+  // A copied lifecycle, replacement allocation or completed close is not exit authority.
+  const freshBootstrapExitVerified = durableIdentity && await verifyExitedWarmRunnerBootstrap(input, durableIdentity)
+    ? { runnerInstanceId: String(durableIdentity.runnerInstanceId), environmentLeaseId: String(durableIdentity.environmentLeaseId),
+        runId: String(durableIdentity.runId), normalizedSessionId: String(durableIdentity.normalizedSessionId),
+        turnId: String(durableIdentity.turnId), itemId: String(durableIdentity.itemId) } : undefined;
   const backend = createNativeSessionBackend(runnerExecution, {
     retainedSystemInstructions,
     runnerInstanceId:
@@ -19679,6 +19684,7 @@ async function createRunnerdBackendWithinSessionClaim(
     ),
     codexTransportFactory: (recoveryContext) => {
       const bundle = createRunnerdCodexTransport({
+        freshBootstrapExitVerified,
         ...(input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
         measureOperation: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? measureRunnerOperation : undefined,
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,

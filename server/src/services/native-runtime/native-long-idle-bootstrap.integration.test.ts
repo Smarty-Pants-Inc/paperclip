@@ -14,10 +14,14 @@ import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } 
 // Embedded PG and the server executor/admission/restore/retirement road are real.
 // Provider execution/backend and cross-server checkpoint selection are doubles;
 // sandbox commands run the production read/process scripts on local saved files.
-const boundary = vi.hoisted(() => ({ execute: vi.fn() }));
+const boundary = vi.hoisted(() => ({ execute: vi.fn(), transport: vi.fn((_options: unknown) => ({ transport: {} })) }));
 vi.mock("../../vendor/paperclip-runner/index.js", async original => ({
   ...await original<typeof import("../../vendor/paperclip-runner/index.js")>(),
-  executeNativeSession: boundary.execute, createNativeSessionBackend: () => ({ kind: "test", nativeTurnBudgetAdditions: () => ({}) }),
+  executeNativeSession: boundary.execute, createRunnerdCodexTransport: boundary.transport,
+  createNativeSessionBackend: (_input: unknown, options: { codexTransportFactory?: () => unknown }) => {
+    options.codexTransportFactory?.();
+    return { kind: "test", nativeTurnBudgetAdditions: () => ({}) };
+  },
 }));
 vi.mock("./native-codex-runner.js", async original => ({
   ...await original<typeof import("./native-codex-runner.js")>(),
@@ -34,7 +38,9 @@ import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
 const fields = ["runId", "normalizedSessionId", "runnerInstanceId", "environmentLeaseId", "turnId", "itemId"] as const;
-const modes = ["exited", "exited-resumed", "running", "unknown", ...fields.map(field => `identity-${field}`), "outbox", "pending"];
+const reconnectFailures = ["transport_reconnect_deadline_exceeded", "transport_reconnect_grace_exceeded"];
+const modes = ["exited", "exited-resumed", "running", "unknown", ...fields.map(field => `identity-${field}`), "outbox", "pending",
+  ...reconnectFailures.flatMap(reason => [`exited-${reason}`, `running-${reason}`])];
 
 describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
   const environment = nativeRestartFixture();
@@ -82,7 +88,10 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
         expect(options.persistedSession ?? await options.existingSession?.snapshot()).toMatchObject({ providerSessionId,
           identity: { sessionId: identity.normalizedSessionId } });
       }
-      if (prompts.length === 1 && !freshSessionId) restoredReceipts.push(JSON.parse(await readFile(join(root, "plugin-runner-state.json"), "utf8")));
+      if (prompts.length === 1 && !freshSessionId) {
+        restoredReceipts.push(JSON.parse(await readFile(join(root, "plugin-runner-state.json"), "utf8")));
+        expect(boundary.transport.mock.calls.at(-1)?.[0]).toMatchObject({ freshBootstrapExitVerified: identity });
+      }
       const sessionId = freshSessionId ?? identity.normalizedSessionId;
       snapshot = { ...snapshot, sessionId, providerSessionId: freshSessionId ? `provider-${freshSessionId}` : providerSessionId,
         identity: { ...options.input.binding, sessionId } };
@@ -141,14 +150,14 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
         createHash("sha256").update(identity.normalizedSessionId).digest("hex"), "runner");
       await mkdir(runnerDirectory, { recursive: true });
       const saved = { schema: "paperclip.runner.durable.state.v1", ...identity, lifecycle: "recoverable_failure",
-        recoverableFailure: "lease_expired_requires_bootstrap", nextSourceSeq: 42, ackedSourceSeq: 41,
+        recoverableFailure: reconnectFailures.find(reason => mode.endsWith(reason)) ?? "lease_expired_requires_bootstrap", nextSourceSeq: 42, ackedSourceSeq: 41,
         outbox: mode === "outbox" ? [{ sourceSeq: 41 }] : [], pendingTerminalDelivery: mode === "pending" ? { commandId: "pending" } : null,
         ...(mode.startsWith("identity-") ? { [mode.slice(9)]: "different-owner" } : {}) };
       const runnerPath = join(runnerDirectory, "runner-state.json");
       await writeFile(runnerPath, JSON.stringify(saved));
       const savedBytes = await readFile(runnerPath, "utf8");
       let pid = 2147483646, fingerprint = "linux:abcd-1234:100";
-      if (mode === "running" || mode === "unknown") {
+      if (mode.startsWith("running") || mode === "unknown") {
         child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "--runner-id", identity.runnerInstanceId], { stdio: "ignore" });
         await once(child, "spawn"); pid = child.pid!;
         const stat = await readFile(`/proc/${pid}/stat`, "utf8");
@@ -201,7 +210,7 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
       }
       const message = `Please continue the same conversation: ${mode}`;
       const next = await nextRun(message, true);
-      if (mode === "exited" || mode === "exited-resumed") {
+      if (mode.startsWith("exited")) {
         await expect(next.outcome).resolves.toMatchObject({ exitCode: 0, sessionId: identity.normalizedSessionId });
         expect(prompts[1]).toContain(message);
         expect(await deliveredQueuedCommentIds(f.db, { companyId, issueId: f.issueId, agentId, commentIds: [next.commentId!] })).toEqual(new Set([next.commentId!]));
@@ -227,7 +236,8 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
         await expect(next.outcome).rejects.toThrow("remote_warm_session_not_idle");
         const [settled] = await f.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, next.runId));
         expect(settled).toMatchObject({ phase: "terminal_failure", failureCode: "remote_warm_session_not_idle", nextAttemptAt: null });
-        expect((settled.failureDetail as { nextAction: string }).nextAction).toContain("message remains unanswered");
+        expect((settled.failureDetail as { nextAction: string }).nextAction).toBe(
+          "Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent; /new does not carry your unanswered message, so send it again. Automatic retries are stopped.");
         const dispatch = vi.fn();
         for (const delay of [31_000, 62_000]) expect(await dispatchNativeSessionResumptions({ db: f.db,
           runnerInstanceId: "idle-reconciler", runIds: [next.runId], now: new Date(Date.now() + delay), dispatch })).toEqual([]);

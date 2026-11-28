@@ -246,15 +246,17 @@ function assertSuspendedRunnerState(
 
 /** Cold continuation may also retire an exited Runner's settled bootstrap failure.
  * Keep suspension-only callers (in particular close) on their stricter guard.
- * Remote process-exit authority remains the embedding server's prerequisite.
+ * The embedding server must explicitly attest the exact prior Runner's exit.
  */
 function assertColdRestorableRunnerState(
   state: Record<string, unknown>,
   expected: DurableRecoveryIdentity,
+  exitVerified?: DurableRecoveryIdentity,
 ): void {
   const failure = typeof state.recoverableFailure === "string" ? state.recoverableFailure
     : typeof state.recoverable_failure === "string" ? state.recoverable_failure : null;
   if (state.lifecycle === "recoverable_failure"
+    && exitVerified !== undefined && recoveryIdentityMatches(exitVerified, expected)
     && state.schema === "paperclip.runner.durable.state.v1"
     && recoveryIdentityMatches(state, expected)
     && [expected.runnerInstanceId, expected.environmentLeaseId, expected.runId,
@@ -463,7 +465,7 @@ interface RunnerStateArchive {
 }
 
 /** Runner state that this controller owns under `<root>/runner`. */
-function localRunnerStateArchive(root: string): RunnerStateArchive {
+function localRunnerStateArchive(root: string, exitVerified?: DurableRecoveryIdentity): RunnerStateArchive {
   const runnerDirectory = resolve(root, "runner");
   const live = resolve(runnerDirectory, "runner-state.json");
   const readLive = () => {
@@ -483,7 +485,7 @@ function localRunnerStateArchive(root: string): RunnerStateArchive {
         "runner-state.json",
       );
       if (existsSync(live)) {
-        assertColdRestorableRunnerState(readLive(), priorIdentity);
+        assertColdRestorableRunnerState(readLive(), priorIdentity, exitVerified);
         if (!existsSync(archived)) {
           renameSync(live, archived);
         } else if (sameRegularFile(live, archived)) {
@@ -511,6 +513,7 @@ async function rotateAuthorityEpoch(
   controlPlaneState: Record<string, unknown>,
   desired: DurableRecoveryIdentity,
   runnerState: RunnerStateArchive,
+  exitVerified?: DurableRecoveryIdentity,
 ): Promise<Record<string, unknown>> {
   const priorIdentity = controlPlaneIdentity(controlPlaneState);
   if (
@@ -549,7 +552,7 @@ async function rotateAuthorityEpoch(
       priorIdentity,
     );
   } else {
-    if (!runnerState.archivedByLaunch) assertColdRestorableRunnerState(await runnerState.read(), priorIdentity);
+    if (!runnerState.archivedByLaunch) assertColdRestorableRunnerState(await runnerState.read(), priorIdentity, exitVerified);
     if (!existsSync(activeControlPlane)) {
       throw new Error("native_runner_authority_archive_incomplete");
     }
@@ -561,7 +564,7 @@ async function rotateAuthorityEpoch(
     archiveKey: basename(archive).replace(/^epoch-/, ""),
     priorIdentity,
   });
-  assertColdRestorableRunnerState(archivedRunnerState, priorIdentity);
+  assertColdRestorableRunnerState(archivedRunnerState, priorIdentity, exitVerified);
   return resumedState ?? controlPlaneState;
 }
 
@@ -1773,6 +1776,8 @@ export interface CapabilityRunnerdProcessEvidence {
 }
 
 export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
+  /** In-memory server authority, issued only after exact-box process-exit verification; never restored from state. */
+  freshBootstrapExitVerified?: DurableRecoveryIdentity;
   observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   homeMode?: "isolated" | "preconfigured";
   provider?: "cursor_cloud" | "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx";
@@ -7097,11 +7102,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (!this.options.adoptExistingRunner) {
         if (localStateOwner) {
           if (!candidateRunnerState) throw new Error("native_runner_authority_rotation_state_unavailable");
-          assertColdRestorableRunnerState(candidateRunnerState, identity);
+          assertColdRestorableRunnerState(candidateRunnerState, identity, this.options.freshBootstrapExitVerified);
         } else {
           if (!this.options.readRunnerState || !this.options.prepareExternalRunnerState) throw new Error("native_runner_prp_run_rotation_unavailable");
           await this.options.prepareExternalRunnerState();
-          assertColdRestorableRunnerState(await this.options.readRunnerState(), identity);
+          assertColdRestorableRunnerState(await this.options.readRunnerState(), identity, this.options.freshBootstrapExitVerified);
         }
       }
       sourceAttachmentTarget = queuedSourceAttachment ? null : desiredIdentity;
@@ -7159,7 +7164,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           this.#root,
           rotationSource,
           desiredIdentity,
-          localStateOwner ? localRunnerStateArchive(this.#root) : this.#externalRunnerStateArchive(rotationSource),
+          localStateOwner ? localRunnerStateArchive(this.#root, this.options.freshBootstrapExitVerified) : this.#externalRunnerStateArchive(rotationSource),
+          this.options.freshBootstrapExitVerified,
         );
       } catch (error) {
         // Locally owned state is preserved aside for operator recovery.
