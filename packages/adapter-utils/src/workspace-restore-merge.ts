@@ -837,7 +837,7 @@ export async function mergeDirectoryWithBaseline(input: {
       const currentEntry = async (relative: string) => current
         ? current.entries.get(relative) : await readSnapshotEntry(canonicalTargetDir, relative);
       try {
-        if (input.conflictPolicy === "reject") {
+        if (input.conflictPolicy === "reject" && current) {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
         }
