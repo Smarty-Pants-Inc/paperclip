@@ -8,23 +8,30 @@ import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { prewarmIssueSandbox } from "../services/sandbox-prewarm.js";
+import { awaitPrewarmInFlight, prewarmIssueSandbox } from "../services/sandbox-prewarm.js";
+import { publishLiveEvent } from "../services/live-events.js";
+import { buildHeartbeatRunStatusLiveEventPayload } from "../services/heartbeat-run-status-payload.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { describeEmbeddedPostgres, seedCompanyWithBoardAccess, useEmbeddedPostgres, type BoardActor } from "./helpers/route-test-harness.js";
 
 // Keep reason: issue/agent/company isolation and no-acquisition guards on speculative provider work.
 describeEmbeddedPostgres("sandbox prewarm", () => {
   const ctx = useEmbeddedPostgres("paperclip-sandbox-prewarm-");
+  const seededIssueIds: string[] = [];
   beforeEach(() => {
     vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM", "true");
     vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
   });
-  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+  afterEach(async () => {
+    for (const issueId of seededIssueIds.splice(0)) await awaitPrewarmInFlight(issueId);
+    vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks();
+  });
 
   async function seed(status = "released") {
     const f = await seedCompanyWithBoardAccess(ctx.db, "Prewarm");
     const [agent] = await ctx.db.insert(agents).values({ companyId: f.companyId, name: randomUUID(), role: "engineer", adapterType: "process" }).returning();
     const [issue] = await ctx.db.insert(issues).values({ companyId: f.companyId, title: "Prewarm task", assigneeAgentId: agent!.id }).returning();
+    seededIssueIds.push(issue!.id);
     await ctx.db.insert(issueComments).values({ companyId: f.companyId, issueId: issue!.id,
       authorType: "user", authorUserId: f.userId, body: "A person chats in this task." });
     const [environment] = await ctx.db.insert(environments).values({ name: randomUUID(), driver: "sandbox",
@@ -80,6 +87,224 @@ describeEmbeddedPostgres("sandbox prewarm", () => {
     expect(await ctx.db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toEqual([
       expect.objectContaining({ action: "environment.sandbox_prewarmed", actorId: f.userId, entityId: f.lease.id }),
     ]);
+  });
+
+  // Keep reason: speculative compute must stop without destroying retained files or racing a person's run.
+  it.each(["released", "retained"])("stops exactly the prewarmed %s allocation once when its idle window expires", async status => {
+    const f = await seed(status);
+    vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM_IDLE_MS", "100");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    f.call.mockImplementation(async (_plugin, method, params) => {
+      if (method === "environmentResumeLease") return { providerLeaseId: params.providerLeaseId, metadata: {} };
+      if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" } as never;
+      throw new Error(`Forbidden idle operation: ${method}`);
+    });
+    vi.spyOn(f.workerManager, "getWorker").mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentStopLease"] } as never);
+    const info = vi.spyOn(logger, "info");
+    expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
+    await vi.advanceTimersByTimeAsync(99);
+    expect(f.call).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(async () => {
+      const [lease] = await ctx.db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      expect(lease).toMatchObject({ status: "released", heartbeatRunId: f.run.id, providerLeaseId: f.lease.providerLeaseId,
+        leasePolicy: "reuse_by_environment", metadata: { remoteExecutionTermination: { state: "stopped" },
+          sandboxStopAndRetainReceipt: { method: "environmentStopLease", leaseId: f.lease.id } } });
+    });
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.call.mock.calls.map(([, method]) => method)).toEqual(["environmentResumeLease", "environmentStopLease"]);
+    expect(info).toHaveBeenCalledWith({ issueId: f.issue.id, leaseId: f.lease.id, outcome: "stopped" }, "sandbox prewarm idle stop");
+  });
+
+  it("serializes real run acquisition after an in-flight prewarm resume of the same lease", async () => {
+    const f = await seed();
+    await ctx.db.delete(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    f.call.mockImplementation(async (_plugin, method, params) => {
+      if (method !== "environmentAcquireLease") throw new Error(`Unexpected priming operation: ${method}`);
+      return { providerLeaseId: f.lease.providerLeaseId!, metadata: { remoteCwd: "/workspace/task" } };
+    });
+    const acquireInput = { companyId: f.companyId, environment: { ...f.environment, driver: "sandbox" as const, status: "active" as const },
+      issueId: f.issue.id, agentId: f.agent.id, adapterType: "process", heartbeatRunId: f.run.id, persistedExecutionWorkspace: null };
+    await ctx.db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.run.id));
+    const primed = await f.input.environmentRuntime.acquireRunLease(acquireInput);
+    await ctx.db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
+    await ctx.db.update(environmentLeases).set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.id, primed.lease.id));
+    let finish!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>(resolve => { finish = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let resumeInFlight = false;
+    const order: string[] = [];
+    f.call.mockClear();
+    f.call.mockImplementation(async (_plugin, method, params) => {
+      if (method !== "environmentResumeLease") throw new Error(`Forbidden run operation: ${method}`);
+      if (resumeInFlight) throw new Error("Concurrent resume: still settling");
+      if (order.length === 0) {
+        resumeInFlight = true; order.push("prewarm-start"); entered(); await held;
+        resumeInFlight = false; order.push("prewarm-end");
+      } else order.push("run-resume");
+      return { providerLeaseId: params.providerLeaseId, metadata: {} };
+    });
+    const prewarm = prewarmIssueSandbox(f.input);
+    let acquisition: ReturnType<typeof f.input.environmentRuntime.acquireRunLease> | undefined;
+    try {
+      await started;
+      const [run] = await ctx.db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agent.id,
+        issueId: f.issue.id, status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.issue.id } }).returning();
+      acquisition = f.input.environmentRuntime.acquireRunLease({ ...acquireInput, heartbeatRunId: run!.id });
+      // Capture rejection immediately so a refused concurrent resume is an assertion, not an unhandled rejection.
+      const result = acquisition.then(value => ({ value }), error => ({ error }));
+      await new Promise(resolve => setTimeout(resolve, 200));
+      finish();
+      expect(await result).toMatchObject({ value: { lease: { providerLeaseId: primed.lease.providerLeaseId } } });
+      expect(await prewarm).toMatchObject({ outcome: "resumed" });
+      expect(order).toEqual(["prewarm-start", "prewarm-end", "run-resume"]);
+      expect(f.call).toHaveBeenCalledTimes(2);
+    } finally { finish(); await prewarm; await acquisition?.catch(() => {}); }
+  });
+
+  it("cancels the idle deadline on the production run-start event, even if the run finishes before expiry", async () => {
+    const f = await seed();
+    vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM_IDLE_MS", "100");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
+    const [run] = await ctx.db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agent.id,
+      issueId: f.issue.id, status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.issue.id } }).returning();
+    const timersBeforeStart = vi.getTimerCount();
+    publishLiveEvent({ companyId: f.companyId, type: "heartbeat.run.status", payload: buildHeartbeatRunStatusLiveEventPayload(run!) });
+    expect(vi.getTimerCount()).toBe(timersBeforeStart - 1);
+    await ctx.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run!.id));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(f.call).toHaveBeenCalledOnce();
+    expect(await ctx.db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id))).toEqual([f.lease]);
+  });
+
+  it.each(["issueId", "nativeIssueId", "contextIssue", "contextTask"])("never stops after an unobserved completed run since prewarm (%s)", async scope => {
+    const f = await seed();
+    vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM_IDLE_MS", "100");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
+    await ctx.db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agent.id,
+      status: "succeeded", startedAt: new Date(), finishedAt: new Date(),
+      ...(scope === "issueId" || scope === "nativeIssueId" ? { [scope]: f.issue.id }
+        : { contextSnapshot: { [scope === "contextIssue" ? "issueId" : "taskId"]: f.issue.id } }),
+    });
+    const info = vi.spyOn(logger, "info");
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.waitFor(() => expect(info).toHaveBeenCalledWith({ issueId: f.issue.id, leaseId: f.lease.id, outcome: "skipped" }, "sandbox prewarm idle stop"));
+    expect(f.call).toHaveBeenCalledOnce();
+    expect(await ctx.db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id))).toEqual([f.lease]);
+  });
+
+  it.each(["taken", "other-holder", "identity-changed"])("does not stop a prewarmed allocation whose lease was %s", async change => {
+    const f = await seed();
+    vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM_IDLE_MS", "100");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
+    if (change === "other-holder") {
+      await ctx.db.insert(environmentLeases).values({ ...f.lease, id: randomUUID(), status: "active" });
+    } else await ctx.db.update(environmentLeases).set(change === "taken" ? { status: "active" } : { providerLeaseId: "replacement" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const before = await ctx.db.select().from(environmentLeases).where(eq(environmentLeases.companyId, f.companyId));
+    const info = vi.spyOn(logger, "info");
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.waitFor(() => expect(info).toHaveBeenCalledWith({ issueId: f.issue.id, leaseId: f.lease.id, outcome: "skipped" }, "sandbox prewarm idle stop"));
+    expect(f.call).toHaveBeenCalledOnce();
+    expect(await ctx.db.select().from(environmentLeases).where(eq(environmentLeases.companyId, f.companyId))).toEqual(before);
+  });
+
+  it.each(["lease", "issue"])("fails closed at the bounded prewarm wait deadline (%s key)", async key => {
+    const f = await seed();
+    let finish!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>(resolve => { finish = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    f.call.mockImplementation(async () => { entered(); await held; return { providerLeaseId: f.lease.providerLeaseId!, metadata: {} }; });
+    const prewarm = prewarmIssueSandbox(f.input);
+    try {
+      await started;
+      await expect(awaitPrewarmInFlight(key === "lease" ? f.lease.id : f.issue.id, 10)).rejects.toThrow("Sandbox prewarm is still in flight");
+      expect(f.call).toHaveBeenCalledOnce();
+      finish();
+      expect(await prewarm).toMatchObject({ outcome: "resumed" });
+      await awaitPrewarmInFlight(f.lease.id, 10);
+    } finally { finish(); await prewarm; }
+  });
+
+  it("defaults to a single five-minute idle deadline", async () => {
+    const f = await seed();
+    vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM_IDLE_MS", undefined);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    f.call.mockImplementation(async (_plugin, method, params) => {
+      if (method === "environmentResumeLease") return { providerLeaseId: params.providerLeaseId, metadata: {} };
+      if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" } as never;
+      throw new Error(`Forbidden idle operation: ${method}`);
+    });
+    vi.spyOn(f.workerManager, "getWorker").mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentStopLease"] } as never);
+    expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
+    await vi.advanceTimersByTimeAsync(299_999);
+    expect(f.call).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(async () => {
+      const [lease] = await ctx.db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      expect(lease?.metadata?.remoteExecutionTermination).toMatchObject({ state: "stopped" });
+    });
+    expect(f.call.mock.calls.map(([, method]) => method)).toEqual(["environmentResumeLease", "environmentStopLease"]);
+  });
+
+  it.each(["refused", "unsupported"])("keeps a failed %s idle stop on the existing stop-only retry road, never destroy", async failure => {
+    const f = await seed();
+    vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM_IDLE_MS", "100");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    f.call.mockImplementation(async (_plugin, method, params) => {
+      if (method === "environmentResumeLease") return { providerLeaseId: params.providerLeaseId, metadata: {} };
+      throw new Error(`Provider refused ${method}`);
+    });
+    if (failure === "refused") vi.spyOn(f.workerManager, "getWorker")
+      .mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentStopLease"] } as never);
+    const info = vi.spyOn(logger, "info");
+    expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
+    await vi.advanceTimersByTimeAsync(100);
+    await vi.waitFor(() => expect(info).toHaveBeenCalledWith({ issueId: f.issue.id, leaseId: f.lease.id, outcome: "failed" }, "sandbox prewarm idle stop"));
+    const [lease] = await ctx.db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    expect(lease).toMatchObject({ status: "pending_cleanup", heartbeatRunId: f.run.id, providerLeaseId: f.lease.providerLeaseId,
+      metadata: { pendingCleanupInFlight: false, sandboxStopAndRetain: { leaseId: f.lease.id, providerLeaseId: f.lease.providerLeaseId } } });
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.call.mock.calls.map(([, method]) => method)).toEqual(failure === "refused"
+      ? ["environmentResumeLease", "environmentStopLease"] : ["environmentResumeLease"]);
+  });
+
+  it("replaces the one-shot deadline after another successful prewarm, without an early or duplicate stop", async () => {
+    const f = await seed();
+    vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM_IDLE_MS", "100");
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    f.call.mockImplementation(async (_plugin, method, params) => {
+      if (method === "environmentResumeLease") return { providerLeaseId: params.providerLeaseId, metadata: {} };
+      if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" } as never;
+      throw new Error(`Forbidden idle operation: ${method}`);
+    });
+    vi.spyOn(f.workerManager, "getWorker").mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentStopLease"] } as never);
+    expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
+    await vi.advanceTimersByTimeAsync(50);
+    // Advance the cooldown clock independently; don't close PG sockets with a 60s timer jump before another query.
+    vi.setSystemTime(Date.now() + 60_000);
+    expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(f.call).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(50);
+    await vi.waitFor(async () => {
+      const [lease] = await ctx.db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      expect(lease?.metadata?.remoteExecutionTermination).toMatchObject({ state: "stopped" });
+    });
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.call.mock.calls.map(([, method]) => method)).toEqual(["environmentResumeLease", "environmentResumeLease", "environmentStopLease"]);
+  });
+
+  it("skips ad-hoc leases with no historical run because the stop-only road cannot retain them", async () => {
+    const f = await seed();
+    await ctx.db.update(environmentLeases).set({ heartbeatRunId: null }).where(eq(environmentLeases.id, f.lease.id));
+    expect(await prewarmIssueSandbox(f.input)).toEqual({ outcome: "skipped", reason: "no_reusable_lease" });
+    expect(f.call).not.toHaveBeenCalled();
   });
 
   it("skips an issue with no reusable lease", async () => {

@@ -134,6 +134,7 @@ import {
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
+import { awaitPrewarmInFlight } from "./sandbox-prewarm.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
 // The constant error kind for the durable orphan-cleanup-write-failed log. The
@@ -1911,6 +1912,9 @@ function createSandboxEnvironmentDriver(
           | "resume_failed"
           | undefined;
         if (reusableLease?.providerLeaseId) {
+          // Prewarm is readiness only. Cancel its idle stop and let its provider
+          // resume settle before run admission resumes the same allocation.
+          await awaitPrewarmInFlight(reusableLease.id);
           // The `supportsReusableLeases` check above reads a snapshot of the
           // worker methods. The runtime then does asynchronous database work
           // (list, fingerprint, obsolete-lease cleanup) before this dispatch. A
