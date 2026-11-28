@@ -79,33 +79,48 @@ The response also includes:
 - `documentSummaries`: metadata for all linked issue documents
 - `legacyPlanDocument`: a read-only fallback when the description still contains an old `<plan>` block
 
-## Prewarm a task sandbox (test-server experiment)
+## Wake intent for a task sandbox (test-server experiment)
 
 ```
-POST /api/issues/{issueId}/sandbox-prewarm
-{}
+POST /api/issues/{id}/wake-intent
+{ "reason": "open" }
 ```
+
+The body must contain only `reason`, either `"open"` or `"typing"`; other bodies
+return `400`. The old `/sandbox-prewarm` path returns `404`.
 
 Off by default: the server requires `PAPERCLIP_SANDBOX_PREWARM=true` (exactly).
 Otherwise it returns `404`. Only a signed-in board user with read access to the
-company and task may call it. The agent is taken from the task's conversation
-agent, or its assignee; the request cannot select another agent or sandbox.
+company and task may call it. Existing authentication and read-access errors
+are unchanged. The agent is taken from the task's conversation agent, or its
+assignee; the request cannot select another agent or sandbox.
 
-Returns `202 { "accepted": true }` after authorization, without waiting for the
-provider. This is not confirmation that a sandbox is ready. In the background,
-it resumes only the newest eligible retained/released reusable sandbox lease
-for that company, task and agent, using the existing lifecycle resume road with
-a 60-second provider RPC cap. It never acquires a sandbox, starts a run or
-transfers lease ownership. No lease, a live/queued/scheduled-retry task run, an
-in-flight prewarm or a repeat within 30 seconds makes the hint a no-op. Accepted
+Returns `202 { "accepted": true }` after the read check, without waiting for the
+provider. This is not confirmation that a sandbox is ready. Before reading any
+lease, background work checks these guards in order:
+
+1. The caller may comment, using the comment-create route's authorization and
+   active-pause checks.
+2. A conversation task (`conversation_user_id` set) belongs to the caller.
+3. The task is neither `done` nor `cancelled`.
+4. The task is a conversation, or has a non-deleted user-authored comment in
+   the last seven days. Agent and system comments do not qualify.
+
+A failed guard is a silent no-op `202`, with one info log naming the reason.
+Otherwise, the existing live-run check and lease selection apply unchanged:
+resume only the newest eligible retained/released reusable sandbox lease for
+that company, task and agent, through the existing lifecycle resume road with
+a 60-second provider RPC cap. Never acquire a sandbox, start a run or transfer
+lease ownership. No eligible lease, a live/queued/scheduled-retry task run, an
+in-flight wake or a repeat within **60 seconds** also makes the hint a no-op.
+The in-flight guard remains in force even after 60 seconds elapse. Accepted
 calls each produce one `sandbox prewarm` info log with task ID, outcome and ms;
 a successful resume is also attributed to the user in the activity log.
 
-The task chat sends the hint on open and on typing, with a matching client-side
-30-second throttle. There is no polling or automatic retry. Failures do not block
-message submission; ordinary run admission remains authoritative. Throttling is
-in memory per server process, suitable for the single test server, not a
-distributed ownership lock.
+Opening a task and typing are readiness hints only. There is no polling or
+automatic retry. Failures do not block message submission; ordinary run admission
+remains authoritative. Throttling is in memory per server process, suitable for
+the single test server, not a distributed ownership lock.
 
 ## Create Issue
 

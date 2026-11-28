@@ -103,7 +103,6 @@ const mockIssuesApi = vi.hoisted(() => ({
   steerQueuedComment: vi.fn(),
   discardQueuedComment: vi.fn(),
   markRead: vi.fn(),
-  prewarmSandbox: vi.fn(),
   update: vi.fn(),
   resolveRecoveryAction: vi.fn(),
   recoveryActions: vi.fn(),
@@ -1411,7 +1410,6 @@ describe("IssueDetail", () => {
       text: async () => "# Attachment preview",
     } as Response);
 
-    mockIssuesApi.prewarmSandbox.mockReset().mockResolvedValue({ accepted: true });
     mockIssuesApi.list.mockResolvedValue([]);
     mockIssuesApi.listAll.mockImplementation((...args) => mockIssuesApi.list(...args));
     mockIssuesApi.listComments.mockResolvedValue([]);
@@ -1509,33 +1507,6 @@ describe("IssueDetail", () => {
     mockLocation.state = null;
     mockRouteParams.issueId = "PAP-1";
     mockRouteParams.companyPrefix = "PAP";
-  });
-
-  it("prewarms on opening task chat and on later typing, throttled without sending a message", async () => {
-    mockAuthApi.getSession.mockResolvedValue({ user: { id: "prewarm-reader" } });
-    mockIssuesApi.get.mockResolvedValue(createIssue());
-    const now = Date.now();
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-    await act(async () => renderIssueView());
-    await waitForAssertion(() => expect(mockIssuesApi.prewarmSandbox).toHaveBeenCalledExactlyOnceWith("issue-1"));
-    const thread = container.querySelector('[data-testid="task-chat-thread"], [data-testid="issue-chat-thread"]')!;
-    const input = document.createElement("textarea");
-    thread.appendChild(input);
-    await act(async () => { input.dispatchEvent(new InputEvent("input", { bubbles: true, data: "H" })); });
-    expect(mockIssuesApi.prewarmSandbox).toHaveBeenCalledTimes(1);
-    clock.mockReturnValue(now + 30_001);
-    await act(async () => { input.dispatchEvent(new InputEvent("input", { bubbles: true, data: "i" })); });
-    expect(mockIssuesApi.prewarmSandbox).toHaveBeenCalledTimes(2);
-    await act(async () => { input.dispatchEvent(new InputEvent("input", { bubbles: true, data: "!" })); });
-    expect(mockIssuesApi.prewarmSandbox).toHaveBeenCalledTimes(2);
-    expect(mockIssuesApi.addComment).not.toHaveBeenCalled();
-  });
-
-  it("does not prewarm an unauthenticated task viewer", async () => {
-    mockIssuesApi.get.mockResolvedValue(createIssue());
-    await act(async () => renderIssueView());
-    await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());
-    expect(mockIssuesApi.prewarmSandbox).not.toHaveBeenCalled();
   });
 
   it("clears only the monitor after confirmation and refreshes the task", async () => {

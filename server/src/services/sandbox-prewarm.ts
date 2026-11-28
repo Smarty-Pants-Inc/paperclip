@@ -13,7 +13,7 @@ export type SandboxPrewarmResult =
 type Attempt = { startedAt: number; inFlight: boolean };
 // One test-server process; no durable claims, timers, retries, or idle scans.
 const attempts = new WeakMap<Db, Map<string, Attempt>>();
-const COOLDOWN_MS = 30_000;
+const COOLDOWN_MS = 60_000;
 const RESUME_TIMEOUT_MS = 60_000;
 
 export function sandboxPrewarmEnabled(): boolean {

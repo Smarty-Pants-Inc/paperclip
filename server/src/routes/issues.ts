@@ -81,7 +81,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
@@ -10122,24 +10122,56 @@ export function issueRoutes(
     });
   });
 
-  router.post("/issues/:id/sandbox-prewarm", async (req, res) => {
+  router.post("/issues/:id/wake-intent", async (req, res) => {
     if (!sandboxPrewarmEnabled()) {
       res.status(404).json({ error: "Not found" });
       return;
     }
     assertBoard(req);
     if (req.actor.type !== "board" || !req.actor.userId) throw unauthorized("Authentication required");
+    const intent = z.object({ reason: z.enum(["open", "typing"]) }).strict().safeParse(req.body);
+    if (!intent.success) throw badRequest('Expected { reason: "open" | "typing" }');
     const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
     if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
-    const agentId = issue.conversationAgentId ?? issue.assigneeAgentId;
+    const userId = req.actor.userId;
     const startedAt = Date.now();
     res.status(202).json({ accepted: true });
-    // Only speculative readiness runs here. The response never waits for the provider.
-    const work = agentId
-      ? prewarmIssueSandbox({ db, companyId: issue.companyId, issueId: issue.id, agentId,
-          actor: { actorType: "user", actorId: req.actor.userId }, environmentRuntime })
-      : Promise.resolve({ outcome: "skipped", reason: "no_agent" } as const);
-    void work.then((result) => {
+    // Reuse the comment-create guards, but discard their interactive HTTP errors:
+    // a denied speculative hint has already been accepted as a silent no-op.
+    const commentGuardResponse = {
+      status: (_status: number) => commentGuardResponse,
+      json: (_body: unknown) => commentGuardResponse,
+    } as Response;
+    const work = async () => {
+      if (!(await assertAgentIssueCommentAllowed(req, commentGuardResponse, issue))
+        || !(await assertBoardCommentNotPaused(req, commentGuardResponse, issue))) {
+        return { outcome: "skipped", reason: "comment_not_allowed" } as const;
+      }
+      const conversationTask = issue.conversationUserId !== null;
+      if (conversationTask && issue.conversationUserId !== userId) {
+        return { outcome: "skipped", reason: "conversation_not_owned" } as const;
+      }
+      if (issue.status === "done" || issue.status === "cancelled") {
+        return { outcome: "skipped", reason: "terminal_status" } as const;
+      }
+      if (!conversationTask) {
+        const [comment] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+          eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+          eq(issueComments.authorType, "user"), isNotNull(issueComments.authorUserId),
+          isNull(issueComments.authorAgentId), isNull(issueComments.deletedAt),
+          gte(issueComments.createdAt, new Date(Date.now() - 7 * 24 * 60 * 60_000)),
+        )).limit(1);
+        if (!comment) return { outcome: "skipped", reason: "no_recent_user_comment" } as const;
+      }
+      // Every authorization/participation guard precedes the existing live-run
+      // check and lease selection. Never acquire a lease or start a run here.
+      const agentId = issue.conversationAgentId ?? issue.assigneeAgentId;
+      return agentId
+        ? prewarmIssueSandbox({ db, companyId: issue.companyId, issueId: issue.id, agentId,
+            actor: { actorType: "user", actorId: userId }, environmentRuntime })
+        : { outcome: "skipped", reason: "no_agent" } as const;
+    };
+    void work().then((result) => {
       logger.info({ issueId: issue.id, ...result, ms: "ms" in result ? result.ms : Date.now() - startedAt }, "sandbox prewarm");
     }).catch(() => {
       logger.info({ issueId: issue.id, outcome: "failed", ms: Date.now() - startedAt }, "sandbox prewarm");
