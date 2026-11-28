@@ -57,7 +57,8 @@ export async function uploadVerifiedProviderPack(input: {
   input.signal?.throwIfAborted();
   const cleared = await measure("provider_pack.clear_stale", () => input.runner.execute({
     command: "sh", args: ["-c", `rm -rf ${quote(input.targetPath)}`],
-    cwd: input.cwd, bypassSession: true, timeoutMs: 10_000,
+    // Smarty seam: a multi-gigabyte old pack on a busy sandbox can outlast 10 s (the reason for e1e16dd3, reverted).
+    cwd: input.cwd, bypassSession: true, timeoutMs: 120_000,
   }));
   if (cleared.exitCode !== 0 || cleared.timedOut) {
     throw new Error("runner_remote_provider_artifact_incompatible: stale provider pack could not be replaced");
