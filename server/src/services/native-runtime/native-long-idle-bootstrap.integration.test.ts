@@ -39,7 +39,7 @@ import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
 const fields = ["runId", "normalizedSessionId", "runnerInstanceId", "environmentLeaseId", "turnId", "itemId"] as const;
 const reconnectFailures = ["transport_reconnect_deadline_exceeded", "transport_reconnect_grace_exceeded"];
-const modes = ["exited", "exited-resumed", "running", "unknown", ...fields.map(field => `identity-${field}`), "outbox", "pending",
+const modes = ["suspended", "exited", "exited-resumed", "running", "unknown", ...fields.map(field => `identity-${field}`), "outbox", "pending",
   ...reconnectFailures.flatMap(reason => [`exited-${reason}`, `running-${reason}`])];
 
 describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
@@ -90,7 +90,14 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
       }
       if (prompts.length === 1 && !freshSessionId) {
         restoredReceipts.push(JSON.parse(await readFile(join(root, "plugin-runner-state.json"), "utf8")));
-        expect(boundary.transport.mock.calls.at(-1)?.[0]).toMatchObject({ freshBootstrapExitVerified: identity });
+        const proof = (boundary.transport.mock.calls.at(-1)?.[0] as { freshBootstrapExitVerified?: unknown })?.freshBootstrapExitVerified;
+        if (mode === "suspended") expect(restoredReceipts.at(-1)).toMatchObject({ lifecycle: "suspended" });
+        else if (typeof proof === "function") {
+          expect(await proof()).toEqual(identity);
+          const commands = target.runner.execute.mock.calls.length;
+          expect(await proof()).toEqual(identity);
+          expect(target.runner.execute.mock.calls).toHaveLength(commands);
+        } else expect(proof).toEqual(identity);
       }
       const sessionId = freshSessionId ?? identity.normalizedSessionId;
       snapshot = { ...snapshot, sessionId, providerSessionId: freshSessionId ? `provider-${freshSessionId}` : providerSessionId,
@@ -149,7 +156,7 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
       const runnerDirectory = join(workspace, ".paperclip-runtime/paperclip-runner/sessions",
         createHash("sha256").update(identity.normalizedSessionId).digest("hex"), "runner");
       await mkdir(runnerDirectory, { recursive: true });
-      const saved = { schema: "paperclip.runner.durable.state.v1", ...identity, lifecycle: "recoverable_failure",
+      const saved = { schema: "paperclip.runner.durable.state.v1", ...identity, lifecycle: mode === "suspended" ? "suspended" : "recoverable_failure",
         recoverableFailure: reconnectFailures.find(reason => mode.endsWith(reason)) ?? "lease_expired_requires_bootstrap", nextSourceSeq: 42, ackedSourceSeq: 41,
         outbox: mode === "outbox" ? [{ sourceSeq: 41 }] : [], pendingTerminalDelivery: mode === "pending" ? { commandId: "pending" } : null,
         ...(mode.startsWith("identity-") ? { [mode.slice(9)]: "different-owner" } : {}) };
@@ -209,16 +216,20 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
         console.info("sandbox lifecycle double: running -> stopped (disk retained) -> resumed");
       }
       const message = `Please continue the same conversation: ${mode}`;
+      const commandStart = target.runner.execute.mock.calls.length;
       const next = await nextRun(message, true);
-      if (mode.startsWith("exited")) {
+      if (mode.startsWith("exited") || mode === "suspended") {
         await expect(next.outcome).resolves.toMatchObject({ exitCode: 0, sessionId: identity.normalizedSessionId });
+        if (mode === "suspended") console.info(JSON.stringify({ row: "ordinary-suspended-command-count", timing,
+          commands: target.runner.execute.mock.calls.slice(commandStart).map(([request]) => ({ command: request.command,
+            argsSha256: createHash("sha256").update(JSON.stringify(request.args)).digest("hex") })) }));
         expect(prompts[1]).toContain(message);
         expect(await deliveredQueuedCommentIds(f.db, { companyId, issueId: f.issueId, agentId, commentIds: [next.commentId!] })).toEqual(new Set([next.commentId!]));
         expect((await f.db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.runId))).filter(event => event.eventType === "turn.started")).toHaveLength(1);
         // The server receipt is lifecycle authority only: no backup replaces
         // the box's provider state or advances/rewinds its cursor.
         expect(await readFile(runnerPath, "utf8")).toBe(savedBytes);
-        expect(restoredReceipts).toEqual([expect.objectContaining({ ...identity, lifecycle: "recoverable_failure" })]);
+        expect(restoredReceipts).toEqual([expect.objectContaining({ ...identity, lifecycle: mode === "suspended" ? "suspended" : "recoverable_failure" })]);
         let previousRunId = next.runId;
         for (const turn of ["ordinary one", "ordinary two"]) {
           await f.db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, previousRunId));
@@ -237,7 +248,7 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
         const [settled] = await f.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, next.runId));
         expect(settled).toMatchObject({ phase: "terminal_failure", failureCode: "remote_warm_session_not_idle", nextAttemptAt: null });
         expect((settled.failureDetail as { nextAction: string }).nextAction).toBe(
-          "Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent; /new does not carry your unanswered message, so send it again. Automatic retries are stopped.");
+          "Your message was not answered: this conversation could not be resumed safely. Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent; /new does not carry your unanswered message, so send it again. Automatic retries are stopped.");
         const dispatch = vi.fn();
         for (const delay of [31_000, 62_000]) expect(await dispatchNativeSessionResumptions({ db: f.db,
           runnerInstanceId: "idle-reconciler", runIds: [next.runId], now: new Date(Date.now() + delay), dispatch })).toEqual([]);
