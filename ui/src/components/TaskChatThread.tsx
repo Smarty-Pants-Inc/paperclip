@@ -580,6 +580,7 @@ export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
   onRetainedSubmissionChange?: (requestId: string | null) => void;
   onRestoreReady?: () => void;
   conversationMode?: boolean;
+  wakeIntentAllowed?: boolean;
   creationActivity?: ActivityEvent[];
   createdTasks?: Issue[];
   compactHistory?: boolean;
@@ -715,6 +716,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     mentions,
     enableReassign,
     conversationMode,
+    wakeIntentAllowed = true,
     reassignOptions,
     currentAssigneeValue,
     suggestedAssigneeValue,
@@ -766,7 +768,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   } = props;
   // Agent Chat renders this same thread for its current conversation task.
   const { noteTyping } = useWakeIntent(issueId, {
-    enabled: showComposer && Boolean(conversationMode || issueAssigneeAgentId),
+    enabled: wakeIntentAllowed && showComposer && !composerDisabledReason && Boolean(conversationMode || issueAssigneeAgentId),
   });
   // A reply's question can be on an unfetched history page. Fetch that exact
   // row, without gating the whole transcript on its availability. Admission,
