@@ -3569,6 +3569,41 @@ describe("remote provider pack manifest", () => {
     }
   });
 
+  it("admits a pack that declares only pi_rpc and refuses other harnesses' leftovers in it (Smarty seam)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-pi-only-pack-"));
+    try {
+      const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+      await mkdir(join(root, "dist/cli"), { recursive: true }); await mkdir(join(root, "node_modules/node/bin"), { recursive: true });
+      await writeFile(join(root, "dist/cli/pi-app-server-proxy.cjs"), "proxy\n");
+      await writeFile(join(root, "node_modules/node/bin/node"), "node\n"); await writeFile(join(root, "pnpm-lock.yaml"), "lock\n");
+      const payload: Record<string, unknown> = {
+        compatibility: { pi_rpc: (PROVIDER_PACK_COMPATIBILITY as Record<string, unknown>).pi_rpc },
+        pins: { nodeMinimum: "24.11.0" }, target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "1".repeat(40),
+        distDigest: sha256DirectoryTree(join(root, "dist")),
+        artifacts: { nodeCommand: { path: "node_modules/node/bin/node", sha256: digest("node\n") }, productionLock: { path: "pnpm-lock.yaml", sha256: digest("lock\n") } },
+        pi_rpc: { version: "1.7.0", runtime: { path: "pi-runtime", sha256: digest("r") }, resources: { path: "pi-resources", sha256: digest("s") } },
+      };
+      const write = () => writeFile(join(root, "provider-pack.json"), JSON.stringify({ schema: "paperclip-runner/remote-provider-pack/v1",
+        digest: `sha256:${createHash("sha256").update(canonical(payload)).digest("hex")}`, payload }));
+      await write();
+      expect(readRemoteProviderPackManifest(root).payload.pins).toEqual({ nodeMinimum: "24.11.0" });
+      await expect(verifyRemoteProviderPackManifest(root)).resolves.toEqual(readRemoteProviderPackManifest(root));
+      for (const [field, value, message] of [
+        ["pins", { nodeMinimum: "24.11.0", opencode: "1.18.34" }, "pins or source revision"],
+        ["bridgeDigest", digest("bridge"), "pins or source revision"],
+        ["pi_rpc", undefined, "pins or source revision"],
+        ["artifacts", { ...(payload.artifacts as object), opencodeProxy: { path: "dist/cli/opencode-app-server-proxy.cjs", sha256: digest("x") } }, "carries no OpenCode proxy"],
+      ] as const) {
+        const previous = payload[field]; payload[field] = value; await write();
+        expect(() => readRemoteProviderPackManifest(root), field).toThrow(message);
+        payload[field] = previous; await write();
+      }
+      // A full-compatibility pack keeps every other harness's artifact requirement.
+      payload.compatibility = PROVIDER_PACK_COMPATIBILITY; await write();
+      expect(() => readRemoteProviderPackManifest(root)).toThrow("pins or source revision");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("keeps a cached warm Pi owner on its admitted pack when the server pack changes", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-provider-pack-"));
     await mkdir(join(root, "dist", "cli"), { recursive: true });
