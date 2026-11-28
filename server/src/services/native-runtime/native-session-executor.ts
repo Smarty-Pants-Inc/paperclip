@@ -15311,6 +15311,19 @@ function* providerPackIdentityChecks(
       "runner_remote_provider_artifact_incompatible: provider dist tree digest mismatch",
     );
   }
+  // Smarty seam (pack-declared providers): the Pi closure that runs is checked like the other harnesses' assets.
+  if (payload.pi_rpc !== undefined) {
+    const piArtifacts = payload.artifacts as Record<string, { path: string; sha256: string } | undefined> | undefined;
+    for (const [label, entry, kind] of [["Pi runtime", payload.pi_rpc?.runtime, "tree"], ["Pi resources", payload.pi_rpc?.resources, "tree"],
+      ["Pi proxy", piArtifacts?.piProxy, "file"], ["Pi executable", piArtifacts?.piExecutable, "file"], ["Pi RPC command", piArtifacts?.piRpcCommand, "file"]] as const) {
+      if (entry === undefined && kind === "file") continue;
+      const entryPath = providerPackRelativePath(entry?.path, `${label} path`);
+      if (!/^sha256:[a-f0-9]{64}$/.test(entry?.sha256 ?? "")
+        || (verifyControllerFiles && (yield { kind, path: resolve(packRoot, entryPath) }) !== entry!.sha256)) {
+        throw new Error(`runner_remote_provider_artifact_incompatible: ${label} digest mismatch`);
+      }
+    }
+  }
   for (const [inventory, candidates] of [["providers", payload.providers], ["candidateProviders", payload.candidateProviders]] as const) {
     if (candidates === undefined) continue;
     const allowedProviders: readonly string[] = inventory === "providers" ? REMOTE_PROVIDER_PACK_PROVIDERS : REMOTE_PROVIDER_PACK_CANDIDATES;
