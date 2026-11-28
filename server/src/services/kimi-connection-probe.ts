@@ -5,6 +5,7 @@ import { unprocessable } from "../errors.js";
 import { createSshCommandManagedRuntimeRunner, runSshCommand } from "@paperclipai/adapter-utils/ssh";
 import { QUALIFIED_ACPX_PROFILES } from "../vendor/paperclip-runner/index.js";
 import { resolveKimiCandidateAdmission } from "./native-runtime/acpx-qualification.js";
+import { providerPackPathForEnvironment } from "./native-runtime/provider-pack-path.js";
 
 const REQUEST_FAILED = () => unprocessable("Kimi Code metadata verification failed.", { code: "KIMI_REQUEST_FAILED" });
 const INSTALLATION_INVALID = () => unprocessable("Install the current verified Kimi Code runtime in this execution environment.", { code: "KIMI_INSTALLATION_INVALID" });
@@ -39,7 +40,7 @@ export async function probeKimiExecutionTarget(apiKey: string, target: AdapterEx
     throw unprocessable("Kimi Code metadata verification is unavailable in this hosting environment.", { code: "KIMI_INSTALLATION_INVALID" });
   }
   let locations = ["/opt/paperclip-runner/provider-pack", '"$HOME/.local/share/paperclip-runner/provider-pack"'];
-  const selectedPackRoot = process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH?.trim();
+  const selectedPackRoot = providerPackPathForEnvironment(target.environmentId);
   if (selectedPackRoot) {
     try {
       // Test uses the same complete-pack installer as native execution. It

@@ -1,3 +1,5 @@
+import { isAbsolute } from "node:path";
+
 /**
  * Smarty seam (11-28): the provider pack an environment's runs use.
  * PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH_BY_ENVIRONMENT maps environment ids to pack paths
@@ -14,8 +16,8 @@ export function providerPackPathForEnvironment(
     let map: unknown;
     try { map = JSON.parse(raw); } catch { map = null; }
     if (!map || typeof map !== "object" || Array.isArray(map)
-      || Object.values(map).some(path => typeof path !== "string" || !path.trim())) {
-      throw new Error("PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH_BY_ENVIRONMENT must map environment ids to pack paths");
+      || Object.values(map).some(path => typeof path !== "string" || !path.trim() || !isAbsolute(path.trim()))) {
+      throw new Error("PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH_BY_ENVIRONMENT must map environment ids to absolute pack paths");
     }
     const path = environmentId && Object.hasOwn(map, environmentId) ? (map as Record<string, string>)[environmentId] : undefined;
     if (path) return path.trim();
