@@ -128,7 +128,8 @@ describe("workspace snapshot threads", () => {
       baseline, sourceDir: source, targetDir: target, workspaceSnapshotIsolation: "worker",
       ...(supplied ? { snapshots: { source: supplied } } : {}),
     });
-    expect(created).toHaveLength(mode === "changed" ? 2 : 1);
+    // Only the source is captured off-thread; without the strict preflight the current copy is read per path, never captured.
+    expect(created).toHaveLength(mode === "sparse" ? 0 : 1);
     expect(await fs.readFile(path.join(target, "file"), "utf8")).toBe(mode === "unchanged" ? "before" : "after");
     expect(await fs.readFile(path.join(target, "concurrent"), "utf8")).toBe("host bytes");
     for (const directory of created) await expect(fs.stat(directory)).rejects.toMatchObject({ code: "ENOENT" });

@@ -143,6 +143,27 @@ describe("workspace restore merge", () => {
     ).resolves.toBe("ssh codex\n");
   });
 
+  it("replaces a changed symlink in place and leaves no merge temporaries in the copy", async () => {
+    const rootDir = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-link-swap-")));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(path.join(targetDir, "d"), { recursive: true });
+    await symlink("old-target", path.join(targetDir, "d", "link"));
+    await writeFile(path.join(targetDir, "gone.txt"), "baseline");
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked: true });
+    try {
+      await mkdir(path.join(sourceDir, "d", "new", "deep"), { recursive: true });
+      await symlink("new-target", path.join(sourceDir, "d", "link"));
+      await writeFile(path.join(sourceDir, "d", "new", "deep", "file.txt"), "fresh");
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+      expect(await fsPromises.readlink(path.join(targetDir, "d", "link"))).toBe("new-target");
+      expect(await readFile(path.join(targetDir, "d", "new", "deep", "file.txt"), "utf8")).toBe("fresh");
+      await expect(lstat(path.join(targetDir, "gone.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await readdir(targetDir, { recursive: true })).filter(name => path.basename(name).startsWith(".paperclip-merge-"))).toEqual([]);
+    } finally { await disposeDirectorySnapshot(baseline); }
+  });
+
   it("never deletes outside the target through a parent directory replaced by a symlink", async () => {
     const rootDir = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-symlink-parent-")));
     cleanupDirs.push(rootDir);

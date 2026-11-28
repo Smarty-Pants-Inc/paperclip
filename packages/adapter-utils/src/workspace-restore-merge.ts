@@ -600,12 +600,13 @@ async function withCanonicalDirectoryMergeLock<T>(
   }
 }
 
-type StagedFile = { temporary: string; targetPath: string };
+type StagedFile = { temporary: string; targetPath: string; symlink?: boolean };
 
 /** Directories and symlinks are applied in path order at once; a regular file is copied to a temporary sibling and
  * returned for the batch publish in mergeDirectoryWithBaseline (Smarty speed/one: the per-file fsync made a 16k-file
  * repository merge take ~80 s). */
-async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry): Promise<StagedFile | null> {
+async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry,
+  temporaryFor: (targetPath: string) => string, changed: string[]): Promise<StagedFile | null> {
   const sourcePath = path.join(sourceDir, relative);
   const targetPath = path.join(targetDir, relative);
 
@@ -618,18 +619,20 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
       await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
     }
     await fs.mkdir(targetPath, { recursive: true });
+    changed.push(targetPath);
     return null;
   }
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   if (entry.kind === "symlink") {
-    await fs.rm(targetPath, { recursive: true, force: true });
-    await fs.symlink(entry.target, targetPath);
-    return null;
+    // Old link or new link, never none: the new link is made aside and renamed over the old one with the files.
+    const temporary = temporaryFor(targetPath);
+    await fs.symlink(entry.target, temporary);
+    return { temporary, targetPath, symlink: true };
   }
   // An interrupted restore must not leave a truncated current file. The incoming bytes go to a temporary sibling; the
   // caller makes every staged file durable in ONE flush before any rename publishes it, then flushes the renames.
-  const temporary = path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
+  const temporary = temporaryFor(targetPath);
   try {
     await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, temporary);
@@ -669,6 +672,32 @@ async function runBounded<T>(items: readonly T[], work: (item: T) => Promise<voi
   };
   await Promise.all(Array.from({ length: Math.min(MERGE_COPY_CONCURRENCY, items.length) }, worker));
   if (failure !== null) throw failure;
+}
+
+/** Every directory from each path's parent up to the target itself: the entries a crash could lose (a created
+ * directory's own entry lives in its parent, all the way up). */
+function ancestorDirectories(targetDir: string, paths: readonly string[]): string[] {
+  const dirs = new Set<string>();
+  for (const changedPath of paths) {
+    for (let dir = path.dirname(changedPath); !dirs.has(dir); dir = path.dirname(dir)) {
+      dirs.add(dir);
+      if (dir === targetDir || !dir.startsWith(`${targetDir}${path.sep}`)) break;
+    }
+  }
+  return [...dirs];
+}
+
+/** The merge's temporaries live in ONE directory per target beside its lock, so an interrupted merge (SIGKILL) leaves
+ * nothing inside the copy and the next merge clears the leftovers in one remove. On a different filesystem from the
+ * target (a rename could not publish across it) the temporaries fall back to siblings of their targets. */
+async function prepareMergeStaging(canonicalTargetDir: string): Promise<string | null> {
+  const lockRoot = await resolveDirectoryMergeLockRoot(process.env);
+  const staging = path.join(lockRoot, `${createHash("sha256").update(canonicalTargetDir).digest("hex")}.staging`);
+  await fs.rm(staging, { recursive: true, force: true });
+  await fs.mkdir(staging, { mode: 0o700 });
+  if ((await fs.stat(staging)).dev === (await fs.stat(canonicalTargetDir)).dev) return staging;
+  await fs.rm(staging, { recursive: true, force: true });
+  return null;
 }
 
 export async function captureDirectorySnapshot(
@@ -848,53 +877,69 @@ export async function mergeDirectoryWithBaseline(input: {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
         }
-        for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
-          if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
-          if (!entriesMatch(await currentEntry(relative), baselineEntry)) continue;
-          await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
-          timing.entriesRemoved++;
-        }
-        // Reverse path order visits descendants before their parent directory.
-        for (const [relative, entry] of orderedEntries(input.baseline, true)) {
-          if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
-          });
-        }
-        // Directories and symlinks in path order; regular files copied to temporaries in a bounded pool, made durable in
-        // one flush, renamed into place, and the renames flushed, all before the owner records success (afterApply).
+        // Every path this merge removes, creates or replaces; their directories are flushed before success is recorded.
+        const changed: string[] = [];
+        const staging = await prepareMergeStaging(canonicalTargetDir);
+        let nextTemporary = 0;
+        const temporaryFor = (targetPath: string) => staging
+          ? path.join(staging, String(nextTemporary++)) : path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
         const staged: StagedFile[] = [];
         let pending: Promise<void>[] = [], failure: unknown = null;
         const settle = async () => { await Promise.all(pending); pending = []; if (failure !== null) throw failure; };
         try {
+          for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
+            if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
+            if (!entriesMatch(await currentEntry(relative), baselineEntry)) continue;
+            await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
+            changed.push(path.join(canonicalTargetDir, relative));
+            timing.entriesRemoved++;
+          }
+          // Reverse path order visits descendants before their parent directory.
+          for (const [relative, entry] of orderedEntries(input.baseline, true)) {
+            if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative))
+              .then(() => { changed.push(path.join(canonicalTargetDir, relative)); }, (error: NodeJS.ErrnoException) => {
+                if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
+              });
+          }
+          // Directories in path order; regular files and symlinks made aside (files in a bounded pool), the files' bytes
+          // made durable in one flush, everything renamed into place, then every changed directory up to the target
+          // flushed, all before the owner records success (afterApply).
           for (const [relative, entry] of orderedEntries(source)) {
             if (entriesMatch(input.baseline.entries.get(relative), entry) ||
                 (input.conflictPolicy === "reject" && entriesMatch(current?.entries.get(relative), entry))) continue;
-            if (entry.kind !== "file") {
+            if (entry.kind === "dir") {
               await settle();
-              await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+              await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry, temporaryFor, changed);
               continue;
             }
             if (pending.length >= MERGE_COPY_CONCURRENCY) await settle();
-            pending.push(copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry)
+            pending.push(copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry, temporaryFor, changed)
               .then(file => { if (file) staged.push(file); }, error => { failure ??= error; }));
           }
           await settle();
-          if (staged.length) {
+          const files = staged.filter(file => !file.symlink);
+          if (files.length) {
             const flushStart = performance.now();
-            await flushTargetFilesystem(canonicalTargetDir, staged.map(file => file.temporary));
+            await flushTargetFilesystem(canonicalTargetDir, files.map(file => file.temporary));
             timing.flushMs = Math.round(performance.now() - flushStart);
-            timing.filesWritten = staged.length;
-            for (const file of staged) {
-              const existing = await fs.lstat(file.targetPath).catch(() => null);
-              if (existing?.isDirectory()) await fs.rm(file.targetPath, { recursive: true, force: true });
-              await fs.rename(file.temporary, file.targetPath);
-              file.temporary = "";
-            }
-            await flushTargetFilesystem(canonicalTargetDir, [...new Set(staged.map(file => path.dirname(file.targetPath)))]);
+            timing.filesWritten = files.length;
+          }
+          for (const file of staged) {
+            const existing = await fs.lstat(file.targetPath).catch(() => null);
+            if (existing?.isDirectory()) await fs.rm(file.targetPath, { recursive: true, force: true });
+            await fs.rename(file.temporary, file.targetPath);
+            file.temporary = "";
+            changed.push(file.targetPath);
+          }
+          if (changed.length) {
+            const flushStart = performance.now();
+            await flushTargetFilesystem(canonicalTargetDir, ancestorDirectories(canonicalTargetDir, changed));
+            timing.flushMs += Math.round(performance.now() - flushStart);
           }
         } finally {
           await Promise.allSettled(pending);
-          await Promise.all(staged.filter(file => file.temporary).map(file => fs.rm(file.temporary, { force: true })));
+          if (staging) await fs.rm(staging, { recursive: true, force: true });
+          else await Promise.all(staged.filter(file => file.temporary).map(file => fs.rm(file.temporary, { force: true })));
         }
         timing.applyMs = since();
         try { input.onTiming?.(timing); } catch { /* timing is evidence only */ }
