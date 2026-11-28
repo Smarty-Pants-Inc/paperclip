@@ -18663,11 +18663,9 @@ async function createRunnerdBackendWithinSessionClaim(
     const leaseId = remoteTarget.leaseId;
     const updated = await writeEnvironmentCleanup(input.db, tx => tx
       .update(environmentLeases)
+      // Smarty seam: merge the stamp into the CURRENT metadata; a whole-object write could erase a concurrent handoff.
       .set({
-        metadata: {
-          ...(leaseRow.metadata ?? {}),
-          nativeHarnessBackup: stamp,
-        },
+        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackup: stamp })}::jsonb`,
         updatedAt: new Date(),
       })
       .where(eq(environmentLeases.id, leaseId))
@@ -18682,10 +18680,17 @@ async function createRunnerdBackendWithinSessionClaim(
         providerLeaseId: leaseRow.providerLeaseId, executionWorkspaceId: leaseRow.executionWorkspaceId,
         normalizedSessionId: backup.manifest.normalizedSessionId, completedAt: backup.manifest.completedAt,
         currentRunId: input.execution.binding.runId });
-      if (tip) await writeEnvironmentCleanup(input.db, tx => tx.update(environmentLeases)
-        .set({ metadata: { ...(tip.metadata ?? {}), nativeHarnessBackup: stamp }, updatedAt: new Date() })
-        .where(eq(environmentLeases.id, tip.id)),
+      if (!tip) return;
+      // Only while it is still the tip (no successor written since it was read); the stamp merges into its current metadata.
+      const stamped = await writeEnvironmentCleanup(input.db, tx => tx.update(environmentLeases)
+        .set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackup: stamp })}::jsonb`,
+          updatedAt: new Date() })
+        .where(and(eq(environmentLeases.id, tip.id), sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`))
+        .returning({ id: environmentLeases.id }).then(rows => rows[0] ?? null),
       { companyId: leaseRow.companyId, runId: tip.heartbeatRunId ?? undefined, leaseId: tip.id });
+      await input.onLog?.("stderr", stamped
+        ? `[paperclip-runner] backup stamp copied to the sandbox's current lease row ${stamped.id}\n`
+        : `[paperclip-runner] the sandbox's lease row ${tip.id} gained a successor before the stamp; not stamped\n`);
     } catch (error) {
       const detail = redactSensitiveText(error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, " ").slice(0, 512);
       await input.onLog?.("stderr", `[paperclip-runner] the backup stamp was not copied to the sandbox's current lease row: ${detail}\n`);
