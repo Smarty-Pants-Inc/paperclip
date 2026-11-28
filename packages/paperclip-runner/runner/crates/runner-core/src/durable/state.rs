@@ -1230,11 +1230,13 @@ impl DurableStateStore {
                     DurableRunnerError::invalid(format!("failed to commit durable state: {error}"))
                 })?;
             drop(file);
-            fs::rename(&temporary, &self.path).map_err(|error| {
-                DurableRunnerError::invalid(format!(
-                    "failed to atomically replace durable state: {error}"
-                ))
-            })?;
+            crate::atomic_replace::rename_replace_retrying_exdev(&temporary, &self.path).map_err(
+                |error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to atomically replace durable state: {error}"
+                    ))
+                },
+            )?;
             #[cfg(unix)]
             if let Some(parent) = self.path.parent() {
                 File::open(parent)
