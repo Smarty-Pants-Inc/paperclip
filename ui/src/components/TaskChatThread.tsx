@@ -305,6 +305,39 @@ function containsTranscriptWords(candidate: TranscriptEntry[], current: Transcri
   });
 }
 
+// Recovery preserves agent prose (including streamed prefixes), but only
+// tool-result identity: the parsers can format the same output differently.
+function pickerContent(entries: TranscriptEntry[]) {
+  const prose: Array<{ kind: "assistant" | "thinking"; text: string }> = [];
+  const toolResults = new Set<string>();
+  for (const entry of canonicalTranscript(entries, false)) {
+    if (entry.kind === "assistant" || entry.kind === "thinking") {
+      prose.push({ kind: entry.kind, text: entry.text });
+    }
+    if (entry.kind === "tool_result" && entry.toolUseId) toolResults.add(entry.toolUseId);
+    if (entry.kind === "provider_activity" && entry.family === "tool_execution" &&
+      typeof entry.payload.executionId === "string" && typeof entry.payload.output === "string") {
+      toolResults.add(entry.payload.executionId);
+    }
+  }
+  return { prose, toolResults };
+}
+
+function containsPickerContent(candidate: TranscriptEntry[], current: TranscriptEntry[]): boolean {
+  const available = pickerContent(candidate);
+  const drawn = pickerContent(current);
+  if (![...drawn.toolResults].every(id => available.toolResults.has(id))) return false;
+  // Longest first prevents a short prefix from consuming a longer row's match.
+  return drawn.prose.sort((a, b) => b.text.length - a.text.length).every(item => {
+    const exact = available.prose.findIndex(row => row.kind === item.kind && row.text === item.text);
+    const index = exact >= 0 ? exact : available.prose.findIndex(row =>
+      row.kind === item.kind && row.text.startsWith(item.text));
+    if (index < 0) return false;
+    available.prose.splice(index, 1);
+    return true;
+  });
+}
+
 function normalizedMessageText(value: string | null | undefined): string {
   return (value ?? "").trim().replace(/\s+/g, " ");
 }
@@ -1433,6 +1466,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     transcriptByRun: nativeTranscriptByRun,
     activityLabelByRun: nativeActivityLabelByRun,
     errorsByRun: nativeTranscriptErrorsByRun,
+    catchingUpRunIds: nativeCatchingUpRunIds,
     isInitialHydrating: nativeEventsAreInitiallyHydrating,
     hydratedRunIds: hydratedNativeRunIds,
     terminalHydratedRunIds,
@@ -1454,6 +1488,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const historyKey = conversationMode && draftKey ? draftKey : issueId;
   const [expiredHistoryWait, setExpiredHistoryWait] = useState<{ historyKey: typeof historyKey } | null>(null);
   const historyWaitExpired = expiredHistoryWait !== null && expiredHistoryWait.historyKey === historyKey;
+  const drawnByRunRef = useRef(new Map<string, TranscriptEntry[]>());
   const selectedTranscriptByRun = useMemo(() => {
     const next = new Map(logTranscriptByRun);
     for (const run of nativeRuns) {
@@ -1468,10 +1503,19 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const nativeTranscript = nativeTranscriptByRun.get(run.id) ?? [];
       const logTranscript = logTranscriptByRun.get(run.id) ?? [];
       const freshness = compareContentVersion(latestTranscriptContent(nativeTranscript), latestTranscriptContent(logTranscript));
-      // The same rule on first load, recovery and reload: newest durable content
-      // wins. Equal versions may hand over only without changing the words.
-      // Transport failure is a tie-breaker, never a reason to rewind content.
-      if (nativeTranscript.length > 0 && (!logTranscript.length || freshness > 0 ||
+      // Read cursors and output share native sequence numbers. A newer log
+      // watermark must not replace that layout, including on settled reloads.
+      // A failed native read still permits the durable log fallback below.
+      const hasReadLayout = steeringDeliveryPoints(nativeTranscript).byQuestion.size > 0;
+      // Derived only from this memo's output after commit (or that output's
+      // retained paint through a read gap); this is the previous drawn source.
+      const drawn = drawnByRunRef.current.get(run.id);
+      // Recovery may trail agent prose or tool results already shown by the
+      // fallback. Tool-result identity matters here, not parser formatting.
+      const canReturnToNative = !hasReadLayout || !drawn?.length ||
+        steeringDeliveryPoints(drawn).byQuestion.size > 0 || containsPickerContent(nativeTranscript, drawn);
+      const ownsReadLayout = hasReadLayout && !nativeTranscriptErrorsByRun.has(run.id);
+      if (canReturnToNative && nativeTranscript.length > 0 && (ownsReadLayout || !logTranscript.length || freshness > 0 ||
         (freshness === 0 && containsTranscriptWords(nativeTranscript, logTranscript) &&
           (!nativeTranscriptErrorsByRun.has(run.id) || !containsTranscriptWords(logTranscript, nativeTranscript))))) {
         next.set(run.id, nativeTranscript);
@@ -1505,7 +1549,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     : logErrorsByRun.has(run.id) ||
       (nativeTranscriptErrorsByRun.has(run.id) && !(selectedTranscriptByRun.get(run.id)?.length))
   ).map(run => run.id));
-  const drawnByRunRef = useRef(new Map<string, TranscriptEntry[]>());
   const drawnCutLogRunIdsRef = useRef(new Set<string>());
   const { rawTranscriptByRun, cutLogRunIds } = useMemo(() => {
     const next = new Map(selectedTranscriptByRun);
@@ -4330,6 +4373,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // A successful read can still trail the live stream's sequence watermark.
     // It is loading, even after initial hydration, unless the repair read failed.
     if (logCatchingUpRunIds?.has(run.id) && !logErrorsByRun.has(run.id) && !selectedNativeRunIds.has(run.id)) return true;
+    if (nativeCatchingUpRunIds?.has(run.id) && !nativeTranscriptErrorsByRun.has(run.id) && selectedNativeRunIds.has(run.id)) return true;
     if (unavailableRunIds.has(run.id)) return false;
     if (historyWaitExpired && isTerminalRunStatus(run.status) && rawTranscriptByRun.get(run.id)?.length &&
       !logsAreInitiallyHydrating && !(run.runtimeMode === "native" && nativeEventsAreInitiallyHydrating)) return false;
