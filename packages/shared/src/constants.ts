@@ -1510,6 +1510,8 @@ export const PLUGIN_CAPABILITIES = [
   "execution.workspaces.read",
   "workspaces.manage",
   "issues.read",
+  "issues.diagnostics.read",
+  "issues.chat-binding.read",
   "issue.relations.read",
   "issue.subtree.read",
   "issue.comments.read",

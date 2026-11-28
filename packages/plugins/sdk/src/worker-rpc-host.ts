@@ -886,6 +886,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.get", { issueId, companyId });
         },
 
+        async wakeDiagnostics(issueId, companyId, options) {
+          return callHost("issues.wakeDiagnostics", { issueId, companyId, limit: options?.limit });
+        },
+
+        async chatBinding(issueId, companyId) {
+          return callHost("issues.chatBinding", { issueId, companyId });
+        },
+
         async create(input) {
           return callHost("issues.create", {
             companyId: input.companyId,

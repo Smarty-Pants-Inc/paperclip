@@ -13,6 +13,10 @@ import {
   assets,
   companies,
   companyMemberships,
+  chatConversations,
+  chatEndpoints,
+  toolConnections,
+  toolApplications,
   costEvents,
   createDb,
   documents,
@@ -35,6 +39,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { pluginCapabilityValidator } from "../services/plugin-capability-validator.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -130,6 +135,65 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     tempRoots.push(root);
     return root;
   }
+
+  it.each([
+    ["issues.wakeDiagnostics", "issues.diagnostics.read"],
+    ["issues.chatBinding", "issues.chat-binding.read"],
+  ] as const)("requires explicit host capability approval for %s", (operation, capability) => {
+    const validator = pluginCapabilityValidator();
+    const manifest = { capabilities: ["issues.read"] } as any;
+    expect(validator.checkOperation(manifest, operation)).toMatchObject({ allowed: false, missing: [capability] });
+    expect(validator.checkOperation({ ...manifest, capabilities: [capability] }, operation).allowed).toBe(true);
+  });
+
+  it("projects bounded wake diagnostics without payload or error text", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Wake read" });
+    const requestedAt = new Date();
+    await db.insert(agentWakeupRequests).values(Array.from({ length: 51 }, () => ({
+      companyId, agentId, source: "assignment", status: "failed", runId,
+      payload: { issueId, privateText: "hidden payload" }, error: "hidden error",
+      requestedAt, claimedAt: requestedAt, finishedAt: requestedAt,
+    })));
+    const services = buildHostServices(db, "plugin-record-id", "test.reads", createEventBusStub());
+    const expected = {
+      kind: "wake_request", status: "failed", runId, agentId,
+      requestedAt: requestedAt.toISOString(), claimedAt: requestedAt.toISOString(),
+      finishedAt: requestedAt.toISOString(), failureClass: "failed",
+    };
+    const result = await services.issues.wakeDiagnostics({ issueId, companyId, limit: 1 });
+    expect(result).toEqual({ events: [expected], truncated: true });
+    for (const limit of [undefined, 500, Infinity, NaN, 1.9, 0, -1]) {
+      const bounded = await services.issues.wakeDiagnostics({ issueId, companyId, limit });
+      expect(bounded.events.length).toBe(limit === 1.9 || limit === 0 || limit === -1 ? 1 : 50);
+      expect(bounded.truncated).toBe(true);
+      for (const event of bounded.events) expect(event).toEqual(expected);
+    }
+    await expect(services.issues.wakeDiagnostics({ issueId, companyId: randomUUID() })).rejects.toThrow("Issue not found");
+    await db.delete(agentWakeupRequests);
+    await expect(services.issues.wakeDiagnostics({ issueId, companyId })).resolves.toEqual({ events: [], truncated: false });
+  });
+
+  it("projects a stored chat binding to only its conversation id", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID(), connectionId = randomUUID(), endpointId = randomUUID(), conversationId = randomUUID();
+    const applicationId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Chat read" });
+    const services = buildHostServices(db, "plugin-record-id", "test.reads", createEventBusStub());
+    await expect(services.issues.chatBinding({ issueId, companyId })).resolves.toBeNull();
+    await db.insert(toolApplications).values({ id: applicationId, companyId, applicationKey: `read-${applicationId}`, name: "Read fixture", type: "chat" });
+    await db.insert(toolConnections).values({ id: connectionId, companyId, applicationId,
+      name: "Chat fixture", uid: connectionId, connectionPurpose: "channel", transport: "chat_sdk", enabled: true, status: "active" });
+    await db.insert(chatEndpoints).values({ id: endpointId, companyId, connectionId, provider: "slack",
+      publicId: randomUUID(), assignedAgentId: agentId, status: "active", botDisplayName: "Hidden bot" });
+    await db.insert(chatConversations).values({ id: conversationId, companyId, endpointId, issueId,
+      externalConversationId: "hidden-external", externalThreadId: "hidden-thread", externalLabel: "Hidden label",
+      providerUrl: "https://example.test/private", sessionGeneration: 1, isDirectMessage: true, state: "active" });
+    await expect(services.issues.chatBinding({ issueId, companyId })).resolves.toEqual({ conversationId });
+    await expect(services.issues.chatBinding({ issueId, companyId: randomUUID() })).rejects.toThrow("Issue not found");
+  });
 
   it("returns plugin-safe execution workspace metadata scoped to the company", async () => {
     const { companyId } = await seedCompanyAndAgent();
@@ -1399,6 +1463,13 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
       ]);
       return { companyId, agentId, openIssueId, privateIssueId };
     }
+
+    it.each(["wakeDiagnostics", "chatBinding"] as const)("refuses unreadable issues in %s", async (method) => {
+      const { companyId, openIssueId, privateIssueId } = await seedOpenAndPrivate();
+      const services = buildHostServices(db, "plugin-record-id", "test.reads", createEventBusStub());
+      await expect(services.issues[method]({ issueId: privateIssueId, companyId })).rejects.toThrow("Issue not found");
+      await expect(services.issues[method]({ issueId: openIssueId, companyId })).resolves.toBeDefined();
+    });
 
     it("omits private issues from issues.list", async () => {
       const { companyId, openIssueId, privateIssueId } = await seedOpenAndPrivate();

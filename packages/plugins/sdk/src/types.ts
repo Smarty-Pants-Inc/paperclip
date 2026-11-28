@@ -1549,6 +1549,20 @@ export interface PluginIssueAttachmentContent {
  * - `issue.documents.read` for `documents.list` and `documents.get`
  * - `issue.documents.write` for `documents.upsert` and `documents.delete`
  */
+export interface PluginIssueWakeDiagnostics {
+  events: Array<{
+    kind: "wake_request";
+    status: string;
+    runId: string | null;
+    agentId: string;
+    requestedAt: string;
+    claimedAt?: string | null;
+    finishedAt?: string | null;
+    failureClass?: "failed" | "cancelled" | "skipped" | null;
+  }>;
+  truncated: boolean;
+}
+
 export interface PluginIssuesClient {
   list(input: {
     companyId: string;
@@ -1563,6 +1577,8 @@ export interface PluginIssuesClient {
     offset?: number;
   }): Promise<Issue[]>;
   get(issueId: string, companyId: string): Promise<Issue | null>;
+  wakeDiagnostics(issueId: string, companyId: string, options?: { limit?: number }): Promise<PluginIssueWakeDiagnostics>;
+  chatBinding(issueId: string, companyId: string): Promise<{ conversationId: string } | null>;
   create(input: {
     companyId: string;
     projectId?: string;

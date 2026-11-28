@@ -68,6 +68,7 @@ import type {
   PluginIssueAttachmentContent,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
+  PluginIssueWakeDiagnostics,
   PluginJobContext,
   PluginExecutionWorkspaceMetadata,
   PluginWorkspace,
@@ -2005,6 +2006,14 @@ export interface WorkerToHostMethods {
   "issues.get": [
     params: { issueId: string; companyId: string },
     result: Issue | null,
+  ];
+  "issues.wakeDiagnostics": [
+    params: { issueId: string; companyId: string; limit?: number },
+    result: PluginIssueWakeDiagnostics,
+  ];
+  "issues.chatBinding": [
+    params: { issueId: string; companyId: string },
+    result: { conversationId: string } | null,
   ];
   "issues.create": [
     params: {

@@ -1671,6 +1671,16 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         const issue = issues.get(issueId);
         return isInCompany(issue, companyId) ? issue : null;
       },
+      async wakeDiagnostics(issueId, companyId) {
+        requireCapability(manifest, capabilitySet, "issues.diagnostics.read");
+        if (!isInCompany(issues.get(issueId), companyId)) throw new Error("Issue not found");
+        return { events: [], truncated: false };
+      },
+      async chatBinding(issueId, companyId) {
+        requireCapability(manifest, capabilitySet, "issues.chat-binding.read");
+        if (!isInCompany(issues.get(issueId), companyId)) throw new Error("Issue not found");
+        return null;
+      },
       async create(input) {
         requireCapability(manifest, capabilitySet, "issues.create");
         const now = new Date();

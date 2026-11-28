@@ -268,6 +268,7 @@ export type {
   PluginSkillsClient,
   PluginCompaniesClient,
   PluginIssuesClient,
+  PluginIssueWakeDiagnostics,
   PluginIssueMutationActor,
   PluginIssueRelationsClient,
   PluginIssueRelationSummary,

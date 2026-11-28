@@ -60,6 +60,8 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "execution.workspaces.get": ["execution.workspaces.read"],
   "issues.list": ["issues.read"],
   "issues.get": ["issues.read"],
+  "issues.wakeDiagnostics": ["issues.diagnostics.read"],
+  "issues.chatBinding": ["issues.chat-binding.read"],
   "issues.relations.get": ["issue.relations.read"],
   "issue.comments.list": ["issue.comments.read"],
   "issue.comments.get": ["issue.comments.read"],

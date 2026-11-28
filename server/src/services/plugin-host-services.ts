@@ -42,6 +42,7 @@ import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { issueService } from "./issues.js";
+import { getExternalChannelBindingSummary } from "./chat-channel-binding.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
@@ -2142,6 +2143,40 @@ export function buildHostServices(
         if (!inCompany(issue, companyId)) return null;
         if (!(await pluginCanReadIssue(issue))) return null;
         return issue as Issue;
+      },
+      async wakeDiagnostics(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        await requirePluginReadableIssue(params.issueId, companyId);
+        const limit = typeof params.limit === "number" && Number.isFinite(params.limit)
+          ? Math.max(1, Math.min(50, Math.floor(params.limit))) : 50;
+        const diagnostic = await issues.getWakeDiagnostics(params.issueId, {
+          maxWakeRequests: limit,
+          maxActivityRecords: 0,
+        });
+        const events = diagnostic.wakeRequests.slice(0, limit).map((row) => ({
+          kind: "wake_request" as const,
+          status: row.status,
+          runId: row.runId,
+          agentId: row.agentId,
+          requestedAt: new Date(row.requestedAt).toISOString(),
+          claimedAt: row.claimedAt ? new Date(row.claimedAt).toISOString() : null,
+          finishedAt: row.finishedAt ? new Date(row.finishedAt).toISOString() : null,
+          failureClass: row.status === "failed" || row.error ? "failed" as const
+            : row.status === "cancelled" ? "cancelled" as const
+            : row.status === "skipped" ? "skipped" as const : null,
+        }));
+        return {
+          events,
+          truncated: diagnostic.truncatedWakeRequests || diagnostic.wakeRequests.length > limit,
+        };
+      },
+      async chatBinding(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        await requirePluginReadableIssue(params.issueId, companyId);
+        const binding = await getExternalChannelBindingSummary(db, companyId, params.issueId);
+        return binding ? { conversationId: binding.conversationId } : null;
       },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
