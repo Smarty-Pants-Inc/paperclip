@@ -834,8 +834,15 @@ export async function mergeDirectoryWithBaseline(input: {
       const current = input.snapshots?.current ?? (input.conflictPolicy === "reject"
         ? await capture(canonicalTargetDir, { exclude: [], diskBacked: true }) : null);
       if (!input.snapshots?.current && current) timing.captureCurrentMs = since();
-      const currentEntry = async (relative: string) => current
-        ? current.entries.get(relative) : await readSnapshotEntry(canonicalTargetDir, relative);
+      // A per-path read resolves every parent segment (lstat follows all but the last), while a full capture never
+      // descends a symlink. So a path whose parent is no longer the plain directory under the target never matches,
+      // and the delete pass can never reach outside the target through a symlinked parent.
+      const currentEntry = async (relative: string) => {
+        if (current) return current.entries.get(relative);
+        const parent = path.dirname(path.join(canonicalTargetDir, relative));
+        if (await fs.realpath(parent).catch(() => null) !== parent) return null;
+        return await readSnapshotEntry(canonicalTargetDir, relative);
+      };
       try {
         if (input.conflictPolicy === "reject" && current) {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
