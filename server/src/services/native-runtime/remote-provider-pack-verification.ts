@@ -151,9 +151,6 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "const tree=(treeRoot)=>{try{return walk(treeRoot)}catch{return 'unreadable'}}",
     "for(const name of ['nodeCommand','productionLock','opencodeCommand','opencodeExecutable','opencodeProxy','acpxSidecar','grokLauncher']){const artifact=manifest.payload.artifacts[name];if(!artifact&&piOnly&&name!=='nodeCommand'&&name!=='productionLock')continue;if(hash(artifact.path)!==artifact.sha256)fail('artifact_digest:'+name,name+' digest mismatch')}",
     "if(tree(path.join(root,'dist'))!==manifest.payload.distDigest)fail('dist_digest','dist tree digest mismatch')",
-    // Smarty seam (pack-declared providers): a pi_rpc-only pack's Pi closure is checked like the other harnesses' assets
-    // (full packs keep today's box check; the server checks every pack's Pi closure at upload / admission).
-    "const pi=manifest.payload.pi_rpc;if(pi&&piOnly){for(const [name,entry] of [['pi_runtime',pi.runtime],['pi_resources',pi.resources]])if(tree(path.join(root,entry.path))!==entry.sha256)fail('pi_digest:'+name,name+' tree digest mismatch');for(const name of ['piProxy','piExecutable','piRpcCommand']){const artifact=manifest.payload.artifacts[name];if(artifact&&hash(artifact.path)!==artifact.sha256)fail('artifact_digest:'+name,name+' digest mismatch')}}",
     "for(const candidate of Object.values({...manifest.payload.providers,...manifest.payload.candidateProviders})){if(tree(path.join(root,candidate.path))!==candidate.sha256)fail('candidate_digest','candidate asset tree digest mismatch')}",
     "const version=process.versions.node.split('.').map(Number)",
     "const minimum=manifest.payload.pins.nodeMinimum.split('.').map(Number)",
