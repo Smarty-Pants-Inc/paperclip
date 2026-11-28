@@ -8322,6 +8322,20 @@ type LeaseCoordinator = {
   resultId: string | null;
 };
 
+/** A backup-stamp write (Smarty seam, Astra T1): `coalesce(metadata, '{}') || $json` on the row's current metadata.
+ * Returns whether it is that merge and the JSON it merges, which must be the stamp alone (the row's other keys stay). */
+function stampMerge(metadata: unknown): { merges: boolean; set: unknown } {
+  const chunks = (metadata as { queryChunks?: unknown[] } | null)?.queryChunks ?? [];
+  const text = chunks.map(chunk => {
+    const value = chunk && typeof chunk === "object" ? (chunk as { value?: unknown }).value : undefined;
+    return Array.isArray(value) ? value.join("") : "";
+  }).join("");
+  const json = chunks.map(chunk => typeof chunk === "string" ? chunk
+    : chunk && typeof chunk === "object" && typeof (chunk as { value?: unknown }).value === "string" ? (chunk as { value: string }).value : null)
+    .find(value => typeof value === "string" && value.startsWith("{"));
+  return { merges: /coalesce\(/.test(text) && /\|\|/.test(text), set: json ? JSON.parse(json) : undefined };
+}
+
 function leaseDb(
   boundExecution: NativeExecutionInput = execution,
   coordinatorOverrides: Partial<LeaseCoordinator> = {},
@@ -24907,12 +24921,13 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
-      expect(updates.filter(update => update.table === environmentLeases)).toEqual([expect.objectContaining({
-        values: expect.objectContaining({ metadata: { nativeHarnessBackup: expect.objectContaining({
-          normalizedSessionId: current.session.normalizedSessionId, runnerInstanceId,
-          sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created",
-        }) } }),
-      })]);
+      const leaseWrites = updates.filter(update => update.table === environmentLeases);
+      expect(leaseWrites).toHaveLength(1);
+      // The stamp merges into the row's current metadata and writes nothing else.
+      expect(stampMerge(leaseWrites[0]!.values.metadata)).toEqual({ merges: true, set: { nativeHarnessBackup: expect.objectContaining({
+        normalizedSessionId: current.session.normalizedSessionId, runnerInstanceId,
+        sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created",
+      }) } });
     } else {
       await expect(options.prepareExternalRunnerState()).rejects.toThrow("backup_without_reusable_lease");
       expect(syncIn).not.toHaveBeenCalled();
@@ -25068,16 +25083,15 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
-      expect(updates.filter(update => update.table === environmentLeases)).toEqual([
-        // The idle source is claimed first: its reuse scope moves into a superseded
-        // receipt, so it is never resumed with the older state again.
-        ...(idleWarm ? [expect.objectContaining({ values: expect.objectContaining({
-          metadata: expect.not.objectContaining({ reusableSandboxLease: expect.anything() }) }) })] : []),
-        expect.objectContaining({
-          values: expect.objectContaining({ metadata: { nativeHarnessBackup: expect.objectContaining({
-            normalizedSessionId: current.session.normalizedSessionId, sourceProviderLeaseId: "prior-sandbox",
-            authorizedProviderLeaseId: "sandbox-created" }) } }),
-        })]);
+      const leaseWrites = updates.filter(update => update.table === environmentLeases);
+      expect(leaseWrites).toHaveLength(idleWarm ? 2 : 1);
+      // The idle source is claimed first: its reuse scope moves into a superseded
+      // receipt, so it is never resumed with the older state again.
+      if (idleWarm) expect(leaseWrites[0]!.values.metadata).toEqual(expect.not.objectContaining({ reusableSandboxLease: expect.anything() }));
+      // The stamp merges into the row's current metadata and writes nothing else.
+      expect(stampMerge(leaseWrites.at(-1)!.values.metadata)).toEqual({ merges: true, set: { nativeHarnessBackup: expect.objectContaining({
+        normalizedSessionId: current.session.normalizedSessionId, sourceProviderLeaseId: "prior-sandbox",
+        authorizedProviderLeaseId: "sandbox-created" }) } });
       if (idleWarm) expect(updates.filter(update => update.table === environmentLeases)[0]!.values.metadata).toEqual(
         expect.objectContaining({ reusableSandboxLeaseSuperseded: expect.objectContaining({
           supersededByRunId: current.binding.runId, supersededByProviderLeaseId: "sandbox-created",
@@ -25599,8 +25613,8 @@ describe("runnerd provider runtime wiring", () => {
       expect(syncIn).toHaveBeenCalled();
       // Failed inspection must not erase the durable provenance of files that
       // were already copied. The next invocation must still use the END fence.
-      expect(cleanupUpdates.find(update => update.table === environmentLeases)?.values.metadata)
-        .toHaveProperty("nativeHarnessBackup");
+      expect(stampMerge(cleanupUpdates.find(update => update.table === environmentLeases)?.values.metadata))
+        .toEqual({ merges: true, set: { nativeHarnessBackup: expect.anything() } });
     }
   });
 
