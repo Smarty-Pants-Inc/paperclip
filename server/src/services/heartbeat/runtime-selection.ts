@@ -311,11 +311,35 @@ export async function prepareAndSelectHeartbeatRuntime(
   input: HeartbeatRuntimeSelectionInput,
   preparation: {
     prepareInstructions: (policy: NativeLifecyclePolicy | null) => Promise<Pick<HeartbeatRuntimeSelectionInput["config"], "runtimeConfig" | "instructionCopy">>;
+    /** Independent environment staging only; required services must already be prepared. */
+    prepareEnvironment?: () => Promise<Record<string, string>>;
+    onPrepared?: (config: Pick<HeartbeatRuntimeSelectionInput["config"], "runtimeConfig" | "instructionCopy">) => void;
     measure: <T>(phase: "instructions" | "runtime_selection", work: () => Promise<T>) => Promise<T>;
   },
 ): Promise<HeartbeatRuntimeSelectionResult> {
   const nativeLifecyclePolicy = resolveRuntimeLifecyclePolicy(input);
-  const prepared = await preparation.measure("instructions", () => preparation.prepareInstructions(nativeLifecyclePolicy));
+  const prepareInstructions = () => preparation.measure("instructions", () => preparation.prepareInstructions(nativeLifecyclePolicy));
+  let prepared: Pick<HeartbeatRuntimeSelectionInput["config"], "runtimeConfig" | "instructionCopy">;
+  if (preparation.prepareEnvironment) {
+    let failed = false;
+    let firstError: unknown;
+    const observe = <T>(work: () => Promise<T>) => Promise.resolve().then(work).catch((error: unknown) => {
+      if (!failed) { failed = true; firstError = error; }
+      throw error;
+    });
+    // Do not let either branch outlive the instruction/launcher owners: outer
+    // cleanup can release their files and lease as soon as this function throws.
+    const [instructions, environment] = await Promise.allSettled([
+      observe(prepareInstructions), observe(preparation.prepareEnvironment),
+    ]);
+    if (failed) throw firstError;
+    if (instructions.status === "rejected") throw instructions.reason;
+    if (environment.status === "rejected") throw environment.reason;
+    prepared = { ...instructions.value, runtimeConfig: { ...instructions.value.runtimeConfig, env: environment.value } };
+  } else {
+    prepared = await prepareInstructions();
+  }
+  preparation.onPrepared?.(prepared);
   return preparation.measure("runtime_selection", () => selectHeartbeatRuntime(db, {
     ...input,
     config: { ...input.config, ...prepared, nativeLifecyclePolicy },
