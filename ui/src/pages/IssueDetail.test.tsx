@@ -57,11 +57,16 @@ import { getRecentTasksStorageKey, readRecentTasks, recordRecentTask } from "../
 import { getLastProjectId, trackRecentProject } from "../lib/recent-projects";
 import { ApiError } from "../api/client";
 import type { issuesApi } from "../api/issues";
+import type { TaskChatThreadProps } from "../components/TaskChatThread";
 
 // These page fixtures exercise Classic task behavior. Preference identity and
 // persistence have their own hook tests; keep their readiness explicit here.
 const coordinatorPreference = vi.hoisted(() => ({ enabled: false, loaded: true }));
 const inlineEditorFixture = vi.hoisted(() => ({ real: false }));
+const taskThreadFixture = vi.hoisted(() => ({ real: null as ((props: TaskChatThreadProps) => ReactNode) | null }));
+vi.mock("../components/MarkdownEditor", () => ({
+  MarkdownEditor: () => <div data-testid="wake-owner-editor" />,
+}));
 const taskLiveConnection = vi.hoisted(() => ({ connected: false }));
 vi.mock("../context/LiveUpdatesProvider", async importOriginal => ({
   ...await importOriginal<typeof import("../context/LiveUpdatesProvider")>(),
@@ -91,6 +96,7 @@ const mockIssuesApi = vi.hoisted(() => ({
   listFeedbackVotes: vi.fn(),
   listInteractions: vi.fn(),
   getQueuedComments: vi.fn(),
+  wakeIntent: vi.fn().mockResolvedValue(undefined),
   interruptQueuedComments: vi.fn(),
   editQueuedComment: vi.fn(),
   reorderQueuedComments: vi.fn(),
@@ -469,6 +475,8 @@ vi.mock("../components/TaskChatThread", () => ({
     footer?: ReactNode;
   }) => {
     mockIssueChatThreadRender(props);
+    const RealThread = taskThreadFixture.real;
+    if (RealThread) return <RealThread {...props as TaskChatThreadProps} />;
     return (
       <div data-testid="task-chat-thread">
         {props.threadHeader}
@@ -1371,6 +1379,8 @@ describe("IssueDetail", () => {
   beforeEach(() => {
     Object.assign(coordinatorPreference, { enabled: false, loaded: true });
     inlineEditorFixture.real = false;
+    taskThreadFixture.real = null;
+    mockIssuesApi.wakeIntent.mockClear();
     taskLiveConnection.connected = false;
     mockTaskPluginPanels.panels = []; mockTaskPluginPanels.isLoading = false;
     localStorage.clear();
@@ -2121,6 +2131,25 @@ describe("IssueDetail", () => {
     await flushReact();
     expect(mockSetBreadcrumbs.mock.calls.at(-1)![0]).toEqual([{ label: "All chats", href: "/chats" }, { label: updatedAgent.name }]);
 
+  });
+
+  // Keep reason: opening another person's chat must never spend their sandbox resources.
+  it("sends wake-intent only for the conversation owner, not a read-only viewer", async () => {
+    const { TaskChatThread } = await vi.importActual<typeof import("../components/TaskChatThread")>("../components/TaskChatThread");
+    taskThreadFixture.real = TaskChatThread;
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "reader" } });
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableAgentChat: true });
+    const chat = createIssue({ conversationAgentId: "agent-1", conversationUserId: "owner", assigneeAgentId: "agent-1" });
+    mockIssuesApi.get.mockResolvedValue(chat);
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="wake-owner-editor"]')).not.toBeNull());
+    expect(mockIssuesApi.wakeIntent).not.toHaveBeenCalled();
+
+    await act(async () => {
+      queryClient.setQueryData(queryKeys.auth.session, { user: { id: "owner" } });
+    });
+    await waitForAssertion(() => expect(mockIssuesApi.wakeIntent).toHaveBeenCalledExactlyOnceWith(chat.id, "open"));
   });
 
   it("uses task breadcrumbs for a conversation's unnumbered backing task", async () => {
