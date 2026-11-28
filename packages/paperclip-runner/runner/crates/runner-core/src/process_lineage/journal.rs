@@ -214,7 +214,13 @@ fn write_private_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     // No fsync: the journal must survive runnerd, not the host. A host
     // restart ends every process the journal could name.
     drop(file);
-    crate::atomic_replace::rename_replace_retrying_exdev(&temporary, path)
+    // Journal writes hold `last`; fail promptly so the writer marker can be
+    // withdrawn rather than blocking other journal writers for the full budget.
+    crate::atomic_replace::rename_replace_retrying_exdev_within(
+        &temporary,
+        path,
+        Duration::from_secs(1),
+    )
 }
 
 /// Journals every lineage this runnerd records under `state_dir`, so the

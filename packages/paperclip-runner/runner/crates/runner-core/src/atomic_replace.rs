@@ -25,10 +25,21 @@ const MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// created while the directory was restoring. Publication is always rename,
 /// never a copy into the target. Callers still own any parent-directory fsync.
 pub fn rename_replace_retrying_exdev(temporary: &Path, target: &Path) -> io::Result<()> {
+    rename_replace_retrying_exdev_within(temporary, target, EXDEV_RETRY_BUDGET)
+}
+
+/// Like [`rename_replace_retrying_exdev`], with a caller-supplied retry budget.
+/// The budget bounds EXDEV retry waits, not filesystem operation durations.
+pub fn rename_replace_retrying_exdev_within(
+    temporary: &Path,
+    target: &Path,
+    budget: Duration,
+) -> io::Result<()> {
     let started = Instant::now();
     rename_replace_retrying_exdev_with(
         temporary,
         target,
+        budget,
         |source, destination| fs::rename(source, destination),
         std::thread::sleep,
         || started.elapsed(),
@@ -43,6 +54,7 @@ fn is_exdev(error: &io::Error) -> bool {
 fn rename_replace_retrying_exdev_with(
     temporary: &Path,
     target: &Path,
+    budget: Duration,
     mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
     mut sleep: impl FnMut(Duration),
     mut elapsed: impl FnMut() -> Duration,
@@ -61,7 +73,7 @@ fn rename_replace_retrying_exdev_with(
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let elapsed_before_wait = elapsed();
-        let remaining = EXDEV_RETRY_BUDGET.saturating_sub(elapsed_before_wait);
+        let remaining = budget.saturating_sub(elapsed_before_wait);
         if remaining.is_zero() {
             eprintln!(
                 "paperclip-runnerd: rename EXDEV retries exhausted attempts={} elapsed_ms={} target={target_name}",
@@ -73,7 +85,7 @@ fn rename_replace_retrying_exdev_with(
         sleep(backoff.min(remaining));
         backoff = (backoff * 2).min(MAX_BACKOFF);
         let elapsed_after_wait = elapsed();
-        if elapsed_after_wait >= EXDEV_RETRY_BUDGET {
+        if elapsed_after_wait >= budget {
             eprintln!(
                 "paperclip-runnerd: rename EXDEV retries exhausted attempts={} elapsed_ms={} target={target_name}",
                 retries + 1,
@@ -192,6 +204,7 @@ mod tests {
         rename_replace_retrying_exdev_with(
             &fixture.temporary,
             &fixture.target,
+            EXDEV_RETRY_BUDGET,
             |temporary, target| {
                 attempts += 1;
                 assert_eq!(fs::read(temporary).unwrap(), b"replacement bytes");
@@ -241,6 +254,7 @@ mod tests {
         let error = rename_replace_retrying_exdev_with(
             &fixture.temporary,
             &fixture.target,
+            EXDEV_RETRY_BUDGET,
             |temporary, _| {
                 attempts += 1;
                 assert_eq!(fs::read(temporary).unwrap(), b"replacement bytes");
@@ -268,6 +282,50 @@ mod tests {
         fixture.assert_no_temporary();
     }
 
+    // Unit test agreed: an injected persistent EXDEV and fake clock prove the
+    // journal's shorter budget without a real filesystem restore or sleep.
+    #[cfg(unix)]
+    #[test]
+    fn persistent_exdev_with_one_second_budget_returns_original_error_within_one_second() {
+        let _guard = EXDEV_TEST_LOCK.lock().unwrap();
+        let fixture = Fixture::new();
+        let budget = Duration::from_secs(1);
+        let elapsed = Cell::new(Duration::ZERO);
+        let original = io::Error::from_raw_os_error(18);
+        let expected = (
+            original.raw_os_error(),
+            original.kind(),
+            original.to_string(),
+        );
+        let mut first = Some(original);
+        let mut waits = Vec::new();
+        let error = rename_replace_retrying_exdev_with(
+            &fixture.temporary,
+            &fixture.target,
+            budget,
+            |_, _| {
+                Err(first
+                    .take()
+                    .unwrap_or_else(|| io::Error::from_raw_os_error(18)))
+            },
+            |wait| {
+                waits.push(wait);
+                elapsed.set(elapsed.get() + wait);
+                assert!(elapsed.get() <= budget);
+            },
+            || elapsed.get(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (error.raw_os_error(), error.kind(), error.to_string()),
+            expected
+        );
+        assert_eq!(elapsed.get(), budget);
+        assert_eq!(waits, [100, 200, 400, 300].map(Duration::from_millis));
+        assert_eq!(fs::read(&fixture.target).unwrap(), b"old bytes");
+        fixture.assert_no_temporary();
+    }
+
     // Unit test agreed: injected EXDEV and a fake clock measure the exact
     // process-wide retry delta without a live filesystem restore.
     #[cfg(unix)]
@@ -281,6 +339,7 @@ mod tests {
         rename_replace_retrying_exdev_with(
             &fixture.temporary,
             &fixture.target,
+            EXDEV_RETRY_BUDGET,
             |temporary, target| {
                 attempts += 1;
                 if attempts <= 2 {
@@ -304,6 +363,7 @@ mod tests {
         let error = rename_replace_retrying_exdev_with(
             &fixture.temporary,
             &fixture.target,
+            EXDEV_RETRY_BUDGET,
             |_, _| {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
