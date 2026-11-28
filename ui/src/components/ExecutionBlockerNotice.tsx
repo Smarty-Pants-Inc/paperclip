@@ -198,6 +198,7 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
   const repairWait = queuedMessageWait?.reason === "workspace_repair_required" ? queuedMessageWait
     : presentation?.retryWait?.reason === "workspace_repair_required" ? presentation.retryWait : null;
   const workspaceRepairRequired = blocker?.workspaceRepairRequired || Boolean(repairWait);
+  const workspaceRepairMessage = blocker?.workspaceRepairRequired ? blocker.nextAction : repairWait?.message;
   // Structured recovery ownership, not reassuring hold wording, means wait.
   const repairRecovering = workspaceRepairRequired && (blocker?.workspaceRecovery?.status === "queued"
     || blocker?.workspaceRecovery?.status === "recovering"
@@ -293,8 +294,9 @@ export function ExecutionBlockerNotice({ presentation, observedStatus, observedR
           ? "text-muted-foreground" : "rounded-lg bg-destructive/10 p-4 text-foreground")}>
         {repairRecovering ? <LoaderCircle className="size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />
           : <AlertCircle className="size-5 shrink-0 text-destructive" aria-hidden="true" />}
-        <span className="min-w-0 flex-1">{blocker?.workspaceRepairRequired ? blocker.nextAction : repairWait?.message}
-          {!repairRecovering && canRetry ? " Press Retry to continue from your saved work." : null}</span>
+        <span className="min-w-0 flex-1">{workspaceRepairMessage}
+          {!repairRecovering && canRetry && !/press retry/i.test(workspaceRepairMessage ?? "")
+            ? " Press Retry to continue from your saved work." : null}</span>
         {canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}
       </div>
     </div>

@@ -251,6 +251,25 @@ describe("ordinary task interruption", () => {
   ];
   const repairMessage = "Paperclip is recovering saved work before continuing. Your message is saved.";
   const repairRetrySentence = " Press Retry to continue from your saved work.";
+  it.each(["blocker", "queued message", "presentation"] as const)(
+    "says what Retry does once for a workspace repair from %s", async source => {
+      for (const nextAction of [
+        "The saved files could not be restored. Press Retry to continue in a new workspace.",
+        "The saved files could not be restored.",
+      ]) {
+        const retryWait = { reason: "workspace_repair_required" as const, message: nextAction };
+        await act(async () => root.render(<ExecutionBlockerNotice
+          presentation={source === "presentation" ? { ...failed, retryWait } : null}
+          queuedMessageWait={source === "queued message" ? retryWait : undefined}
+          blocker={source === "blocker" ? { workspaceRepairRequired: true, nextAction } as never : undefined}
+          canRetry onRetry={retry} />));
+        const text = container.querySelector('[role="status"] > span')?.textContent;
+        expect(text).toBe(`${nextAction}${nextAction.includes("Press Retry") ? "" : repairRetrySentence}`);
+        expect(text?.match(/Press Retry/g)).toHaveLength(1);
+        await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+      }
+      expect(retry).toHaveBeenCalledTimes(2);
+    });
   const pausedConversation = "This conversation paused after a problem on our side.";
   const recoveredBlocker = {
     recoveryActionId: "hold", runId: "source", agentId: "agent", cause: "native_continuation_requires_reconciliation",
