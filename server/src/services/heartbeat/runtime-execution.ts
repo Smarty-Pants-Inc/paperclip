@@ -113,6 +113,7 @@ import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import { resolvePluginWorkspaceFinalization } from "../plugin-workspaces.js";
 import type { RealizedExecutionWorkspace } from "../workspace-runtime.js";
 import type { reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
+import { providerPackPathForEnvironment } from "../native-runtime/provider-pack-path.js";
 
 type Selection = HeartbeatRuntimeSelectionInput;
 type Selected = Extract<HeartbeatRuntimeSelectionResult, { selected: true }>;
@@ -782,8 +783,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 runtimeEnv.PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC?.trim() ||
                 null,
               runnerRemoteProviderPackPath:
-                runtimeEnv.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH?.trim() ||
-                null,
+                providerPackPathForEnvironment(executionTarget?.environmentId, runtimeEnv) ?? null,
               stopTaskForReassignment: async (target) => {
                 await settleLiveRunnerGoalBeforeInterrupt(db, target);
                 if (!target.runId) return;
