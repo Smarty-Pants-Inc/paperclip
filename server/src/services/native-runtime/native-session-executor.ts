@@ -666,7 +666,8 @@ const PI_SESSION_HOME_CHECKPOINT_EXCLUDED_ENTRIES = [
   ".cargo",
   "cache",
   "node-compile-cache",
-  ".npm",
+  // npm's cache only: .npm/_logs holds npm's own command logs, which stay in the save.
+  ".npm/_cacache",
 ] as const;
 const RUNNERD_STATE_SCHEMA = "paperclip.runner.durable.state.v1";
 const CODEX_PROVIDER_STATE_SCHEMA = "paperclip.runner.codex-provider-state.v1";
