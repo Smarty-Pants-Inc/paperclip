@@ -150,7 +150,7 @@ describe("history retry feedback request budget", () => {
     })).catch(error => error);
     expect(failure).toBeInstanceOf(ApiUnavailableError);
     expect(failure).not.toBeInstanceOf(ApiError);
-    expect(failure.retryAfterMs).toBe(20_000);
+    expect((failure as ApiUnavailableError).retryAfterMs).toBe(20_000);
     const read = vi.fn().mockRejectedValue(failure);
     const rejected = vi.fn();
     const result = readTranscriptRequest(read, new AbortController().signal).catch(rejected);
