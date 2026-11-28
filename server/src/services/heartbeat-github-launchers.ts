@@ -4,6 +4,18 @@ import { cleanupGitHubOperationLaunchers, prepareGitHubOperationLaunchers } from
 
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
 
+/** No session-shell contention, task-owned layout, or service-env dependency. */
+export function canOverlapHeartbeatGitHubLaunchersWithInstructions(input: {
+  native: boolean;
+  target: LauncherInput["target"];
+  runtimeServiceCount: number;
+}) {
+  const target = input.target;
+  return input.native && input.runtimeServiceCount === 0 && target?.kind === "remote" && target.transport === "sandbox" &&
+    !target.runnerTask && target.effectiveCapabilities?.independentControlCommands === true &&
+    target.effectiveCapabilities.persistentProcessSessions === false;
+}
+
 export async function prepareHeartbeatGitHubLaunchers(
   input: LauncherInput & {
     native: boolean;

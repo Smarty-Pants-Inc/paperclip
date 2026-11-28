@@ -356,7 +356,7 @@ import {
 import {
   authorizeFailedChatRunRetryWake,
 } from "./durable-chat-wakeup.js";
-import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
+import { canOverlapHeartbeatGitHubLaunchersWithInstructions, prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
@@ -476,6 +476,7 @@ import {
 } from "./activity-log.js";
 import {
   releaseRuntimeServicesForRun,
+  listConfiguredRuntimeServiceEntries,
 } from "./workspace-runtime.js";
 
 import { issueService } from "./issues.js";
@@ -3313,7 +3314,8 @@ export function heartbeatService(
       runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
       context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
-      if (!useHostGitHub && !providerApiPlacement) {
+      const prepareGitHubLaunchers = async () => {
+        if (useHostGitHub || providerApiPlacement) return gitExecutionEnv;
         const githubLaunchers = await timePreparation("github_launchers", () => prepareHeartbeatGitHubLaunchers({
           native: agent.adapterType === "paperclip_runner",
           githubConfigured: githubSelection.configured,
@@ -3332,9 +3334,18 @@ export function heartbeatService(
           })?.token ?? "",
         }));
         githubLauncherLocation = githubLaunchers.cleanupLocation;
-        runtimeConfig = { ...runtimeConfig, env: githubLaunchers.env };
         secretKeys.add("PAPERCLIP_GITHUB_BROKER_TOKEN");
-      }
+        return githubLaunchers.env;
+      };
+      // Instructions must retain the workspace context and warm-owner setup
+      // below. Defer only the independent launcher work to their existing owner.
+      const overlapGitHubLaunchers = !useHostGitHub && !providerApiPlacement &&
+        canOverlapHeartbeatGitHubLaunchersWithInstructions({
+          native: agent.adapterType === "paperclip_runner",
+          target: executionTarget,
+          runtimeServiceCount: listConfiguredRuntimeServiceEntries(hostExecutionWorkspaceConfig).length,
+        });
+      if (!overlapGitHubLaunchers) runtimeConfig = { ...runtimeConfig, env: await prepareGitHubLaunchers() };
       context.paperclipEnvironment = selectedEnvironment && activeEnvironmentLease ? {
         id: selectedEnvironment.id,
         name: selectedEnvironment.name,
@@ -3594,7 +3605,7 @@ export function heartbeatService(
           environmentDriver: selectedEnvironment?.driver ?? "provider_api",
           leaseMetadata: activeEnvironmentLease?.lease.metadata ?? {},
         }));
-        const adapterEnv = Object.fromEntries(
+        let adapterEnv = Object.fromEntries(
           Object.entries(parseObject(runtimeConfig.env)).filter(
             (entry): entry is [string, string] =>
               typeof entry[0] === "string" && typeof entry[1] === "string",
@@ -3722,10 +3733,16 @@ export function heartbeatService(
           stopControllerLease: () => controllerLease.stop(),
         }, {
           measure: timePreparation,
+          prepareEnvironment: overlapGitHubLaunchers ? prepareGitHubLaunchers : undefined,
           prepareInstructions: async nativeLifecyclePolicy => {
-            runtimeConfig = await prepareWithAgentDirectoryDeferral(() => preparedInstructions.prepare({ runtimeConfig, nativeRuntimeResolution, hasInstructionFilesystem, nativeLifecyclePolicy }),
+            const preparedConfig = await prepareWithAgentDirectoryDeferral(() => preparedInstructions.prepare({ runtimeConfig, nativeRuntimeResolution, hasInstructionFilesystem, nativeLifecyclePolicy }),
               { waitMs: runOptions.nativeRestartRecovery ? REATTACH_AGENT_DIRECTORY_WAIT_MS : 0 });
-            return { runtimeConfig, instructionCopy: preparedInstructions.instructionCopy };
+            return { runtimeConfig: preparedConfig, instructionCopy: preparedInstructions.instructionCopy };
+          },
+          onPrepared: prepared => {
+            runtimeConfig = prepared.runtimeConfig;
+            adapterEnv = Object.fromEntries(Object.entries(parseObject(runtimeConfig.env))
+              .filter((entry): entry is [string, string] => typeof entry[1] === "string"));
           },
         });
         if (!runtimeSelection.selected) return;

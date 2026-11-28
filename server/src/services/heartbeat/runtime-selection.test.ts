@@ -32,6 +32,7 @@ import { reserveRunBudget } from "../budget-reservations.js";
 import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
+import { prepareHeartbeatGitHubLaunchers } from "../heartbeat-github-launchers.js";
 import { environmentService } from "../environments.js";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession, type HeartbeatSessionPreparationInput } from "./session-preparation.js";
 import { getAdapterSessionCodec } from "./run-state.js";
@@ -525,6 +526,66 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(buildNativeRuntimeContext).not.toHaveBeenCalled();
   });
 
+  // Real filesystem failures exercise the preparation join: no mocked provider,
+  // fake clock, or call count stands in for the sibling's outstanding file write.
+  it.each([
+    ["instructions", false], ["instructions", true], ["environment", false], ["environment", true],
+  ] as const)("awaits both preparations and preserves the first %s error (sibling also fails: %s)", async (first, siblingFails) => {
+    const { input, run } = await fixture();
+    const root = await mkdtemp(join(instructionRoot, "preparation-join-"));
+    const completedFile = join(root, "sibling-finished");
+    let notifyFirstFailure!: () => void;
+    let releaseSibling!: () => void;
+    let finishSibling!: () => void;
+    const firstFailed = new Promise<void>(resolve => { notifyFirstFailure = resolve; });
+    const siblingReleased = new Promise<void>(resolve => { releaseSibling = resolve; });
+    const siblingFinished = new Promise<void>(resolve => { finishSibling = resolve; });
+    let siblingStarted = false;
+    let firstError: unknown;
+    let ownerSettled = false;
+    const work = async (branch: "instructions" | "environment") => {
+      if (branch === first) {
+        try { await stat(join(root, `missing-${branch}`)); }
+        catch (error) { firstError = error; notifyFirstFailure(); throw error; }
+      } else {
+        siblingStarted = true;
+        try {
+          await siblingReleased;
+          await writeFile(completedFile, branch);
+          if (siblingFails) await stat(join(root, `missing-${branch}`));
+        } finally { finishSibling(); }
+      }
+    };
+    const outcome = prepareAndSelectHeartbeatRuntime(db, input, {
+      measure: async (_phase, runWork) => runWork(),
+      prepareInstructions: async () => {
+        await work("instructions");
+        return { runtimeConfig: input.config.runtimeConfig, instructionCopy: null };
+      },
+      prepareEnvironment: async () => { await work("environment"); return {}; },
+      onPrepared: () => { throw new Error("Failed preparation must not publish configuration"); },
+    }).then(() => { throw new Error("Expected a filesystem failure"); }, error => error)
+      .finally(() => { ownerSettled = true; });
+    try {
+      await firstFailed;
+      // Let the original rejection reach the join, not a timing-based sleep.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(ownerSettled).toBe(false);
+      await expect(stat(completedFile)).rejects.toMatchObject({ code: "ENOENT" });
+      releaseSibling();
+      expect(await outcome).toBe(firstError);
+      expect(await readFile(completedFile, "utf8")).toBe(first === "instructions" ? "environment" : "instructions");
+      expect(await coordinators(run.id)).toEqual([]);
+      expect((await read(run.id)).runtimeMode).toBe("legacy");
+    } finally {
+      // Even a failing assertion must join started work before removing its root.
+      releaseSibling();
+      await outcome;
+      if (siblingStarted) await siblingFinished;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([false, true])("checkpoints the real instruction copy under the selected agent-default warm policy (changed: %s)", async changed => {
     const { input, issue, agent, run } = await fixture();
     const userId = randomUUID(), environmentId = randomUUID(), leaseId = randomUUID();
@@ -572,14 +633,24 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       context: input.task.context, session: { taskSession: null, taskSessionForRun: null, sessionConfigMetadata: {} as never },
       workspace: input.workspace, appendRunEvent: instructionEvents });
     const phases: string[] = [];
+    let preparedConfig: Record<string, unknown> = {};
     const selected = await prepareAndSelectHeartbeatRuntime(db, input, {
       measure: async (phase, work) => { phases.push(phase); return work(); },
       prepareInstructions: async nativeLifecyclePolicy => {
         const runtimeConfig = await controller.prepare({ runtimeConfig: {}, nativeRuntimeResolution: input.nativeRuntimeResolution, hasInstructionFilesystem: true, nativeLifecyclePolicy });
         return { runtimeConfig, instructionCopy: controller.instructionCopy };
       },
+      prepareEnvironment: async () => (await prepareHeartbeatGitHubLaunchers({
+        native: true, githubConfigured: false, agentId: agent.id, runId: run.id, target, cwd: remoteCwd,
+        env: {}, brokerUrl: "", createBrokerToken: () => { throw new Error("Anonymous preparation must not mint a capability"); },
+      })).env,
+      onPrepared: prepared => { preparedConfig = prepared.runtimeConfig; },
     });
     expect(phases).toEqual(["instructions", "runtime_selection"]);
+    expect(preparedConfig.instructionsFilePath).toBe(join(controller.instructionCopy!.localRoot, "AGENTS.md"));
+    const launcherDirectory = (preparedConfig.env as Record<string, string>).PAPERCLIP_GITHUB_LAUNCHER_DIR;
+    expect(await readFile(join(launcherDirectory, "package.json"), "utf8")).toBe('{"type":"commonjs"}\n');
+    expect(await readFile(join(remoteCwd, ".paperclip-runtime", ".gitignore"), "utf8")).toBe("*\n");
     expect(instructionEvents.mock.calls).toEqual([]);
     expect(controller.instructionCopy).not.toBeNull();
     if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
