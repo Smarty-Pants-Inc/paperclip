@@ -339,8 +339,6 @@ export const issuesApi = {
     detachInflightGet(path);
     return api.get<IssueChatBootstrap<RunForIssue, LiveRunForIssue, ActiveRunForIssue>>(path, { ...options, cache: "no-store" });
   },
-  /** Optional readiness hint; a disabled server returns 404 and no run is started. */
-  prewarmSandbox: (issueId: string) => api.post<{ accepted: true }>(`/issues/${encodeURIComponent(issueId)}/sandbox-prewarm`, {}),
   /** Fetch every page for bounded task-detail relations, not just the default first page. */
   listAll: async (companyId: string, filters: Omit<IssueListFilters, "limit" | "offset" | "sortField" | "sortDir" | "afterId" | "attention">, options?: RequestOptions): Promise<Issue[]> => {
     const pageSize = 500;

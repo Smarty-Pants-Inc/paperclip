@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { activityLog, agents, environmentLeases, environments, heartbeatRuns, issues, plugins } from "@paperclipai/db";
+import { activityLog, agents, environmentLeases, environments, heartbeatRuns, issueComments, issues, issueTreeHolds, plugins } from "@paperclipai/db";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
@@ -25,6 +25,8 @@ describeEmbeddedPostgres("sandbox prewarm", () => {
     const f = await seedCompanyWithBoardAccess(ctx.db, "Prewarm");
     const [agent] = await ctx.db.insert(agents).values({ companyId: f.companyId, name: randomUUID(), role: "engineer", adapterType: "process" }).returning();
     const [issue] = await ctx.db.insert(issues).values({ companyId: f.companyId, title: "Prewarm task", assigneeAgentId: agent!.id }).returning();
+    await ctx.db.insert(issueComments).values({ companyId: f.companyId, issueId: issue!.id,
+      authorType: "user", authorUserId: f.userId, body: "A person chats in this task." });
     const [environment] = await ctx.db.insert(environments).values({ name: randomUUID(), driver: "sandbox",
       config: { provider: "prewarm-test", reuseLease: true, timeoutMs: 300_000 } }).returning();
     const [run] = await ctx.db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: agent!.id,
@@ -138,11 +140,11 @@ describeEmbeddedPostgres("sandbox prewarm", () => {
     expect(f.call).not.toHaveBeenCalled();
   });
 
-  it("ignores repeats within 30 seconds, then permits a new readiness hint", async () => {
+  it("ignores repeats within 60 seconds, then permits a new readiness hint", async () => {
     const f = await seed();
     vi.useFakeTimers({ toFake: ["Date"] });
     expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
-    vi.setSystemTime(Date.now() + 29_999);
+    vi.setSystemTime(Date.now() + 59_999);
     expect(await prewarmIssueSandbox(f.input)).toEqual({ outcome: "skipped", reason: "cooldown" });
     vi.setSystemTime(Date.now() + 1);
     expect(await prewarmIssueSandbox(f.input)).toMatchObject({ outcome: "resumed" });
@@ -178,7 +180,7 @@ describeEmbeddedPostgres("sandbox prewarm", () => {
     const f = await seed();
     vi.stubEnv("PAPERCLIP_SANDBOX_PREWARM", value);
     expect(await prewarmIssueSandbox(f.input)).toEqual({ outcome: "skipped", reason: "disabled" });
-    await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/sandbox-prewarm`).expect(404);
+    await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/wake-intent`).send({ reason: "open" }).expect(404);
     expect(f.call).not.toHaveBeenCalled();
   });
 
@@ -193,7 +195,7 @@ describeEmbeddedPostgres("sandbox prewarm", () => {
       if (message === "sandbox prewarm" && fields.issueId === f.issue.id && fields.outcome === "resumed") logged();
     }) as never);
     try {
-      await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/sandbox-prewarm`).expect(202, { accepted: true });
+      await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/wake-intent`).send({ reason: "open" }).expect(202, { accepted: true });
     } finally { finish(); }
     await settled;
     expect(info.mock.calls.filter(args => args[1] === "sandbox prewarm")).toEqual([
@@ -201,16 +203,133 @@ describeEmbeddedPostgres("sandbox prewarm", () => {
     ]);
   });
 
+  async function hint(f: Awaited<ReturnType<typeof seed>>, outcome: string, reason?: string, intent: "open" | "typing" = "open") {
+    let finish!: () => void;
+    const settled = new Promise<void>(resolve => { finish = resolve; });
+    const info = vi.spyOn(logger, "info").mockImplementation(((fields: { issueId?: string }, message: string) => {
+      if (message === "sandbox prewarm" && fields.issueId === f.issue.id) finish();
+    }) as never);
+    try {
+      await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/wake-intent`)
+        .send({ reason: intent }).expect(202, { accepted: true });
+      await settled;
+      expect(info.mock.calls.filter(args => args[1] === "sandbox prewarm")).toEqual([
+        [expect.objectContaining({ issueId: f.issue.id, outcome, ...(reason ? { reason } : {}), ms: expect.any(Number) }), "sandbox prewarm"],
+      ]);
+      if (outcome === "skipped") expect(f.call).not.toHaveBeenCalled();
+    } finally { info.mockRestore(); }
+  }
+
+  it.each([{}, { reason: "hover" }, { reason: "OPEN" }, { reason: null }, { reason: 1 },
+    { reason: true }, { reason: ["open"] }, { reason: "typing", agentId: "other" }])("rejects invalid wake intent %j with 400", async body => {
+    const f = await seed();
+    await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/wake-intent`).send(body).expect(400);
+    expect(f.call).not.toHaveBeenCalled();
+  });
+
+  it("retires the old sandbox-prewarm path", async () => {
+    const f = await seed();
+    await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/sandbox-prewarm`).send({}).expect(404);
+    expect(f.call).not.toHaveBeenCalled();
+  });
+
+  it("reuses the comment-create pause authorization without returning its error to the page", async () => {
+    const f = await seed();
+    await ctx.db.insert(issueTreeHolds).values({ companyId: f.companyId, rootIssueId: f.issue.id, mode: "pause" });
+    await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/comments`).send({ body: "Not allowed while paused" }).expect(409);
+    await hint(f, "skipped", "comment_not_allowed");
+  });
+
+  it("does not wake another person's readable conversation", async () => {
+    const f = await seed();
+    await ctx.db.update(issues).set({ conversationAgentId: f.agent.id, conversationUserId: "another-person", conversationState: "active" })
+      .where(eq(issues.id, f.issue.id));
+    await hint(f, "skipped", "conversation_not_owned");
+  });
+
+  it.each(["done", "cancelled"])("does not wake a %s task", async status => {
+    const f = await seed();
+    await ctx.db.update(issues).set({ status }).where(eq(issues.id, f.issue.id));
+    await hint(f, "skipped", "terminal_status");
+  });
+
+  it.each(["no_comments", "old_user", "agent", "agent_with_user_id", "system", "deleted_user", "other_task"] as const)
+    ("does not wake a task without recent human chat: %s", async kind => {
+      const f = await seed();
+      await ctx.db.delete(issueComments).where(eq(issueComments.issueId, f.issue.id));
+      if (kind !== "no_comments") {
+        let issueId = f.issue.id;
+        if (kind === "other_task") {
+          const [other] = await ctx.db.insert(issues).values({ companyId: f.companyId, title: "Other task" }).returning();
+          issueId = other!.id;
+        }
+        await ctx.db.insert(issueComments).values({ companyId: f.companyId, issueId, body: "Not recent human chat on this task",
+          authorType: kind === "agent" || kind === "agent_with_user_id" ? "agent" : kind === "system" ? "system" : "user",
+          authorUserId: kind === "agent" || kind === "system" ? null : f.userId,
+          authorAgentId: kind === "agent" || kind === "agent_with_user_id" ? f.agent.id : null,
+          createdAt: new Date(Date.now() - (kind === "old_user" ? 7 * 24 * 60 * 60_000 + 1_000 : 0)),
+          deletedAt: kind === "deleted_user" ? new Date() : null,
+        });
+      }
+      await hint(f, "skipped", "no_recent_user_comment");
+    });
+
+  it("permits an owned conversation with no comments", async () => {
+    const f = await seed();
+    await ctx.db.delete(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    await ctx.db.update(issues).set({ conversationAgentId: f.agent.id, conversationUserId: f.userId, conversationState: "active" })
+      .where(eq(issues.id, f.issue.id));
+    await hint(f, "resumed");
+    expect(f.call).toHaveBeenCalledOnce();
+  });
+
+  it("permits typing in a non-conversation with a user comment within seven days", async () => {
+    const f = await seed();
+    await ctx.db.update(issueComments).set({ createdAt: new Date(Date.now() - 6 * 24 * 60 * 60_000) }).where(eq(issueComments.issueId, f.issue.id));
+    await hint(f, "resumed", undefined, "typing");
+    expect(f.call).toHaveBeenCalledOnce();
+  });
+
+  it("checks comment permission before conversation ownership", async () => {
+    const f = await seed();
+    await ctx.db.insert(issueTreeHolds).values({ companyId: f.companyId, rootIssueId: f.issue.id, mode: "pause" });
+    await ctx.db.update(issues).set({ conversationAgentId: f.agent.id, conversationUserId: "another-person", conversationState: "active" })
+      .where(eq(issues.id, f.issue.id));
+    await hint(f, "skipped", "comment_not_allowed");
+  });
+
+  it("checks terminal status before recent human chat", async () => {
+    const f = await seed();
+    await ctx.db.delete(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    await ctx.db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issue.id));
+    await hint(f, "skipped", "terminal_status");
+  });
+
+  it("keeps route repeats silent through 59,999 ms and allows another attempt at 60,000 ms", async () => {
+    const f = await seed();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    await hint(f, "resumed");
+    vi.setSystemTime(Date.now() + 30_000);
+    // The previous attempt is the only provider call; cooldown hints cannot add another.
+    f.call.mockClear();
+    await hint(f, "skipped", "cooldown", "typing");
+    vi.setSystemTime(Date.now() + 29_999);
+    await hint(f, "skipped", "cooldown");
+    vi.setSystemTime(Date.now() + 1);
+    await hint(f, "resumed", undefined, "typing");
+    expect(f.call).toHaveBeenCalledOnce();
+  });
+
   it("requires a signed-in person and issue read access before doing speculative work", async () => {
     const f = await seed();
     const actor = { type: "agent", companyId: f.companyId, agentId: f.agent.id, keyId: "test-key", keyScope: { kind: "standard" } } as Express.Request["actor"];
-    await request(app(actor, f.workerManager)).post(`/api/issues/${f.issue.id}/sandbox-prewarm`).expect(403);
+    await request(app(actor, f.workerManager)).post(`/api/issues/${f.issue.id}/wake-intent`).send({ reason: "open" }).expect(403);
     await request(app({ ...f.actor, userId: undefined } as unknown as Express.Request["actor"], f.workerManager))
-      .post(`/api/issues/${f.issue.id}/sandbox-prewarm`).expect(401);
+      .post(`/api/issues/${f.issue.id}/wake-intent`).send({ reason: "open" }).expect(401);
     const outsider = await seedCompanyWithBoardAccess(ctx.db, "Outsider");
-    await request(app(outsider.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/sandbox-prewarm`).expect(404);
+    await request(app(outsider.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/wake-intent`).send({ reason: "open" }).expect(404);
     await ctx.db.update(issues).set({ visibility: "private", privacyRootIssueId: f.issue.id, responsibleUserId: "someone-else" }).where(eq(issues.id, f.issue.id));
-    await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/sandbox-prewarm`).expect(404);
+    await request(app(f.actor, f.workerManager)).post(`/api/issues/${f.issue.id}/wake-intent`).send({ reason: "open" }).expect(404);
     expect(f.call).not.toHaveBeenCalled();
   });
 });
