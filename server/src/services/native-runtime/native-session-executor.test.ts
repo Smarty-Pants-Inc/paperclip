@@ -24720,6 +24720,105 @@ describe("runnerd provider runtime wiring", () => {
     expect(runnerEnvironment).toMatchObject(paths);
   });
 
+  // Keep reason: real-driver guard for stamp merges and the concurrent-successor fence; no copied stamp SQL.
+  it.each([false, true])("real Postgres backup stamp preserves metadata and fences a successor (race=%s)", async race => {
+    const pg = await startRecoveryPostgres("native-stamp-guard-");
+    const { createDb, companies, agents, executionWorkspaces } = await import("@paperclipai/db");
+    const realDb = createDb(pg.connectionString);
+    const cleanup = await import("../environment-cleanup-notifications.js");
+    const tips = await import("./native-backup-tip-lease.js");
+    const writeCleanup = cleanup.writeEnvironmentCleanup, selectTip = tips.nativeBackupTipLease;
+    const logs: string[] = [];
+    try {
+      const [company] = await realDb.insert(companies).values({ name: "Native stamp guard" }).returning();
+      const [agent] = await realDb.insert(agents).values({ companyId: company.id, name: "Stamp owner" }).returning();
+      const normalizedSessionId = randomUUID();
+      const [run] = await realDb.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+        status: "succeeded", nativeSessionId: normalizedSessionId }).returning();
+      const [workspace] = await realDb.insert(executionWorkspaces).values({ companyId: company.id,
+        mode: "shared", strategyType: "project", name: "Stamp workspace" }).returning();
+      const providerLeaseId = randomUUID(), successor = { runId: randomUUID() };
+      const lease = { companyId: company.id, heartbeatRunId: run.id, executionWorkspaceId: workspace.id, providerLeaseId };
+      const [launch] = await realDb.insert(environmentLeases).values({ ...lease,
+        metadata: { retainedLaunch: { yes: true }, reusableLeaseSuccessor: successor } }).returning();
+      const [tip] = await realDb.insert(environmentLeases).values({ ...lease, metadata: { retainedTip: { yes: true } } }).returning();
+      const current: NativeExecutionInputV1 = { ...execution, binding: { ...execution.binding,
+        companyId: company.id, agentId: agent.id, runId: run.id, issueId: randomUUID(), executionWorkspaceId: workspace.id },
+        session: { ...execution.session, normalizedSessionId, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } } };
+      // Only unrelated controller bookkeeping is simulated: all lease reads, writes, and cleanup transactions use Postgres.
+      const db = leaseDb(current), select = db.select.bind(db);
+      db.select = ((fields?: Parameters<Db["select"]>[0]) => ({ from: (table: unknown) =>
+        (table === environmentLeases || table === heartbeatRunEvents ? (fields ? realDb.select(fields) : realDb.select())
+          : (fields ? select(fields) : select())).from(table as never) })) as unknown as Db["select"];
+      vi.spyOn(cleanup, "writeEnvironmentCleanup").mockImplementation((_db, write, scope) => writeCleanup(realDb, write, scope));
+      vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue(null);
+      vi.spyOn(runnerCheckpoint, "nativeRunnerCheckpointRegistration").mockReturnValue(async () => undefined);
+      vi.spyOn(tips, "nativeBackupTipLease").mockImplementation(async (database, input) => {
+        const selected = await selectTip(database, input);
+        if (race && selected) await realDb.update(environmentLeases)
+          .set({ metadata: { ...selected.metadata, reusableLeaseSuccessor: successor } }).where(eq(environmentLeases.id, selected.id));
+        return selected;
+      });
+      const remoteCwd = join(isolatedStateDirectory, "stamp-remote"), runnerInstanceId = "stamp-guard-runner";
+      const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
+        if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner",
+          binaryContractVersion: 2, durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"] }) };
+        if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stderr: "", stdout: "codex-cli 0.170.0" };
+        if (command.command === "sh" && /base64|tar |\.paperclip-checkpoint-/.test(command.args?.[1] ?? "")) {
+          try { return { exitCode: 0, timedOut: false, stderr: "", stdout: execFileSync("sh", command.args!, { encoding: "utf8" }) }; }
+          catch { return { exitCode: 1, timedOut: false, stderr: "", stdout: "" }; }
+        }
+        return { exitCode: 0, timedOut: false, stderr: "", stdout: "" };
+      });
+      const artifact = join(isolatedStateDirectory, "stamp-runnerd"); await writeFile(artifact, "fixture bootstrap artifact");
+      await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true,
+        runnerRemoteBinaryPath: artifact, runnerRemoteCodexPath: artifact, onLog: async (_stream, message) => { logs.push(message); },
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment", leaseId: launch.id,
+          providerKey: "daytona", reusableLeaseConfigured: true, sandboxLeaseAcquisition: { outcome: "created", providerLeaseId },
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute: remoteExecute, syncIn: vi.fn(),
+            syncOut: async (operations: Parameters<typeof copySyncedFiles>[0]) => {
+              for (const operation of operations) for (const file of operation.files) await cp(file.sourcePath, file.targetPath, { recursive: true });
+            } },
+          getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+            secretHeaders: [], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }) } as never });
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+        controlPlaneRegistration: NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]> };
+      const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions", createHash("sha256").update(normalizedSessionId).digest("hex"));
+      for (const directory of resolveNativeHarnessPersistenceProfile(current).directories)
+        await mkdir(join(remoteSession, directory.location === "runner" ? "runner" : "filesystem", directory.location === "runner" ? "" : directory.name), { recursive: true });
+      await writeFile(join(remoteSession, "runner/runner-state.json"), JSON.stringify(durableRunnerState({ runId: run.id,
+        normalizedSessionId, runnerInstanceId, environmentLeaseId: launch.id, turnId: "turn", itemId: "item" }, "suspended")));
+      await writeFile(join(remoteSession, "runner/codex-provider-state.json"), JSON.stringify({ schema: "paperclip.runner.codex-provider-state.v1",
+        lifecycle: "prepared", threadId: "stamp-thread", providerSessionId: null, activeProviderTurnId: null,
+        config: { provider: "codex", driver: "codex_app_server" } }));
+      const controller = new DurablePrpControlPlane({ stateDirectory: join(options.stateDirectory!, "control-plane"),
+        identity: options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+        expectedRunnerVersion: "stamp-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      const registration = await options.controlPlaneRegistration(controller);
+      try { await registration.checkpoint!("settled"); }
+      finally { await registration.release(); await controller.stop(); }
+      const [savedLaunch] = await realDb.select().from(environmentLeases).where(eq(environmentLeases.id, launch.id));
+      const [savedTip] = await realDb.select().from(environmentLeases).where(eq(environmentLeases.id, tip.id));
+      expect(savedLaunch.metadata).toMatchObject({ retainedLaunch: { yes: true }, reusableLeaseSuccessor: successor,
+        nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId } });
+      expect(savedTip.metadata).toMatchObject({ retainedTip: { yes: true } });
+      if (race) {
+        expect(savedTip.metadata).toHaveProperty("reusableLeaseSuccessor", successor);
+        expect(savedTip.metadata).not.toHaveProperty("nativeHarnessBackup");
+        expect(logs.join("")).toContain("not stamped");
+      } else {
+        expect(savedTip.metadata).toHaveProperty("nativeHarnessBackup", savedLaunch.metadata!.nativeHarnessBackup);
+        expect(logs.join("")).toContain("backup stamp copied");
+      }
+      // Successful row assertions above and no caught tip error prove the production raw '?' predicate executed.
+      expect(logs.join("")).not.toContain("backup stamp was not copied");
+    } finally {
+      vi.restoreAllMocks(); await realDb.$client.end({ timeout: 2 }); await pg.cleanup();
+    }
+  }, 120_000);
+
   it("keeps the provider backup fence while its accepted result is saving the workspace", async () => {
     const current = { ...execution, binding: { ...execution.binding, runId: randomUUID(), issueId: randomUUID(),
       executionWorkspaceId: randomUUID() }, session: { ...execution.session, normalizedSessionId: randomUUID() } };
