@@ -52,15 +52,15 @@ const support = externalTestDatabaseUrl ? { supported: true } : await getEmbedde
   it.each([
     { cause: "backup_without_reusable_lease", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease", nextAction:
-      "The sandbox's previous conversation could not be reused. Press Retry to try again." },
+      "The sandbox's previous conversation could not be reused. Press Retry to try again; it may start a new conversation." },
     { cause: "runner_remote_provider_verification_unavailable", errorCode: "runner_remote_provider_verification_unavailable",
       error: "runner_remote_provider_verification_unavailable: pack unavailable after 2 verification attempts (exitCode=null; timedOut=true)", nextAction:
       "The sandbox's tool pack could not be checked. Press Retry to check it again." },
     { cause: "runner_remote_state_unavailable", errorCode: "native_session_interrupted",
       error: "runner_remote_state_unavailable: exit=1 timedOut=false", nextAction:
-      "The sandbox's conversation could not be read. Press Retry to try again." },
+      "The sandbox's conversation could not be read. Press Retry to continue the work in a new conversation." },
     { cause: "unclassified_preparation_failure", errorCode: "unclassified_preparation_failure", error: null, nextAction:
-      "The run stopped before it finished, and its workspace could not be restored automatically. Press Retry to try again." },
+      "The run stopped before it finished, and its workspace could not be restored automatically. Press Retry to try again; it may start a new conversation." },
     { cause: "native_predecessor_retirement_unproven", errorCode: "native_predecessor_retirement_unproven",
       error: "The previous run's session on this sandbox could not be retired (lease no longer active).", nextAction:
       "Couldn't confirm the previous session stopped. The previous session could not be confirmed stopped, so no new agent work started. Your message is saved. Press Retry to start it again." },
@@ -88,7 +88,7 @@ const support = externalTestDatabaseUrl ? { supported: true } : await getEmbedde
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
       expect(action.nextAction).toBe(state === "committed"
         ? "The task's saved files could not be put back after the run stopped. They are kept where they were and are not applied. Press Retry to continue from the last saved version in a new workspace."
-        : "The run stopped before it finished, and its workspace could not be restored automatically. Press Retry to try again.");
+        : "The run stopped before it finished, and its workspace could not be restored automatically. Press Retry to try again; it may start a new conversation.");
     });
 
   it("locks only terminal control state while returning and retaining the complete run", async () => {
