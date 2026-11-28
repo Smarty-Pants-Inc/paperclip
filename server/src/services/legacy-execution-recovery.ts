@@ -14,14 +14,14 @@ import { PLUGIN_WORKER_UNAVAILABLE_CODE } from "./plugin-worker-unavailable-erro
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "./environment-provider-unavailable-error.js";
 import { REPOSITORY_CATALOG_UNAVAILABLE_CODE } from "./repository-catalog-unavailable-error.js";
 import { RUNNER_REVISION_MISMATCH_CODE } from "./runner-revision-mismatch.js";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, remoteWorkspaceRunReferenceSchema } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { preservePersonStopResultSql } from "./person-stop-result.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { environmentLeases, executionWorkspaceSnapshots, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { executionStartedEventPredicate, isPreDispatchResourceWait } from "./pre-dispatch-execution-evidence.js";
 import { readRunCancellation } from "./run-cancellation.js";
 import { readRunFailureStage } from "./run-failure-stage.js";
@@ -43,12 +43,40 @@ export const UNRESTORED_FILES_NEXT_ACTION = "The task's saved files could not be
   + "They are kept where they were and are not applied. Press Retry to continue from the last saved version in a new workspace.";
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
-async function workspaceRecoveryNextAction(db: Pick<Db, "select">, run: Pick<Run, "id" | "companyId" | "errorCode">) {
+const WORKSPACE_RECOVERY_NEXT_ACTION = "The run stopped before it finished, and its workspace could not be restored automatically. "
+  + "Press Retry to try again.";
+const WORKSPACE_RECOVERY_CAUSES: Record<string, string> = {
+  // A mismatch does not prove a move; a failed remote read does not prove release or an absent backup.
+  runner_harness_state_mismatch: "The sandbox's previous conversation could not be reused. Press Retry to try again.",
+  runner_remote_provider_verification_unavailable: "The sandbox's tool pack could not be checked. Press Retry to check it again.",
+  runner_remote_state_unavailable: "The sandbox's conversation could not be read. Press Retry to try again.",
+};
+
+async function workspaceRecoveryNextAction(db: Pick<Db, "select">,
+  run: Pick<Run, "id" | "companyId" | "errorCode" | "error" | "resultJson" | "runnerProfileJson">) {
+  // Historical native failures wrap these diagnostics in native_session_interrupted.
+  // Recognize only fixed internal prefixes; never return the diagnostic itself.
+  const cause = run.errorCode === "native_session_interrupted"
+    ? Object.keys(WORKSPACE_RECOVERY_CAUSES).find(code => run.error?.startsWith(`${code}:`)) : run.errorCode;
+  if (cause && Object.hasOwn(WORKSPACE_RECOVERY_CAUSES, cause)) return WORKSPACE_RECOVERY_CAUSES[cause];
   // Containing a prepared workspace does not mean its files caused the failure.
   const failure = classifiedRunFailure({ errorCode: run.errorCode,
     ...(run.errorCode === "native_session_interrupted" ? await readRunFailureStage(db, run.companyId, run.id) : undefined) });
-  return ["agent_machine_unreachable", "agent_machine_unavailable", "previous_session_unconfirmed"].includes(failure.code)
-    ? `${failure.title}. ${failure.detail} Press Retry to start it again.` : UNRESTORED_FILES_NEXT_ACTION;
+  if (["agent_machine_unreachable", "agent_machine_unavailable", "previous_session_unconfirmed"].includes(failure.code))
+    return `${failure.title}. ${failure.detail} Press Retry to start it again.`;
+  // A restore failure alone says nothing about whether a saved version exists.
+  const reference = remoteWorkspaceRunReferenceSchema.safeParse(run.runnerProfileJson?.remoteWorkspace);
+  if (run.errorCode === "workspace_restore_failed" && hasWorkspaceRestoreFailure(run.resultJson)
+      && reference.success && reference.data.snapshotId) {
+    const [snapshot] = await db.select({ id: executionWorkspaceSnapshots.id }).from(executionWorkspaceSnapshots).where(and(
+      eq(executionWorkspaceSnapshots.companyId, run.companyId),
+      eq(executionWorkspaceSnapshots.executionWorkspaceId, reference.data.workspaceId),
+      eq(executionWorkspaceSnapshots.id, reference.data.snapshotId),
+      inArray(executionWorkspaceSnapshots.status, ["committed", "superseded"]),
+    )).limit(1);
+    if (snapshot) return UNRESTORED_FILES_NEXT_ACTION;
+  }
+  return WORKSPACE_RECOVERY_NEXT_ACTION;
 }
 
 const unusedReconciliationContextKeys = [
