@@ -1542,6 +1542,19 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     ? IssueChatThread
     : TaskChatThread;
   const designSandbox = useDesignSandbox();
+  const lastSandboxPrewarm = useRef<{ key: string; at: number } | null>(null);
+  const prewarmSandbox = useCallback(() => {
+    if (!issueId || !currentUserId || designSandbox) return;
+    const key = `${currentUserId}:${issueId}`;
+    const now = Date.now();
+    if (lastSandboxPrewarm.current?.key === key && now - lastSandboxPrewarm.current.at < 30_000) return;
+    lastSandboxPrewarm.current = { key, at: now };
+    void issuesApi.prewarmSandbox(issueId).catch((error: unknown) => {
+      // This server-side experiment is off by default. Its absence is expected.
+      if (!(error instanceof ApiError && error.status === 404)) console.warn("Sandbox prewarm request failed", error);
+    });
+  }, [issueId, currentUserId, designSandbox]);
+  useEffect(() => { prewarmSandbox(); }, [prewarmSandbox]);
   const queryClient = useQueryClient();
   const issueQueryRef = queryIssueId ?? issueId;
   const scrollLocation = useLocation();
@@ -2713,6 +2726,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
 
   const savedThread = (
     <div
+      onInputCapture={prewarmSandbox}
       className={
         classicTaskInterfaceEnabled
           ? "space-y-3"
