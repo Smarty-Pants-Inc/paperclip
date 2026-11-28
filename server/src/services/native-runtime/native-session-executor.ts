@@ -3006,7 +3006,8 @@ function savePluginRunnerCheckpoint(root: string, state: Record<string, unknown>
   const temporary = `${path}.${randomUUID()}.tmp`;
   // Keep only the verified lifecycle identity. Provider state stays on the execution host.
   writeFileSync(temporary, JSON.stringify({ schema: state.schema, lifecycle: state.lifecycle,
-    ...Object.fromEntries(fields.map(key => [key, state[key]])) }), { flag: "wx", mode: 0o600 });
+    ...Object.fromEntries(fields.map(key => [key, state[key]])),
+    ...(runnerStateRequestsFreshBootstrap(state) ? { recoverableFailure: state.recoverableFailure } : {}) }), { flag: "wx", mode: 0o600 });
   renameSync(temporary, path);
 }
 
@@ -5635,6 +5636,7 @@ async function verifyPriorRunnerdStateForSessionScope(input: {
   allowVerifiedBackup: boolean;
   admittedPreviousExecution?: NativeExecutionInput;
   retainedWarmOwnerRunId?: string;
+  runnerExecutionTarget?: AdapterExecutionTarget | null;
 }): Promise<PriorRunnerdStateVerification> {
   let priorRun: {
     status: string;
@@ -5680,6 +5682,7 @@ async function verifyPriorRunnerdStateForSessionScope(input: {
     if (!sameScope) return "scope_mismatch";
     const lifecycle = runnerdAuthorityLifecycleWithVerifiedBackup({ ...input, execution: admittedPrior ? priorExecution : input.execution });
     if (lifecycle === "suspended") return "verified";
+    if (lifecycle === "not_suspended" && await verifyExitedWarmRunnerBootstrap(input, input.identity)) return "verified";
     const directLifecycle = runnerdAuthorityLifecycle(
       input.root,
       input.identity,
@@ -6837,6 +6840,7 @@ async function migrateRunnerdStateRootForExecution(input: {
         admittedPreviousExecution: input.admittedPreviousExecution,
         allowVerifiedBackup: input.allowVerifiedBackup,
         retainedWarmOwnerRunId: input.retainedWarmOwnerRunId,
+        runnerExecutionTarget: input.runnerExecutionTarget,
       });
       // Name the failed retirement proof: the shared error otherwise hides
       // which of several independent fences held the follow-up.
@@ -6904,6 +6908,7 @@ async function migrateRunnerdStateRootForExecution(input: {
         admittedPreviousExecution: legacy === previousRoot ? input.admittedPreviousExecution : undefined,
         allowVerifiedBackup: input.allowVerifiedBackup,
         retainedWarmOwnerRunId: input.retainedWarmOwnerRunId,
+        runnerExecutionTarget: input.runnerExecutionTarget,
       });
       if (
         verification !== "verified" &&
@@ -7961,11 +7966,15 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
   await reconcileControllerJournalWithRunner({ ...controllerProjectionInput(input, { runId: prior.runId, issueId: input.execution.binding.issueId }), runnerState: state });
   // A running warm source keeps the existing live-adoption identity, idle,
   // controller-fencing and physical-process checks. Only suspension is cached.
-  if (!movedAllocation && input.execution.session.lifecyclePolicy.mode === "warm" && state.lifecycle !== "suspended") return;
-  if (state.lifecycle !== "suspended" || !Array.isArray(state.outbox) || state.outbox.length !== 0
+  const freshBootstrap = settledFreshBootstrapState(state, prior);
+  if (!movedAllocation && input.execution.session.lifecyclePolicy.mode === "warm" && state.lifecycle !== "suspended" && !freshBootstrap) return;
+  if ((state.lifecycle !== "suspended" && !freshBootstrap) || !Array.isArray(state.outbox) || state.outbox.length !== 0
     || (state.pendingTerminalDelivery != null && !isUndeliveredSuspendReceipt(state, root))
     || state.pendingProviderCleanup != null || state.warmTransition != null) {
     throw new Error("native_controller_recovery_missing_evidence:runner_not_settled");
+  }
+  if (freshBootstrap && !await verifyExitedWarmRunnerBootstrap(input, prior)) {
+    throw new Error("runner_state_identity_mismatch: remote_warm_session_not_idle");
   }
   savePluginRunnerCheckpoint(root, state, prior);
 }
@@ -9242,6 +9251,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_CHANGED_AFTER_READ ||
     sourceFailureCode === "native_session_cleanup_quarantined" ||
     sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
+    sourceFailureCode === "remote_warm_session_not_idle" ||
     sourceFailureCode === "native_provider_usage_limit" ||
     sourceFailureCode === NATIVE_PROVIDER_SESSION_CLOSED ||
     sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED ||
@@ -9451,6 +9461,7 @@ function classifyNativeSessionFailure(
   | typeof NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
   | "native_session_cleanup_quarantined"
   | "native_adopted_runner_authentication_timeout"
+  | "remote_warm_session_not_idle"
   | "runner_remote_provider_artifact_incompatible"
   | "runner_remote_provider_verification_unavailable"
   | "provider_process_exited"
@@ -9520,6 +9531,7 @@ function classifyNativeSessionFailure(
   }
   if (runnerClosedTurnStartSession(error)) return NATIVE_PROVIDER_SESSION_CLOSED;
   const message = error instanceof Error ? error.message : String(error);
+  if (message === "runner_state_identity_mismatch: remote_warm_session_not_idle") return "remote_warm_session_not_idle";
   if (message.startsWith("native_provider_output_without_result:")) return "native_provider_output_without_result";
   if (/"code":"controller_sequence_mismatch"/.test(message)) return NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER;
   if (/^(?:runner_ingress_unavailable: runnerd exited unexpectedly with code 1: )?runner_task_admission_rejected: (session_state_unavailable|account_binding_mismatch)$/.test(message)) {
@@ -11215,6 +11227,16 @@ export async function executePaperclipNativeSession(input: {
       : await executePaperclipNativeSessionWithinScope(await stageAttachments(), undefined, false, ownDiagnosticLease);
   } catch (error) {
     executionFailure = error;
+    // Preparation can refuse before an execution claim exists; settle only
+    // an unowned coordinator, never a concurrent controller's attempt.
+    if (error instanceof Error && error.message === "runner_state_identity_mismatch: remote_warm_session_not_idle") {
+      await input.db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "remote_warm_session_not_idle",
+        nextAttemptAt: null, failureDetail: { sourceFailureCode: "remote_warm_session_not_idle",
+          nextAction: "The saved conversation is not safely idle. Your message remains unanswered. Inspect the retained runner state before retrying; automatic retries are stopped." } })
+        .where(and(eq(nativeRunFinalizations.runId, runId), eq(nativeRunFinalizations.companyId, input.execution.binding.companyId),
+          eq(nativeRunFinalizations.issueId, input.execution.binding.issueId), isNull(nativeRunFinalizations.leaseOwner),
+          inArray(nativeRunFinalizations.phase, ["observed", "retryable_failure"])));
+    }
     if (error instanceof NativeControllerRecoveryWaitingError) {
       await deferNativeControllerRecovery(input.db, { ...input.execution.binding,
         leaseOwner: input.leaseOwner, retryAt: error.retryAt, waitingForOwner: error.owner });
@@ -14239,6 +14261,8 @@ async function executePaperclipNativeSessionAttempt(
                   ? providerLimit.nextAction
                   : sourceFailureCode === "native_provider_output_without_result"
                   ? "The provider produced output but no complete answer could be saved. This question remains unanswered. Automatic retries are stopped; nothing was re-sent."
+                  : sourceFailureCode === "remote_warm_session_not_idle"
+                  ? "The saved conversation is not safely idle. Your message remains unanswered. Inspect the retained runner state before retrying; automatic retries are stopped."
                   : sourceFailureCode === "native_permission_declined"
                   ? "Provider permission was declined. Inspect the task and give explicit direction before starting further provider work. Automatic recovery is stopped."
                   : sourceFailureCode === "native_provider_approval_required"
@@ -16429,6 +16453,38 @@ function remoteRunnerStateDirectory(remoteCwd: string, normalizedSessionId: stri
     createHash("sha256").update(normalizedSessionId).digest("hex"), "runner");
 }
 
+function settledFreshBootstrapState(state: Record<string, unknown>, identity: Record<string, unknown>): boolean {
+  return runnerStateRequestsFreshBootstrap(state) && Array.isArray(state.outbox) && state.outbox.length === 0
+    && state.pendingTerminalDelivery === null && state.pendingProviderCleanup == null && state.warmTransition == null
+    && REMOTE_RUNNER_IDENTITY_FIELDS.every(field => typeof identity[field] === "string" && !!identity[field] && state[field] === identity[field]);
+}
+
+/** State alone is never retirement authority: inspect the same box and exact process identity. */
+async function verifyExitedWarmRunnerBootstrap(input: {
+  db: Db; execution: NativeExecutionInput; runnerExecutionTarget?: AdapterExecutionTarget | null;
+}, identity: Record<string, unknown>): Promise<boolean> {
+  const target = input.runnerExecutionTarget;
+  if (target?.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask
+    || input.execution.session.lifecyclePolicy.mode !== "warm" || target.sandboxLeaseAcquisition?.outcome !== "resumed") return false;
+  try {
+    const retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: String(identity.runId), target });
+    const stateDirectory = remoteRunnerStateDirectory(retained.remoteCwd, String(identity.normalizedSessionId));
+    const state = await readRemoteRunnerState({ runner: target.runner, stateDirectory });
+    if (!settledFreshBootstrapState(state, identity)) return false;
+    try {
+      await verifyRemoteRunnerReattachment({ target: { ...target, remoteCwd: retained.remoteCwd }, identity,
+        runId: String(identity.runId), normalizedSessionId: String(identity.normalizedSessionId),
+        claim: { runId: String(identity.runId), remote: { providerLeaseId: target.sandboxLeaseAcquisition.providerLeaseId, remoteCwd: retained.remoteCwd } } });
+    } catch (error) {
+      const diagnostic = readRemoteRunnerRecoveryError(error);
+      return diagnostic?.stage === "process_verification" && diagnostic.reason === "process_not_running"
+        && diagnostic.runnerSettled === true && exitedRunnerRequestedFreshBootstrap(diagnostic)
+        && settledFreshBootstrapState(await readRemoteRunnerState({ runner: target.runner, stateDirectory }), identity);
+    }
+  } catch { /* Missing, running and unknown process evidence all retain today's refusal. */ }
+  return false;
+}
+
 /** A settled box may have suspended after the server saved its warm checkpoint. */
 class RemoteWarmRunnerSuspendedError extends Error {
   constructor() {
@@ -16471,7 +16527,8 @@ export async function verifyRemoteRunnerReattachment(input: {
   const runnerState = await readRemoteRunnerState({ runner, stateDirectory, recoveryDeadline: probeDeadline, stall });
   if (input.requireIdle && (runnerState.lifecycle !== "ready" ||
       !Array.isArray(runnerState.outbox) || runnerState.outbox.length !== 0 || runnerState.pendingTerminalDelivery !== null)) {
-    if (runnerState.lifecycle === "suspended" && Array.isArray(runnerState.outbox) && runnerState.outbox.length === 0
+    if ((runnerState.lifecycle === "suspended" || settledFreshBootstrapState(runnerState, identity))
+      && Array.isArray(runnerState.outbox) && runnerState.outbox.length === 0
       && runnerState.pendingTerminalDelivery === null && REMOTE_RUNNER_IDENTITY_FIELDS.every(field =>
         typeof identity[field] === "string" && !!identity[field] && runnerState[field] === identity[field])) {
       throw new RemoteWarmRunnerSuspendedError();
@@ -18522,7 +18579,8 @@ async function createRunnerdBackendWithinSessionClaim(
     ) {
       throw new Error("runner_harness_state_mismatch: runner_identity");
     }
-    if (runnerState.lifecycle !== "suspended") {
+    if (runnerState.lifecycle !== "suspended" && !(source === "host_preparation" && durableIdentity
+      && settledFreshBootstrapState(runnerState, durableIdentity) && await verifyExitedWarmRunnerBootstrap(input, durableIdentity))) {
       const notSuspendedRunId = typeof runnerState.runId === "string" ? runnerState.runId : null;
       if (source === "host_preparation" && notSuspendedRunId === input.execution.binding.runId) {
         await inspectOwnUnpreparedBootstrap();
