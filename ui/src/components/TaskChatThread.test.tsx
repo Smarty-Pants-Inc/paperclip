@@ -1893,6 +1893,150 @@ describe("TaskChatThread draft pass-through", () => {
   });
 });
 
+// Keep reason: a newer log poll must not erase native read cursors and move a sent message.
+describe("native read source stability", () => {
+  const at = (second: number) => new Date(Date.UTC(2026, 0, 1, 12, 0, second)).toISOString();
+  const message = (ts: string, text: string, channel: "progress" | "final") => ({ kind: "assistant" as const, ts, text, channel });
+  const fixture = (id = "stable", offset = 0) => {
+    const run = { ...nativePlanRun(id), createdAt: at(offset), startedAt: at(offset) };
+    const comment = (suffix: string, body: string, second: number) => ({
+      id: `${id}-${suffix}`, body, companyId: "company", issueId: "issue", authorType: "user" as const,
+      authorUserId: "viewer", authorAgentId: null, presentation: null, metadata: null,
+      createdAt: new Date(at(offset + second)), updatedAt: new Date(at(offset + second)), consumedByRunId: id,
+    });
+    const request = comment("request", `Start ${id} turn.`, 0);
+    const steer = { ...comment("steer", `Mid-turn ${id} input.`, 4), steeredIntoRunId: id,
+      conversationAnchorAt: new Date(at(offset + 5)) };
+    const entries: ReturnType<typeof nativeRunEventsToTranscript> = [
+      { kind: "system", text: "", ts: at(offset + 1), eventSeq: 1, steeringEvent: { kind: "input", turnId: id } },
+      { ...message(at(offset + 2), `${id} before read.`, "progress"), itemId: `${id}-before`, eventSeq: 2 },
+      { kind: "system", text: "", ts: at(offset + 5), eventSeq: 3, steeringEvent: { kind: "ack", turnId: id, commentId: steer.id } },
+      { kind: "system", text: "", ts: at(offset + 6), eventSeq: 4, steeringEvent: { kind: "input", turnId: id } },
+      { ...message(at(offset + 7), `${id} after read.`, "progress"), itemId: `${id}-after`, eventSeq: 5 },
+      { ...message(at(offset + 8), `${id} final answer.`, "final"), itemId: `${id}-final`, eventSeq: 10 },
+    ];
+    const props = { issueId: "issue", currentUserId: "viewer", conversationMode: true, onAdd: async () => {},
+      comments: [request, steer], activeRun: run, linkedRuns: [{ ...run, runId: id, wakeCommentId: request.id }] };
+    return { id, offset, run, request, steer, entries, props };
+  };
+  // The log has the same words, but no input reads and a later content watermark.
+  const log = (data: ReturnType<typeof fixture>, poll: number) => data.entries.filter(row => !row.steeringEvent).map(row => ({
+    ...row, eventSeq: undefined, contentVersion: { at: at(data.offset + 10 + poll), completed: true },
+  }));
+  const load = (data: ReturnType<typeof fixture>, poll = 0) => {
+    nativeTranscriptState.hydratedRunIds = new Set([...(nativeTranscriptState.hydratedRunIds ?? []), data.id]);
+    transcriptState.hydratedRunIds = new Set([...(transcriptState.hydratedRunIds ?? []), data.id]);
+    nativeTranscriptState.transcriptByRun.set(data.id, data.entries);
+    transcriptState.transcriptByRun.set(data.id, log(data, poll));
+  };
+  const assertPlaced = async (data: ReturnType<typeof fixture>) => {
+    await settleThreadLayout();
+    for (let pass = 0; pass < 3; pass++) flushSync(() => {
+      for (const button of container.querySelectorAll<HTMLButtonElement>(
+        '[data-testid="task-chat-turn-summary"][aria-expanded="false"], [data-testid="task-chat-activity-phase-toggle"][aria-expanded="false"]')) button.click();
+    });
+    const text = container.textContent ?? "";
+    for (const body of [data.request.body, `${data.id} before read.`, data.steer.body, `${data.id} after read.`, `${data.id} final answer.`]) {
+      expect(text.split(body), `${body} appears once`).toHaveLength(2);
+    }
+    expect(text.indexOf(`${data.id} before read.`)).toBeLessThan(text.indexOf(data.steer.body));
+    expect(text.indexOf(data.steer.body)).toBeLessThan(text.indexOf(`${data.id} after read.`));
+    expect(text.indexOf(`${data.id} after read.`)).toBeLessThan(text.indexOf(`${data.id} final answer.`));
+  };
+  it("keeps a live read placed across newer log polls and native catch-up", async () => {
+    const data = fixture();
+    for (let poll = 0; poll < 4; poll++) {
+      // Native history grows independently while each log response is newer.
+      if (poll) data.entries.splice(-1, 0, {
+        ...message(at(7 + poll / 10), `Native update ${poll}.`, "progress"),
+        itemId: `native-update-${poll}`, eventSeq: 5 + poll,
+      });
+      load(data, poll);
+      render(<TaskChatThread {...data.props} />);
+      await assertPlaced(data);
+    }
+  });
+  it("keeps native layout while the same progress item grows", async () => {
+    const data = fixture();
+    load(data);
+    render(<TaskChatThread {...data.props} />);
+    await assertPlaced(data);
+    const growing = data.entries[4]!;
+    if (growing.kind !== "assistant") throw new Error("Expected progress fixture");
+    data.entries[4] = { ...growing, text: "stable after read. More words from the same item." };
+    load(data, 1);
+    render(<TaskChatThread {...data.props} />);
+    await assertPlaced(data);
+    expect(container.textContent).toContain("More words from the same item.");
+  });
+  it.each([false, true])("keeps the read placed after settlement and a cold reload (compact=%s)", async compactHistory => {
+    const data = fixture();
+    load(data);
+    render(<TaskChatThread {...data.props} compactHistory={compactHistory} />);
+    await assertPlaced(data);
+    const settled = { ...data.props, activeRun: undefined, linkedRuns: [{ ...data.props.linkedRuns[0]!, status: "succeeded", finishedAt: at(9) }] };
+    for (let reload = 0; reload < 2; reload++) {
+      if (reload) render(<div />);
+      load(data, reload + 1);
+      render(<TaskChatThread {...settled} compactHistory={compactHistory} />);
+      await assertPlaced(data);
+    }
+  });
+  it("does not move the first answer when the next turn starts within a minute", async () => {
+    const first = fixture("first"), second = fixture("second", 30);
+    load(first); load(second);
+    const props = { ...second.props, comments: [...first.props.comments, ...second.props.comments], linkedRuns: [
+      { ...first.props.linkedRuns[0]!, status: "succeeded", finishedAt: at(9) }, ...second.props.linkedRuns,
+    ] };
+    for (let reload = 0; reload < 2; reload++) {
+      if (reload) render(<div />);
+      render(<TaskChatThread {...props} />);
+      await assertPlaced(first); await assertPlaced(second);
+      expect(container.textContent!.indexOf("first final answer.")).toBeLessThan(container.textContent!.indexOf(second.request.body));
+    }
+  });
+  it("does not rewind log words when a native read recovers behind the fallback", async () => {
+    const data = fixture();
+    load(data);
+    nativeTranscriptState.errorsByRun.set(data.id, { message: "Native read unavailable" });
+    transcriptState.transcriptByRun.set(data.id, [...log(data, 1),
+      { ...message(at(12), "Visible fallback continuation.", "progress"), itemId: "log-tail" },
+    ]);
+    render(<TaskChatThread {...data.props} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Visible fallback continuation.");
+    nativeTranscriptState.errorsByRun.clear();
+    data.entries = data.entries.map(row => row.kind === "assistant"
+      ? { ...row, contentVersion: { at: at(20), completed: true } } : row);
+    nativeTranscriptState.transcriptByRun.set(data.id, data.entries);
+    render(<TaskChatThread {...data.props} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Visible fallback continuation.");
+    // Once native covers the fallback, the source can regain its read layout.
+    data.entries.push({ ...message(at(12), "Visible fallback continuation.", "progress"), itemId: "log-tail", eventSeq: 11 });
+    load(data, 2);
+    render(<TaskChatThread {...data.props} />);
+    await assertPlaced(data);
+    expect(container.textContent).toContain("Visible fallback continuation.");
+  });
+  it("falls back to newer log words when the native read fails", async () => {
+    const data = fixture();
+    load(data);
+    render(<TaskChatThread {...data.props} />);
+    await settleThreadLayout();
+    nativeTranscriptState.errorsByRun.set(data.id, { message: "Native read unavailable" });
+    transcriptState.transcriptByRun.set(data.id, [...log(data, 1),
+      { ...message(at(12), "New words available only in the log.", "progress"), itemId: "log-tail" },
+    ]);
+    render(<TaskChatThread {...data.props} />);
+    await settleThreadLayout();
+    const text = container.textContent ?? "";
+    for (const body of ["New words available only in the log.", "stable before read.", "stable after read.", data.steer.body]) {
+      expect(text.split(body), `${body} appears once`).toHaveLength(2);
+    }
+  });
+});
+
 // Keep reason: ordinary saved replies must not jump to their native run's opening slot.
 describe("saved task chronology", () => {
   const at = (time: string) => `2026-11-27T${time}Z`;

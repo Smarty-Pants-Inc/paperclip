@@ -1455,6 +1455,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const historyKey = conversationMode && draftKey ? draftKey : issueId;
   const [expiredHistoryWait, setExpiredHistoryWait] = useState<{ historyKey: typeof historyKey } | null>(null);
   const historyWaitExpired = expiredHistoryWait !== null && expiredHistoryWait.historyKey === historyKey;
+  const drawnByRunRef = useRef(new Map<string, TranscriptEntry[]>());
   const selectedTranscriptByRun = useMemo(() => {
     const next = new Map(logTranscriptByRun);
     for (const run of nativeRuns) {
@@ -1469,10 +1470,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const nativeTranscript = nativeTranscriptByRun.get(run.id) ?? [];
       const logTranscript = logTranscriptByRun.get(run.id) ?? [];
       const freshness = compareContentVersion(latestTranscriptContent(nativeTranscript), latestTranscriptContent(logTranscript));
-      // The same rule on first load, recovery and reload: newest durable content
-      // wins. Equal versions may hand over only without changing the words.
-      // Transport failure is a tie-breaker, never a reason to rewind content.
-      if (nativeTranscript.length > 0 && (!logTranscript.length || freshness > 0 ||
+      // Read cursors and output share native sequence numbers. A newer log
+      // watermark must not replace that layout, including on settled reloads.
+      // A failed native read still permits the durable log fallback below.
+      const hasReadLayout = steeringDeliveryPoints(nativeTranscript).byQuestion.size > 0;
+      const drawn = drawnByRunRef.current.get(run.id);
+      // Recovery may trail words already shown by the fallback. A newer
+      // native watermark alone is not evidence that it carries those words.
+      const canReturnToNative = !hasReadLayout || !drawn?.length ||
+        steeringDeliveryPoints(drawn).byQuestion.size > 0 || containsTranscriptWords(nativeTranscript, drawn);
+      const ownsReadLayout = hasReadLayout && !nativeTranscriptErrorsByRun.has(run.id);
+      if (canReturnToNative && nativeTranscript.length > 0 && (ownsReadLayout || !logTranscript.length || freshness > 0 ||
         (freshness === 0 && containsTranscriptWords(nativeTranscript, logTranscript) &&
           (!nativeTranscriptErrorsByRun.has(run.id) || !containsTranscriptWords(logTranscript, nativeTranscript))))) {
         next.set(run.id, nativeTranscript);
@@ -1506,7 +1514,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     : logErrorsByRun.has(run.id) ||
       (nativeTranscriptErrorsByRun.has(run.id) && !(selectedTranscriptByRun.get(run.id)?.length))
   ).map(run => run.id));
-  const drawnByRunRef = useRef(new Map<string, TranscriptEntry[]>());
   const drawnCutLogRunIdsRef = useRef(new Set<string>());
   const { rawTranscriptByRun, cutLogRunIds } = useMemo(() => {
     const next = new Map(selectedTranscriptByRun);
