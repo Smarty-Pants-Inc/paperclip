@@ -3576,12 +3576,15 @@ describe("remote provider pack manifest", () => {
       await mkdir(join(root, "dist/cli"), { recursive: true }); await mkdir(join(root, "node_modules/node/bin"), { recursive: true });
       await writeFile(join(root, "dist/cli/pi-app-server-proxy.cjs"), "proxy\n");
       await writeFile(join(root, "node_modules/node/bin/node"), "node\n"); await writeFile(join(root, "pnpm-lock.yaml"), "lock\n");
+      await mkdir(join(root, "pi-runtime"), { recursive: true }); await writeFile(join(root, "pi-runtime/cli.js"), "pi\n");
+      await mkdir(join(root, "pi-resources"), { recursive: true }); await writeFile(join(root, "pi-resources/resources.json"), "{}\n");
       const payload: Record<string, unknown> = {
         compatibility: { pi_rpc: (PROVIDER_PACK_COMPATIBILITY as Record<string, unknown>).pi_rpc },
         pins: { nodeMinimum: "24.11.0" }, target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "1".repeat(40),
         distDigest: sha256DirectoryTree(join(root, "dist")),
         artifacts: { nodeCommand: { path: "node_modules/node/bin/node", sha256: digest("node\n") }, productionLock: { path: "pnpm-lock.yaml", sha256: digest("lock\n") } },
-        pi_rpc: { version: "1.7.0", runtime: { path: "pi-runtime", sha256: digest("r") }, resources: { path: "pi-resources", sha256: digest("s") } },
+        pi_rpc: { version: "1.7.0", runtime: { path: "pi-runtime", sha256: sha256DirectoryTree(join(root, "pi-runtime")) },
+          resources: { path: "pi-resources", sha256: sha256DirectoryTree(join(root, "pi-resources")) } },
       };
       const write = () => writeFile(join(root, "provider-pack.json"), JSON.stringify({ schema: "paperclip-runner/remote-provider-pack/v1",
         digest: `sha256:${createHash("sha256").update(canonical(payload)).digest("hex")}`, payload }));
@@ -3598,6 +3601,13 @@ describe("remote provider pack manifest", () => {
         const previous = payload[field]; set(value); await write();
         expect(() => readRemoteProviderPackManifest(root), field).toThrow(message);
         set(previous); await write();
+      }
+      // The Pi closure that runs is checked like the other harnesses' assets: a changed runtime or resources tree is refused.
+      for (const tree of ["pi-runtime/cli.js", "pi-resources/resources.json"]) {
+        const original = await readFile(join(root, tree), "utf8"); await writeFile(join(root, tree), "substitute\n");
+        expect(() => readRemoteProviderPackManifest(root), tree).toThrow(tree.startsWith("pi-runtime") ? "Pi runtime digest mismatch" : "Pi resources digest mismatch");
+        await expect(verifyRemoteProviderPackManifest(root)).rejects.toThrow("digest mismatch");
+        await writeFile(join(root, tree), original);
       }
       // A full-compatibility pack keeps every other harness's artifact requirement.
       payload.compatibility = PROVIDER_PACK_COMPATIBILITY; await write();
