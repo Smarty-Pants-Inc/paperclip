@@ -1006,6 +1006,69 @@ const pluginTaskSessionOwners = new WeakMap<NativeSession, ReturnType<typeof cre
 // Closing a remote owner saves its checkpoint asynchronously. A new turn must
 // not inspect or quarantine that owner's state until the save has finished.
 const closingWarmNativeSessions = new Map<string, Promise<void>>();
+const pendingWarmInstructionRetirements = new Set<Promise<void>>();
+
+/** A successful changed agent-file save invalidates other held materializations.
+ * The save's caller never joins this work. Only an idle, still-current owner may
+ * be retired; active/reserved owners keep today's lazy preparation fence. */
+export function retireStaleWarmNativeInstructionCopies(input: {
+  companyId: string;
+  agentId: string;
+  runId: string;
+  isCurrent: (ownerRunId: string) => Promise<boolean>;
+}): void {
+  const available = (scope: string, entry: WarmNativeSession) => warmNativeSessions.get(scope) === entry &&
+    !entry.busy && !entry.preparingRunId && !entry.instructionPreparationRunId &&
+    !executingRunnerdSessionScopes.has(scope) && !settlingNativeSessionScopes.has(scope) && !closingWarmNativeSessions.has(scope);
+  // Snapshot eligibility now: a turn busy at the save must not be interrupted
+  // or marked for later closure even if it settles while another owner saves.
+  const owners = [...warmNativeSessions].filter(([scope, entry]) =>
+    entry.companyId === input.companyId && entry.agentId === input.agentId && entry.runId !== input.runId &&
+    (entry.instructionWorkingCopy?.runId ?? entry.instructionCopy?.runId) !== input.runId &&
+    Boolean(entry.instructionWorkingCopy?.runId ?? entry.instructionCopy?.runId) && available(scope, entry));
+  if (owners.length === 0) return;
+  const closeOwners = async () => {
+    for (let owner = owners.shift(); owner; owner = owners.shift()) {
+      const [scope, entry] = owner;
+      if (!available(scope, entry)) continue;
+      const ownerRunId = entry.instructionWorkingCopy?.runId ?? entry.instructionCopy!.runId;
+      try {
+        if (await input.isCurrent(ownerRunId)) continue;
+        // The read yielded: a new turn may now own this exact entry. Never
+        // revoke its authority or close its transport from this notification.
+        if (!available(scope, entry) || (entry.instructionWorkingCopy?.runId ?? entry.instructionCopy?.runId) !== ownerRunId) continue;
+        entry.busy = true;
+        if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+        entry.idleTimer = null;
+        entry.closeOnReleaseReason = "agent files changed in another run";
+        const closing = Promise.resolve().then(async () => {
+          // No discard option: the conversation checkpoint must settle exactly
+          // as on the lazy road before collection or a successor may proceed.
+          await retireWarmPredecessor(entry, entry.closeOnReleaseReason!);
+          forgetWarmNativeSession(scope, entry);
+        });
+        closingWarmNativeSessions.set(scope, closing);
+        try { await closing; }
+        finally {
+          entry.busy = false;
+          if (closingWarmNativeSessions.get(scope) === closing) closingWarmNativeSessions.delete(scope);
+          releaseIdleSessionToolAuthority(scope);
+        }
+      } catch (error) {
+        // A failed retirement stays registered and fenced. Never change the
+        // successful saving task's outcome or launch over an unproven owner.
+        logger.warn({ runId: entry.runId, savingRunId: input.runId, issueId: entry.issueId,
+          environmentId: entry.environmentId, closeFailure: describeWarmCloseFailure(error) },
+        "eager warm instruction retirement deferred to the next admission");
+      }
+    }
+  };
+  // One slow conversation backup must not prevent the other held chats from
+  // beginning retirement. Their canonical writes retain the agent-file lock.
+  const retirement = Promise.all(Array.from({ length: Math.min(WARM_NATIVE_SESSION_CLOSE_CONCURRENCY, owners.length) }, closeOwners)).then(() => {});
+  pendingWarmInstructionRetirements.add(retirement);
+  void retirement.finally(() => { pendingWarmInstructionRetirements.delete(retirement); });
+}
 
 export async function forgetDestroyedWarmNativeSessions(lease: { companyId: string; environmentId: string | null; providerLeaseId: string | null }) {
   for (const [scope, entry] of warmNativeSessions) {
@@ -1021,7 +1084,7 @@ export async function forgetDestroyedWarmNativeSessions(lease: { companyId: stri
 }
 
 export function readNativeSessionIdleWork(): IdleLocalWork {
-  return closingWarmNativeSessions.size !== 0 || [...warmNativeSessions.values()].some(entry =>
+  return pendingWarmInstructionRetirements.size !== 0 || closingWarmNativeSessions.size !== 0 || [...warmNativeSessions.values()].some(entry =>
     entry.busy || entry.preparingRunId || entry.instructionPreparationRunId || entry.closeOnReleaseReason || !entry.released)
     ? "present" : "none";
 }

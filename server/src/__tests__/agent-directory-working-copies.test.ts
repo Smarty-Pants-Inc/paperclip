@@ -1194,6 +1194,24 @@ describe("persistent agent directories", () => {
     expect(after.context.aggregateDigest).toBe(before.context.aggregateDigest);
     expect(after.context.instructions.bundle.fileCount).toBe(1);
   });
+  it.each([false, true])("detects another task's saved canonical change without reading or changing the held copy (warm=%s)", async warm => {
+    const held = await run({ warm });
+    if (warm) await copies.checkpointWarm({ companyId, runId: held.runId });
+    else expect(await copies.hasChanges({ companyId, runId: held.runId })).toBe(false);
+    expect(await copies.isCanonicalCurrent(companyId, agentId, held.runId)).toBe(true);
+    expect(await copies.isCanonicalCurrent(randomUUID(), agentId, held.runId)).toBe(false);
+    expect(await copies.isCanonicalCurrent(companyId, randomUUID(), held.runId)).toBe(false);
+    const saving = await run();
+    const changed = "Changed by another task, not by the held conversation.\n";
+    await fs.writeFile(path.join(saving.localRoot, entryFile), changed);
+    expect((await copies.collectStopped({ companyId, runId: saving.runId }))?.state).toBe("saved");
+    expect(await copies.isCanonicalCurrent(companyId, agentId, held.runId)).toBe(false);
+    expect(await fs.readFile(path.join(held.localRoot, entryFile), "utf8")).toBe(initial);
+    // Retirement may later collect the old copy, but unchanged paths cannot
+    // roll back task A's canonical save.
+    await copies.collectStopped({ companyId, runId: held.runId });
+    expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(changed);
+  });
   it("checkpoints three managed turns into one live directory, fences old cleanup, and persists after retirement", async () => {
     let copy = await run({ warm: true });
     const original = copy;

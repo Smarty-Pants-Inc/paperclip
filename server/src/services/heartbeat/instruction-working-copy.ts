@@ -7,7 +7,7 @@ import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "../agent-directory-working-copies.js";
 import { collectStoppedInstructionCopyWithRetries, instructionWorkingCopyGuidance, type agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
-import { claimWarmNativeInstructionCopy, nativeSessionWorkspaceScope, reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
+import { claimWarmNativeInstructionCopy, nativeSessionWorkspaceScope, reserveWarmNativeInstructionDirectory, retireStaleWarmNativeInstructionCopies } from "../native-runtime/index.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { supportsNativeWarmFiles } from "../native-runtime/native-warm-capability.js";
 import type { HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
@@ -102,6 +102,12 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
       message: storageWarning ?? (state === "saved" ? "Agent files saved."
         : state === "unchanged" ? "Instruction working copy is unchanged."
           : saved.errorMessage ?? "Instruction edits were not saved."), payload: instructionSave });
+    if (state === "saved" && !saved.errorCode && isAgentDirectoryCopy(saved)) {
+      // Checkpoint other held conversations now, not during their next message's
+      // prepare.instructions. Their own baseline decides whether they are stale.
+      retireStaleWarmNativeInstructionCopies({ companyId: agent.companyId, agentId: agent.id, runId: saved.runId,
+        isCurrent: runId => instructionCopies.isCanonicalCurrent(agent.companyId, agent.id, runId) });
+    }
   };
   const collectStoppedInstructions = async () => {
     if (!instructionCopy) return;
