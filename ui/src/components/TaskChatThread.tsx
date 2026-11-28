@@ -141,6 +141,7 @@ import {
   taskChatContentKey,
 } from "@/components/task-chat/TaskChatThreadView";
 import { TaskChatComposer } from "@/components/task-chat/TaskChatComposer";
+import { useWakeIntent } from "@/hooks/useWakeIntent";
 import { TaskChatComposerDock } from "@/components/task-chat/TaskChatComposerDock";
 import {
   RunnerGoalWidget,
@@ -763,6 +764,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onOpenSkill,
     onRestoreStoppedMessages,
   } = props;
+  // Agent Chat renders this same thread for its current conversation task.
+  const { noteTyping } = useWakeIntent(issueId, {
+    enabled: showComposer && Boolean(conversationMode || issueAssigneeAgentId),
+  });
   // A reply's question can be on an unfetched history page. Fetch that exact
   // row, without gating the whole transcript on its availability. Admission,
   // ACK and save time are not a substitute for the question's send time.
@@ -4812,6 +4817,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         <TaskChatComposer
                           composerRef={composerRef}
                           onAdd={handleThreadAdd}
+                          onNoteTyping={noteTyping}
                           onRetainedSubmissionChange={onRetainedSubmissionChange}
                           onRestoreReady={onRestoreReady}
                           confirmedSubmissionIds={new Set(comments.filter((comment) =>

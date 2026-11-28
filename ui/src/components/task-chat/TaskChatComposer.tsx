@@ -115,6 +115,8 @@ export interface TaskChatComposerTakeover {
 
 interface TaskChatComposerProps {
   composerRef?: Ref<IssueChatComposerHandle>;
+  /** User input only; the page owns speculative wake throttling. */
+  onNoteTyping?: () => void;
   onAdd?: (
     body: string,
     reopen?: boolean,
@@ -400,6 +402,7 @@ function escapeMarkdownLabel(name: string): string {
 
 export function TaskChatComposer({
   composerRef,
+  onNoteTyping,
   onAdd,
   creation,
   confirmedSubmissionIds,
@@ -528,7 +531,9 @@ export function TaskChatComposer({
   const markRequestUnbound = useRequestOwnerBinding({
     draftKey, owner: draftOwner, uncertainSubmission, setUncertainSubmission, pendingDraftRef,
   });
-  function changeBody(value: string) {
+  function changeBody(value: string, userInput = false) {
+    if (userInput && value !== bodyRef.current && !queuedEdit && !creation && !disabled)
+      onNoteTyping?.();
     bodyRef.current = value;
     if (creation) {
       creation.onChange(value);
@@ -1352,7 +1357,7 @@ export function TaskChatComposer({
         onChange={(value) => {
           if (!value && bodyRef.current && draftKey && !queuedEdit && !submittingRef.current && !uncertainSubmission)
             discardStoppedCommentDrafts(draftKey);
-          changeBody(value);
+          changeBody(value, true);
         }}
         placeholder={
           disabled

@@ -64,7 +64,7 @@ vi.mock("@/components/coordinator/CoordinatorChatPendingQuestions", () => ({
 }));
 vi.mock("@/api/issues", async importOriginal => ({
   ...await importOriginal<typeof import("@/api/issues")>(),
-  issuesApi: { summaries: vi.fn(async () => []) },
+  issuesApi: { summaries: vi.fn(async () => []), wakeIntent: vi.fn(async () => {}) },
 }));
 vi.mock("@/lib/router", () => ({
   useLocation: () => ({ pathname: "/issues/chat", hash: "", search: "", key: "test", state: null }),

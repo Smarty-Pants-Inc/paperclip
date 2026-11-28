@@ -292,6 +292,14 @@ function issueListSearchParams(filters?: IssueListFilters) {
 }
 
 export const issuesApi = {
+  /** Speculative warm-up only: a missing route or failed request must never affect chat. */
+  wakeIntent: async (issueId: string, reason: "open" | "typing"): Promise<void> => {
+    try {
+      await api.post(`/issues/${issueId}/wake-intent`, { reason });
+    } catch (error) {
+      console.debug("Wake intent unavailable", error);
+    }
+  },
   listChatHandoffs: (id: string, filters: { view?: "tray"; cursor?: string | null; limit?: number } = {}, options?: RequestOptions) => {
     const params = new URLSearchParams({ limit: String(filters.limit ?? 100) });
     if (filters.view) params.set("view", filters.view);

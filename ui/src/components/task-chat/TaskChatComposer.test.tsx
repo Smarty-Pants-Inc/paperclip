@@ -15,6 +15,9 @@ import { QuestionForm } from "./QuestionForm";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Agent, HeartbeatRun, IssueWorkMode } from "@paperclipai/shared";
 import { agentsApi } from "@/api/agents";
+import { issuesApi } from "@/api/issues";
+import { useWakeIntent } from "@/hooks/useWakeIntent";
+import type { IssueChatComposerHandle } from "@/components/IssueChatThread";
 import { instanceSettingsApi } from "@/api/instanceSettings";
 import { CoordinatorPresentation } from "@/components/coordinator/CoordinatorPresentation";
 import { ThemeProvider } from "@/context/ThemeContext";
@@ -432,6 +435,44 @@ describe("phone composer row", () => {
 });
 
 describe("TaskChatComposer", () => {
+  it("wakes once for user typing, not restored drafts or queued-message edits", () => {
+    const wake = vi.spyOn(issuesApi, "wakeIntent").mockResolvedValue(undefined);
+    const composerRef = { current: null as IssueChatComposerHandle | null };
+    const key = "wake-composer-draft";
+    saveDraft(key, "Saved draft");
+    function WakeComposer({ queued = false }: { queued?: boolean }) {
+      const { noteTyping } = useWakeIntent("wake-composer-task", { enabled: true });
+      return <TaskChatComposer composerRef={composerRef} workMode="standard" draftKey={key}
+        onAdd={vi.fn()} onNoteTyping={noteTyping}
+        queuedEdit={queued ? { commentId: "queued", body: "Queued text" } : null}
+        onSaveQueuedEdit={vi.fn()} />;
+    }
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    try {
+      render(<WakeComposer />);
+      expect(wake).toHaveBeenCalledExactlyOnceWith("wake-composer-task", "open");
+      wake.mockClear();
+      flushSync(() => composerRef.current!.restoreDraft("Returned message"));
+      expect(wake).not.toHaveBeenCalled();
+      typeText("First typed change");
+      typeText("Second typed change");
+      typeText("Third typed change");
+      expect(wake).toHaveBeenCalledExactlyOnceWith("wake-composer-task", "typing");
+      wake.mockClear();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+      try {
+        render(<WakeComposer queued />);
+        typeText("Editing an existing queued message");
+        expect(wake).not.toHaveBeenCalled();
+      } finally {
+        clock.mockRestore();
+      }
+    } finally {
+      wake.mockRestore();
+      visibility.mockRestore();
+    }
+  });
+
   describe("plain HTTP without randomUUID", () => {
     beforeEach(() => {
       vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
