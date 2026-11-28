@@ -656,6 +656,18 @@ const ACPX_RUNTIME_CHECKPOINT_EXCLUDED_ENTRIES = [
   "home/.npm",
   "data/pnpm/store",
 ] as const;
+// Smarty seam (C99, smarty-dev#4605): the re-creatable tool stores a Pi session's tools put under its HOME
+// (<runner>/pi-sessions/<sha256(session)>/pi-home; paperclip-pi-driver sets HOME and XDG_DATA_HOME there). A carried
+// session's pnpm store alone made an 11-27 save copy 3.9 GB / 98k files to keep a 1.3 MB conversation. Exact names
+// only: the conversation (pi-home/agent/...) and every other pi-home entry stay in the save.
+const PI_SESSION_HOME_CHECKPOINT_EXCLUDED_ENTRIES = [
+  "data/pnpm",
+  ".rustup",
+  ".cargo",
+  "cache",
+  "node-compile-cache",
+  ".npm",
+] as const;
 const RUNNERD_STATE_SCHEMA = "paperclip.runner.durable.state.v1";
 const CODEX_PROVIDER_STATE_SCHEMA = "paperclip.runner.codex-provider-state.v1";
 const ACPX_PROVIDER_STATE_SCHEMA = "paperclip.runner.acpx-provider-state.v3";
@@ -8165,7 +8177,10 @@ export function resolveNativeHarnessPersistenceProfile(
     providerKind: execution.provider.kind,
     driverKind: execution.session.driverKind,
     directories: [
-      { name: "runner", location: "runner", excludeEntries: [] },
+      { name: "runner", location: "runner", excludeEntries: execution.provider.kind === "pi_rpc"
+        ? PI_SESSION_HOME_CHECKPOINT_EXCLUDED_ENTRIES.map(entry =>
+          `pi-sessions/${createHash("sha256").update(nativeSessionKey(execution)).digest("hex")}/pi-home/${entry}`)
+        : [] },
       ...(providerDirectory ? [providerDirectory] : []),
     ],
   };
