@@ -3594,9 +3594,10 @@ describe("remote provider pack manifest", () => {
         ["pi_rpc", undefined, "pins or source revision"],
         ["artifacts", { ...(payload.artifacts as object), opencodeProxy: { path: "dist/cli/opencode-app-server-proxy.cjs", sha256: digest("x") } }, "carries no OpenCode proxy"],
       ] as const) {
-        const previous = payload[field]; payload[field] = value; await write();
+        const set = (next: unknown) => { if (next === undefined) delete payload[field]; else payload[field] = next; };
+        const previous = payload[field]; set(value); await write();
         expect(() => readRemoteProviderPackManifest(root), field).toThrow(message);
-        payload[field] = previous; await write();
+        set(previous); await write();
       }
       // A full-compatibility pack keeps every other harness's artifact requirement.
       payload.compatibility = PROVIDER_PACK_COMPATIBILITY; await write();
