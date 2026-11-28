@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { createCapabilityRunnerdCodexTransport } from "./runnerd-codex-transport.js";
 import { isRunnerResumeStateUnavailable, NativeRunnerResumeStateUnavailableError } from "../contracts/harness-driver.js";
-import { defaultCapabilityRunnerdBinary, fakeCodex, fakeCodexArgs } from "../../test/support/runnerd-transport.js";
+import { defaultCapabilityRunnerdBinary, expectTurnStarted, fakeCodex, fakeCodexArgs } from "../../test/support/runnerd-transport.js";
 
 it.each(["restore", "refuse", "foreign-state"] as const)(
   "continues a completed warm handoff through external cold-state preparation: %s",
@@ -106,6 +106,91 @@ it.each(["restore", "refuse", "foreign-state"] as const)(
   },
   30_000,
 );
+
+// Real TS transport + real runnerd; only the Codex provider is the package's
+// deterministic app-server fixture. The saved failure is seeded after runnerd
+// has exited, never while a process still owns the state.
+const bootstrapIdentityFields = ["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId", "turnId", "itemId"] as const;
+const bootstrapFailures = ["lease_expired_requires_bootstrap", "transport_reconnect_deadline_exceeded", "transport_reconnect_grace_exceeded",
+  "legacy:lease_expired_requires_bootstrap"];
+const bootstrapRefusals = ["outbox", "terminal", "cleanup", "transition", "other-failure", "failure-array", "failure-object", "ready", "missing-terminal",
+  ...bootstrapIdentityFields.map(field => `identity-${field}`)];
+it.each([
+  ...bootstrapFailures.flatMap(reason => ["local", "external"].map(placement => ({ mode: "restore", reason, placement }))),
+  ...bootstrapRefusals.map(mode => ({ mode, reason: bootstrapFailures[0]!, placement: "external" })),
+])("cold continuation loads only settled fresh-bootstrap state: $placement / $mode / $reason", async ({ mode, reason, placement }) => {
+  const root = await mkdtemp(join(tmpdir(), "runnerd-bootstrap-cold-"));
+  const callsPath = join(root, "calls.log"), requestsPath = join(root, "requests.jsonl");
+  const identity = { runnerInstanceId: "bootstrap-runner", environmentLeaseId: "bootstrap-lease", runId: "prior-run",
+    normalizedSessionId: "bootstrap-session", turnId: "prior-turn", itemId: "prior-item" };
+  const options = { runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: fakeCodex,
+    codexArgs: fakeCodexArgs(root, "--call-log", callsPath, "--request-log", requestsPath), stateDirectory: root,
+    lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 }, runnerReconnectGraceMs: 2_000 };
+  const first = createCapabilityRunnerdCodexTransport({ ...options, prpIdentity: identity });
+  let resumed: ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+  try {
+    const opened = await first.transport.request("thread/start", { cwd: tmpdir(), dynamicTools: [] });
+    const thread = opened.thread as { id: string; sessionId: string };
+    await first.transport.close();
+    const runnerPath = join(root, "runner/runner-state.json"), controlPath = join(root, "control-plane/control-plane-state.json");
+    const saved = { ...JSON.parse(await readFile(runnerPath, "utf8")), lifecycle: "recoverable_failure", recoverableFailure: reason };
+    expect(saved).toMatchObject({ ...identity, outbox: [], pendingTerminalDelivery: null });
+    if (reason.startsWith("legacy:")) { delete saved.recoverableFailure; saved.recoverable_failure = reason.slice(7); }
+    if (mode.startsWith("identity-")) saved[mode.slice(9)] = "foreign-owner";
+    if (mode === "outbox") saved.outbox = [{ sourceSeq: saved.nextSourceSeq }];
+    if (mode === "terminal") saved.pendingTerminalDelivery = { commandId: "pending" };
+    if (mode === "cleanup") saved.pendingProviderCleanup = { commandId: "pending" };
+    if (mode === "transition") saved.warmTransition = { transitionId: "pending" };
+    if (mode === "other-failure") saved.recoverableFailure = "unrecognized_failure";
+    if (mode === "failure-array") saved.recoverableFailure = [reason];
+    if (mode === "failure-object") saved.recoverableFailure = { code: reason };
+    if (mode === "ready") saved.lifecycle = "ready";
+    if (mode === "missing-terminal") delete saved.pendingTerminalDelivery;
+    await writeFile(runnerPath, JSON.stringify(saved));
+    const controlBefore = await readFile(controlPath), callsBefore = await readFile(callsPath, "utf8");
+    const read = async () => JSON.parse(await readFile(runnerPath, "utf8"));
+    const archived: Record<string, unknown>[] = [];
+    resumed = createCapabilityRunnerdCodexTransport({ ...options,
+      prpIdentity: { ...identity, runId: "next-run", turnId: "next-turn", itemId: "next-item" },
+      resumeProviderSession: { driverSessionId: thread.id, providerSessionId: thread.sessionId },
+      ...(placement === "external" ? { readRunnerState: read, prepareExternalRunnerState: async () => {},
+        archiveExternalRunnerState: async ({ archiveKey }: { archiveKey: string }) => {
+          const state = await read(); archived.push(state);
+          const directory = join(root, "authority-epochs", `epoch-${archiveKey}`);
+          await mkdir(directory, { recursive: true });
+          await rename(runnerPath, join(directory, "runner-state.json"));
+          return state;
+        } } : {}),
+    });
+    if (mode !== "restore") {
+      await expect(resumed.transport.request("thread/read", {})).rejects.toThrow("native_runner_authority_rotation_requires_settled_state");
+      expect(archived).toEqual([]);
+      expect(await readFile(controlPath)).toEqual(controlBefore);
+      expect(await readFile(callsPath, "utf8")).toBe(callsBefore);
+      expect(await read()).toEqual(saved);
+      return;
+    }
+    expect((await resumed.transport.request("thread/read", {})).thread).toMatchObject({ id: thread.id, sessionId: thread.sessionId });
+    const notifications = resumed.transport.notifications()[Symbol.asyncIterator]();
+    const started = expectTurnStarted(notifications);
+    const prompt = "The restored conversation owes this exact follow-up.";
+    await resumed.transport.request("turn/start", { input: [{ type: "text", text: prompt }] });
+    await started;
+    const requests = (await readFile(requestsPath, "utf8")).trim().split(/\r?\n/).map(line => JSON.parse(line));
+    expect(requests.filter(request => request.method === "turn/start")).toMatchObject([
+      { params: { input: [{ type: "text", text: prompt }] } },
+    ]);
+    expect(requests.filter(request => request.method === "thread/start")).toHaveLength(1);
+    expect(requests.filter(request => request.method === "thread/resume")).toHaveLength(1);
+    expect(JSON.parse(await readFile(controlPath, "utf8")).identity).toEqual({ ...identity, runId: "next-run", turnId: "next-turn", itemId: "next-item" });
+    if (placement === "external") expect(archived).toEqual([saved]);
+    console.info(JSON.stringify({ row: "real-runnerd-bootstrap", placement, reason, normalizedSessionId: identity.normalizedSessionId,
+      providerSessionId: thread.sessionId, driverSessionId: thread.id, turns: 1, prompt }));
+  } finally {
+    await Promise.allSettled([first.transport.close(), resumed?.transport.close()]);
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 // Staging class P: a follow-up's new sandbox holds no Runner control-plane
 // state and no archived authority epoch for the saved session. The refusal is
