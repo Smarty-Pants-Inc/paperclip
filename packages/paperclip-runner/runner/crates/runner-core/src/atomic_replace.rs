@@ -3,9 +3,17 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const EXDEV_RETRY_BUDGET: Duration = Duration::from_secs(60);
+static EXDEV_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of EXDEV-triggered rename retries attempted by this process.
+pub fn exdev_retry_count() -> u64 {
+    EXDEV_RETRY_COUNT.load(Ordering::Relaxed)
+}
+
+const EXDEV_RETRY_BUDGET: Duration = Duration::from_secs(20);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
@@ -48,15 +56,29 @@ fn rename_replace_retrying_exdev_with(
     })();
     fs::remove_file(temporary)?;
     let (bytes, permissions) = saved?;
+    let target_name = target.file_name().unwrap_or_default().to_string_lossy();
+    let mut retries = 0_u64;
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        let remaining = EXDEV_RETRY_BUDGET.saturating_sub(elapsed());
+        let elapsed_before_wait = elapsed();
+        let remaining = EXDEV_RETRY_BUDGET.saturating_sub(elapsed_before_wait);
         if remaining.is_zero() {
+            eprintln!(
+                "paperclip-runnerd: rename EXDEV retries exhausted attempts={} elapsed_ms={} target={target_name}",
+                retries + 1,
+                elapsed_before_wait.as_millis(),
+            );
             return Err(original_error);
         }
         sleep(backoff.min(remaining));
         backoff = (backoff * 2).min(MAX_BACKOFF);
-        if elapsed() >= EXDEV_RETRY_BUDGET {
+        let elapsed_after_wait = elapsed();
+        if elapsed_after_wait >= EXDEV_RETRY_BUDGET {
+            eprintln!(
+                "paperclip-runnerd: rename EXDEV retries exhausted attempts={} elapsed_ms={} target={target_name}",
+                retries + 1,
+                elapsed_after_wait.as_millis(),
+            );
             return Err(original_error);
         }
 
@@ -74,10 +96,24 @@ fn rename_replace_retrying_exdev_with(
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
+            // Match runnerd's existing warning facility: stderr, without a
+            // subscriber or filter that could hide an individual retry.
+            retries += 1;
+            EXDEV_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "paperclip-runnerd: rename EXDEV retry attempt={retries} elapsed_ms={} target={target_name}",
+                elapsed().as_millis(),
+            );
             rename(temporary, target)
         })();
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                eprintln!(
+                    "paperclip-runnerd: rename succeeded after exdev_retries={retries} elapsed_ms={} target={target_name}",
+                    elapsed().as_millis(),
+                );
+                return Ok(());
+            }
             Err(error) => {
                 let cleanup = fs::remove_file(temporary);
                 if !is_exdev(&error) {
@@ -93,6 +129,9 @@ fn rename_replace_retrying_exdev_with(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    // Keep process-wide counter deltas independent of parallel EXDEV tests.
+    static EXDEV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct Fixture {
         directory: std::path::PathBuf,
@@ -145,6 +184,7 @@ mod tests {
     #[test]
     fn exdev_twice_then_succeeds_with_original_bytes_and_no_temporary() {
         use std::os::unix::fs::PermissionsExt;
+        let _guard = EXDEV_TEST_LOCK.lock().unwrap();
         let fixture = Fixture::new();
         let elapsed = Cell::new(Duration::ZERO);
         let mut attempts = 0;
@@ -186,6 +226,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_exdev_returns_original_error_at_budget_with_no_temporary() {
+        let _guard = EXDEV_TEST_LOCK.lock().unwrap();
         let fixture = Fixture::new();
         let elapsed = Cell::new(Duration::ZERO);
         let original = io::Error::from_raw_os_error(18);
@@ -196,6 +237,7 @@ mod tests {
         );
         let mut first = Some(original);
         let mut attempts = 0;
+        let mut last_wait = Duration::ZERO;
         let error = rename_replace_retrying_exdev_with(
             &fixture.temporary,
             &fixture.target,
@@ -209,6 +251,7 @@ mod tests {
             |wait| {
                 assert!(!fixture.temporary.exists());
                 assert!(wait <= MAX_BACKOFF);
+                last_wait = wait;
                 elapsed.set(elapsed.get() + wait);
             },
             || elapsed.get(),
@@ -219,8 +262,39 @@ mod tests {
             expected
         );
         assert_eq!(elapsed.get(), EXDEV_RETRY_BUDGET);
-        assert_eq!(attempts, 34);
+        assert_eq!(attempts, 14);
+        assert_eq!(last_wait, Duration::from_millis(900));
         assert_eq!(fs::read(&fixture.target).unwrap(), b"old bytes");
+        fixture.assert_no_temporary();
+    }
+
+    // Unit test agreed: injected EXDEV and a fake clock measure the exact
+    // process-wide retry delta without a live filesystem restore.
+    #[cfg(unix)]
+    #[test]
+    fn counter_rises_by_the_number_of_exdev_retries() {
+        let _guard = EXDEV_TEST_LOCK.lock().unwrap();
+        let fixture = Fixture::new();
+        let before = exdev_retry_count();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut attempts = 0;
+        rename_replace_retrying_exdev_with(
+            &fixture.temporary,
+            &fixture.target,
+            |temporary, target| {
+                attempts += 1;
+                if attempts <= 2 {
+                    Err(io::Error::from_raw_os_error(18))
+                } else {
+                    fs::rename(temporary, target)
+                }
+            },
+            |wait| elapsed.set(elapsed.get() + wait),
+            || elapsed.get(),
+        )
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(exdev_retry_count() - before, 2);
         fixture.assert_no_temporary();
     }
 
