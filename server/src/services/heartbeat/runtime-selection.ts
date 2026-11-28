@@ -133,6 +133,7 @@ export interface HeartbeatRuntimeSelectionInput {
     persistedExecutionWorkspace: { id: string; companyId?: string; metadata?: Record<string, unknown> | null } | null;
     executionWorkspace: Omit<Parameters<typeof buildNativeExecutionInput>[0]["workspace"], "id">;
     executionTarget: Parameters<typeof prepareNativeWorkspaceSync>[0]["target"];
+    workspaceSnapshot?: Parameters<typeof prepareNativeWorkspaceSync>[0]["workspaceSnapshot"];
     activeEnvironmentLease: (Pick<Parameters<typeof prepareNativeWorkspaceSync>[0], "lease"> & {
       pluginTaskDescription?: PluginTaskDescription;
     }) | null;
@@ -1212,6 +1213,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       companyId: agent.companyId,
       workspaceId: nativeExecutionWorkspaceId,
       workspaceLocalDir: executionWorkspace.cwd,
+      workspaceSnapshot: input.workspace.workspaceSnapshot,
       target: executionTarget,
       lease: activeEnvironmentLease!.lease,
       restartRecovery: runOptions.nativeRestartRecovery,

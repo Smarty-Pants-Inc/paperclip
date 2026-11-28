@@ -2193,9 +2193,18 @@ export function heartbeatService(
       return true;
     };
     let nativeWorkspaceFinalizeScheduled = false;
+    let nativeWorkspaceSnapshot: Awaited<ReturnType<typeof prepareHeartbeatWorkspace>>["nativeWorkspaceSnapshot"];
+    let preparationFailure: { error: unknown } | undefined;
     let nativeWorkspaceSync: Awaited<
       ReturnType<typeof prepareNativeWorkspaceSync>
     > = null;
+    const onWorkspaceSyncPhase = async <T>(name: string, work: () => Promise<T>): Promise<T> => {
+      if (isWorkspaceSyncDetailPhase(name)) return measureWorkspaceSyncPhase(name, work);
+      const started = Date.now();
+      try { return await measureWorkspaceSyncPhase(name, work); }
+      finally { await measureRunPhase("workspace_sync.progress", () => appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info",
+        message: name, payload: { phase: name, durationMs: Date.now() - started } })); }
+    };
     let requiredWorkspaceRestoreEvidence: Record<string, unknown> | null = null;
     let providerResourceDispositionForRun:
       ProviderResourceDisposition | undefined;
@@ -2986,6 +2995,7 @@ export function heartbeatService(
       let preparedSession = await prepareSession();
       const prepareWorkspace = () => timePreparation("workspace", () => prepareHeartbeatWorkspace(db, {
         run, agent, controllerLease, nativeRunnerPreparationSpans, signal: executionControl.controller.signal,
+        onWorkspaceSnapshotPhase: onWorkspaceSyncPhase,
         task: {
           issueRef,
           issueId,
@@ -3054,6 +3064,7 @@ export function heartbeatService(
         preparedSession = await prepareSession();
         preparedWorkspace = await prepareWorkspace();
       }
+      nativeWorkspaceSnapshot = preparedWorkspace.nativeWorkspaceSnapshot;
       const {
         persistedRunnerProfile,
         persistedNativeExecutionInput,
@@ -3673,17 +3684,12 @@ export function heartbeatService(
             activeEnvironmentLease,
             isDotRun,
             projectRepositoryPaths,
+            workspaceSnapshot: nativeWorkspaceSnapshot,
             onCheckpoint: async (metrics) => {
               await appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info",
                 message: "workspace_checkpoint", payload: { phase: "workspace_checkpoint", ...metrics } });
             },
-            onPhase: async (name, work) => {
-              if (isWorkspaceSyncDetailPhase(name)) return measureWorkspaceSyncPhase(name, work);
-              const started = Date.now();
-              try { return await measureWorkspaceSyncPhase(name, work); }
-              finally { await measureRunPhase("workspace_sync.progress", () => appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info",
-                message: name, payload: { phase: name, durationMs: Date.now() - started } })); }
-            },
+            onPhase: onWorkspaceSyncPhase,
           },
           config: {
             runtimeConfig,
@@ -3901,6 +3907,10 @@ export function heartbeatService(
           issueContext, onLog,
         }));
       } catch (err) {
+        if (nativeWorkspaceSnapshot) {
+          preparationFailure ??= nativeWorkspaceSnapshot.failure ?? { error: err };
+          err = preparationFailure.error;
+        }
         if (err instanceof ConfigurationSupersededFailure) throw err;
         await persistUsageCaptureFailure?.();
         const agentDirectoryDeferral = await deferRunForBusyAgentDirectory(db, {
@@ -4086,6 +4096,10 @@ export function heartbeatService(
         if (failed?.preserveFailedWorkspace) await preserveNativeWorkspaceOnFailure();
       }
     } catch (outerErr) {
+      if (nativeWorkspaceSnapshot) {
+        preparationFailure ??= nativeWorkspaceSnapshot.failure ?? { error: outerErr };
+        outerErr = preparationFailure.error;
+      }
       if (outerErr instanceof ConfigurationSupersededFailure) {
         configurationSuperseded = !legacyAdapterEntered && !nativeDispatchStarted && !nativeOwnershipHeld &&
           !runOptions.nativeLeaseOwner && !runOptions.nativeRestartRecovery && await parkConfigurationSupersession(db, run);
@@ -4168,6 +4182,9 @@ export function heartbeatService(
             logger.warn({ err: error, runId: run.id }, "Failed native recovery preparation could not be settled"));
       }
     } finally {
+      // This also joins a still-running unused host job on cancellation or a
+      // failed preparation. Consumed snapshots follow native runtime finalization.
+      await nativeWorkspaceSnapshot?.cleanupUnused().catch(err => logger.warn({ runId: run.id, err }, "Unused workspace snapshot cleanup failed"));
       let caseHandoffCleanupSettled = false;
       let failedProcessCancellationSeen = failedProcessRunCancellations.has(run.id);
       await instructionWorkingCopy?.nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));

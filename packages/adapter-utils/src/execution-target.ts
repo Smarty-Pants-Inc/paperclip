@@ -22,6 +22,7 @@ import {
 } from "./remote-managed-runtime.js";
 import type {
   AdditionalSourceStagingFailure,
+  PreparedSandboxWorkspaceSnapshot,
   SandboxAdditionalSource,
   WorkspaceDurableSeedPaths,
   WorkspaceInboundMode,
@@ -1530,6 +1531,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   retainRuntime?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
   workspaceSnapshotIsolation?: "worker";
+  workspaceSnapshot?: PreparedSandboxWorkspaceSnapshot;
   workspaceGitIndexRefresh?: boolean;
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceCheckpoint?: boolean;
@@ -1631,6 +1633,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     syncWorkspace,
     workspaceInboundMode: input.workspaceInboundMode,
     workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
+    workspaceSnapshot: input.workspaceSnapshot,
     workspaceGitIndexRefresh: input.workspaceGitIndexRefresh,
     workspaceDurableSeed: input.workspaceDurableSeed,
     workspaceCheckpoint: input.workspaceCheckpoint,

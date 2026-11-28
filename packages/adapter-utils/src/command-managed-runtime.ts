@@ -7,6 +7,7 @@ import {
   createTarballFromDirectory,
   prepareSandboxManagedRuntime,
   type PreparedSandboxManagedRuntime,
+  type PreparedSandboxWorkspaceSnapshot,
   type SandboxAdditionalSource,
   type SandboxManagedRuntimeAsset,
   type SandboxManagedRuntimeClient,
@@ -555,6 +556,7 @@ export async function prepareCommandManagedRuntime(input: {
   syncWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
   workspaceSnapshotIsolation?: "worker";
+  workspaceSnapshot?: PreparedSandboxWorkspaceSnapshot;
   workspaceGitIndexRefresh?: boolean;
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
   workspaceCheckpoint?: boolean;
@@ -632,6 +634,7 @@ export async function prepareCommandManagedRuntime(input: {
           syncWorkspace: input.syncWorkspace,
           workspaceInboundMode: input.workspaceInboundMode,
           workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
+          workspaceSnapshot: input.workspaceSnapshot,
           workspaceGitIndexRefresh: input.workspaceGitIndexRefresh,
           workspaceDurableSeed: input.workspaceDurableSeed,
           workspaceCheckpoint: input.workspaceCheckpoint,
@@ -686,6 +689,7 @@ export async function prepareCommandManagedRuntime(input: {
     syncWorkspace: input.syncWorkspace,
     workspaceInboundMode: input.workspaceInboundMode,
     workspaceSnapshotIsolation: input.workspaceSnapshotIsolation,
+    workspaceSnapshot: input.workspaceSnapshot,
     workspaceGitIndexRefresh: input.workspaceGitIndexRefresh,
     workspaceDurableSeed: input.workspaceDurableSeed,
     workspaceCheckpoint: input.workspaceCheckpoint,

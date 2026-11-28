@@ -1275,6 +1275,140 @@ function makeTransferProgress(
   };
 }
 
+export interface SandboxWorkspaceSnapshotInput {
+  workspaceLocalDir: string;
+  syncWorkspace?: boolean;
+  workspaceSnapshotIsolation?: "worker";
+  workspaceBaseline?: DirectorySnapshot;
+  workspaceGitSnapshot?: GitWorkspaceSnapshot | null;
+  workspaceRepositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
+  workspaceExclude?: string[];
+  workspaceFileMode?: "all";
+  preserveAbsentOnRestore?: string[];
+  runtimeSpan?: RuntimeSpanRunner;
+}
+
+export interface PreparedSandboxWorkspaceSnapshot {
+  sourcePath: string;
+  syncWorkspace: boolean;
+  workspaceRoot: WorkspaceSourceRoot | null;
+  gitSnapshot: GitWorkspaceSnapshot | null;
+  repositories: NonNullable<GitWorkspaceSnapshot["repositories"]>;
+  repositoryMetadataExcludes: string[];
+  workspaceArchiveExclude: string[];
+  workspaceRestoreExclude: string[];
+  ignoredPaths: WorkspacePaths | undefined;
+  deletedPaths: WorkspacePaths;
+  baselineSnapshot: DirectorySnapshot | null;
+  cleanupWorkspaceSnapshot(): Promise<void>;
+  /** Set only when the managed runtime takes ownership of the manifests. */
+  retainedByRuntime: boolean;
+}
+
+/** Host-only half of workspace preparation. The caller owns cleanup until the
+ * prepared runtime takes over; it must also clean an unused result on failure.
+ * No client, spec, lease, or remote path is needed to capture these inputs. */
+export async function prepareSandboxWorkspaceSnapshot(input: SandboxWorkspaceSnapshotInput): Promise<PreparedSandboxWorkspaceSnapshot> {
+  return captureSandboxWorkspaceSnapshot(input, await canSyncSandboxWorkspace(input));
+}
+
+async function canSyncSandboxWorkspace(input: SandboxWorkspaceSnapshotInput): Promise<boolean> {
+  // A missing host directory has nothing to sync. Other access failures remain fatal.
+  return input.syncWorkspace !== false && await fs.access(input.workspaceLocalDir).then(
+    () => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; },
+  );
+}
+
+async function captureSandboxWorkspaceSnapshot(input: SandboxWorkspaceSnapshotInput, syncWorkspace: boolean): Promise<PreparedSandboxWorkspaceSnapshot> {
+  const sourcePath = input.workspaceLocalDir;
+  const captureWorkspaceSnapshot = input.workspaceSnapshotIsolation === "worker"
+    ? captureDirectorySnapshotOffThread : captureDirectorySnapshot;
+  const runStepSpan = <T>(name: string, work: () => Promise<T>): Promise<T> =>
+    input.runtimeSpan ? input.runtimeSpan(name, work) : work();
+  // Resolve aliases once; archive staging later verifies this captured identity.
+  const workspaceRoot = syncWorkspace ? await runStepSpan("workspace.source_root", () => captureWorkspaceSourceRoot(input.workspaceLocalDir)) : null;
+  if (workspaceRoot) input = { ...input, workspaceLocalDir: workspaceRoot.sourceDir };
+  const gitSnapshot = syncWorkspace && (input.workspaceGitSnapshot !== undefined || input.workspaceFileMode !== "all")
+    ? input.workspaceGitSnapshot !== undefined ? input.workspaceGitSnapshot
+      : await runStepSpan("snapshot.git", () => readGitWorkspaceSnapshot(input.workspaceLocalDir))
+    : null;
+  const repositories = gitSnapshot ? (gitSnapshot.repositories ?? []) : input.workspaceRepositories ?? (syncWorkspace ? await runStepSpan("workspace.repositories", () => readManagedWorkspaceRepositories(input.workspaceLocalDir)) : []);
+  const repositoryGitPaths = (children: typeof repositories, prefix = ""): string[] => children.flatMap(repo => {
+    const relative = prefix ? `${prefix}/${repo.path}` : repo.path;
+    return [`${relative}/.git`, ...repositoryGitPaths(repo.snapshot.repositories ?? [], relative)];
+  });
+  const repositoryMetadataExcludes = repositoryGitPaths(repositories);
+  const repositoryStagingExcludes = syncWorkspace ? await listProjectRepositoryStagingPaths(input.workspaceLocalDir) : [];
+  let managedIgnored: Awaited<ReturnType<typeof createWorkspaceManifest>> | null = null;
+  let ignoredPaths = input.workspaceFileMode === "all" ? undefined : gitSnapshot?.ignoredPaths;
+  if (!gitSnapshot && repositories.length) {
+    managedIgnored = await createWorkspaceManifest();
+    for (const repo of repositories) {
+      if (input.workspaceFileMode !== "all") for (const relative of workspacePaths(repo.snapshot.ignoredPaths)) managedIgnored.add("ignored", `${repo.path}/${relative}`);
+      for (const relative of workspacePaths(repo.snapshot.deletedPaths)) managedIgnored.add("deleted", `${repo.path}/${relative}`);
+    }
+    ignoredPaths = managedIgnored.paths("ignored");
+  }
+  let deletedPaths = gitSnapshot?.deletedPaths ?? managedIgnored?.paths("deleted") ?? [];
+  let filesystemDeleted: Awaited<ReturnType<typeof createWorkspaceManifest>> | null = null;
+  managedIgnored?.close();
+  let baselineSnapshot: DirectorySnapshot | null = null;
+  const cleanupWorkspaceSnapshot = async () => {
+    await disposeDirectorySnapshot(baselineSnapshot);
+    if (input.workspaceBaseline && input.workspaceBaseline !== baselineSnapshot) await disposeDirectorySnapshot(input.workspaceBaseline);
+    await disposeGitWorkspaceSnapshot(gitSnapshot);
+    if (!gitSnapshot) for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
+    if (managedIgnored) await fs.rm(path.dirname(managedIgnored.filePath), { recursive: true, force: true });
+    if (filesystemDeleted) await fs.rm(path.dirname(filesystemDeleted.filePath), { recursive: true, force: true });
+  };
+  try {
+    // Subfolders retain the parent repository's ignore rules.
+    const directoryIgnore = syncWorkspace && !gitSnapshot && input.workspaceFileMode !== "all"
+      ? await runStepSpan("workspace.ignore_rules", () => resolveReferencedSourceIgnore(input.workspaceLocalDir)) : null;
+    if (directoryIgnore?.kind === "failed") throw new Error(`Workspace ignore scan failed: ${directoryIgnore.reason}`);
+    const gitIgnoredExcludes = directoryIgnore?.kind === "git" ? directoryIgnore.ignoredPaths : undefined;
+    const workspaceArchiveExclude = mergeExcludes(
+      [".paperclip-runtime"], repositoryMetadataExcludes, repositoryStagingExcludes,
+      input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
+      input.workspaceFileMode === "all" && !gitSnapshot ? [] : [...GIT_ARCHIVE_EXCLUDES],
+      input.workspaceExclude, gitIgnoredExcludes,
+    );
+    const restoreExclude = mergeExcludes(
+      repositoryMetadataExcludes, repositoryStagingExcludes,
+      input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
+      input.workspaceFileMode === "all" && !gitSnapshot ? [] : [...GIT_ARCHIVE_EXCLUDES],
+      [".paperclip-runtime"], input.preserveAbsentOnRestore, input.workspaceExclude, gitIgnoredExcludes,
+    );
+    const workspaceRestoreExclude = mergeExcludes(restoreExclude, repositories.map((repo) => repo.path));
+    baselineSnapshot = syncWorkspace ? input.workspaceBaseline ?? await runStepSpan("snapshot.baseline", () =>
+      captureWorkspaceSnapshot(input.workspaceLocalDir, { exclude: restoreExclude, ignoredPaths, diskBacked: true })) : null;
+    if (input.workspaceBaseline && repositoryMetadataExcludes.length) {
+      baselineSnapshot = await selectDirectorySnapshot(input.workspaceBaseline, {
+        omit: repositoryMetadataExcludes, exclude: mergeExcludes(input.workspaceBaseline.exclude, repositoryMetadataExcludes),
+        ignoredPaths: input.workspaceBaseline.ignoredPaths,
+      });
+    }
+    if (input.workspaceFileMode === "all" && baselineSnapshot
+      && (isPathManifest(deletedPaths) ? deletedPaths.count : deletedPaths.length) > 0) {
+      filesystemDeleted = await createWorkspaceManifest();
+      try {
+        for (const relative of workspacePaths(deletedPaths)) {
+          if (!baselineSnapshot.entries.has(relative)) filesystemDeleted.add("deleted", relative);
+        }
+        deletedPaths = filesystemDeleted.paths("deleted");
+      } finally { filesystemDeleted.close(); }
+    }
+    return { sourcePath, syncWorkspace, workspaceRoot, gitSnapshot, repositories, repositoryMetadataExcludes,
+      workspaceArchiveExclude, workspaceRestoreExclude, ignoredPaths, deletedPaths,
+      baselineSnapshot, cleanupWorkspaceSnapshot, retainedByRuntime: false };
+  } catch (error) {
+    // Disposal is best-effort here; it must not replace the host operation's
+    // first failure while acquisition or another preparation is still running.
+    await cleanupWorkspaceSnapshot().catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function prepareSandboxManagedRuntime(input: {
   spec: SandboxRemoteExecutionSpec;
   adapterKey: string;
@@ -1288,6 +1422,8 @@ export async function prepareSandboxManagedRuntime(input: {
   /** Selects authoritative host staging, exact durable-seed replay, or no-overwrite adoption. */
   workspaceInboundMode?: WorkspaceInboundMode;
   workspaceSnapshotIsolation?: "worker";
+  /** Optional host snapshot captured earlier by this same owner. */
+  workspaceSnapshot?: PreparedSandboxWorkspaceSnapshot;
   /** Fully await a restored Git index refresh inside the existing inbound barrier. */
   workspaceGitIndexRefresh?: boolean;
   workspaceDurableSeed?: WorkspaceDurableSeedPaths;
@@ -1335,28 +1471,8 @@ export async function prepareSandboxManagedRuntime(input: {
       throw new Error("Transfer scratch must remain within the lease runtime tree");
     }
   }
-  // A workspace directory that does not exist on this host has nothing to
-  // stage, no files for ignore rules to govern, and nothing to restore into —
-  // callers that only stage credential assets (the adapter env tests) hand
-  // the runtime a fresh path. Treat that one case as "do not sync" rather
-  // than letting the ignore scan or the staging walk die on ENOENT. Any other
-  // access failure still fails the preparation: a workspace that exists but
-  // cannot be read must not silently become an empty remote workspace.
-  const syncWorkspace = input.syncWorkspace !== false &&
-    (await fs.access(input.workspaceLocalDir).then(
-      () => true,
-      (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return false;
-        throw error;
-      },
-    ));
+  const syncWorkspace = input.workspaceSnapshot?.syncWorkspace ?? await canSyncSandboxWorkspace(input);
   const workspaceInboundMode = input.workspaceInboundMode ?? "host_current";
-  const stageWorkspace =
-    syncWorkspace && workspaceInboundMode !== "adopt_remote";
-  const prepareWorkspaceSeed =
-    syncWorkspace &&
-    workspaceInboundMode === "adopt_remote" &&
-    input.workspaceDurableSeed !== undefined;
   if (workspaceInboundMode === "durable_seed" && !input.workspaceDurableSeed) {
     throw new Error("workspace_durable_seed_missing");
   }
@@ -1384,109 +1500,17 @@ export async function prepareSandboxManagedRuntime(input: {
   const reportWorkspaceStatus = (phase: RuntimeStatusPhase, message: string) =>
     runStepSpan("workspace.progress", () => emitRuntimeStatus(input.onRuntimeProgress, phase, message));
 
-  // Resolve an existing workspace alias once, before reading its snapshot.
-  // All subsequent work uses that root, so retargeting the alias cannot select
-  // another repository. Staging also verifies the captured directory identity.
-  const workspaceRoot = syncWorkspace ? await runStepSpan("workspace.source_root", () => captureWorkspaceSourceRoot(input.workspaceLocalDir)) : null;
+  const preparedSnapshot = input.workspaceSnapshot ?? await captureSandboxWorkspaceSnapshot(input, syncWorkspace);
+  const { workspaceRoot, gitSnapshot, repositories, repositoryMetadataExcludes,
+    workspaceArchiveExclude, workspaceRestoreExclude, ignoredPaths, deletedPaths,
+    baselineSnapshot, cleanupWorkspaceSnapshot } = preparedSnapshot;
+  // From here the runtime's existing restore/cleanup lifetime owns the manifests,
+  // including deferred finalization. The preparation caller cleans only unused results.
+  preparedSnapshot.retainedByRuntime = true;
   if (workspaceRoot) input = { ...input, workspaceLocalDir: workspaceRoot.sourceDir };
-
-  // The git enumeration (`git status --ignored`, the HEAD diffs, `ls-files`).
-  // It reads git's own bookkeeping to decide what to include/exclude, so it is
-  // usually fast, but on a large working tree the `--ignored` walk is not free.
-  const gitSnapshot = syncWorkspace && (input.workspaceGitSnapshot !== undefined || input.workspaceFileMode !== "all")
-    ? input.workspaceGitSnapshot !== undefined
-      ? input.workspaceGitSnapshot
-      : await runStepSpan("snapshot.git", () =>
-          readGitWorkspaceSnapshot(input.workspaceLocalDir),
-        )
-    : null;
-  const repositories = gitSnapshot ? (gitSnapshot.repositories ?? []) : input.workspaceRepositories ?? (syncWorkspace ? await runStepSpan("workspace.repositories", () => readManagedWorkspaceRepositories(input.workspaceLocalDir)) : []);
-  const repositoryGitPaths = (children: typeof repositories, prefix = ""): string[] => children.flatMap(repo => {
-    const relative = prefix ? `${prefix}/${repo.path}` : repo.path;
-    return [`${relative}/.git`, ...repositoryGitPaths(repo.snapshot.repositories ?? [], relative)];
-  });
-  const repositoryMetadataExcludes = repositoryGitPaths(repositories);
-  const repositoryStagingExcludes = syncWorkspace ? await listProjectRepositoryStagingPaths(input.workspaceLocalDir) : [];
-  let managedIgnored: Awaited<ReturnType<typeof createWorkspaceManifest>> | null = null;
-  let ignoredPaths = input.workspaceFileMode === "all" ? undefined : gitSnapshot?.ignoredPaths;
-  if (!gitSnapshot && repositories.length) {
-    managedIgnored = await createWorkspaceManifest();
-    for (const repo of repositories) {
-      if (input.workspaceFileMode !== "all") for (const relative of workspacePaths(repo.snapshot.ignoredPaths)) managedIgnored.add("ignored", `${repo.path}/${relative}`);
-      for (const relative of workspacePaths(repo.snapshot.deletedPaths)) managedIgnored.add("deleted", `${repo.path}/${relative}`);
-    }
-    ignoredPaths = managedIgnored.paths("ignored");
-  }
-  let deletedPaths = gitSnapshot?.deletedPaths ?? managedIgnored?.paths("deleted") ?? [];
-  let filesystemDeleted: Awaited<ReturnType<typeof createWorkspaceManifest>> | null = null;
-  managedIgnored?.close();
-  let baselineSnapshot: DirectorySnapshot | null = null;
-  const cleanupWorkspaceSnapshot = async () => {
-    await disposeDirectorySnapshot(baselineSnapshot);
-    if (input.workspaceBaseline && input.workspaceBaseline !== baselineSnapshot) await disposeDirectorySnapshot(input.workspaceBaseline);
-    await disposeGitWorkspaceSnapshot(gitSnapshot);
-    if (!gitSnapshot) for (const repo of repositories) await disposeGitWorkspaceSnapshot(repo.snapshot);
-    if (managedIgnored) await fs.rm(path.dirname(managedIgnored.filePath), { recursive: true, force: true });
-    if (filesystemDeleted) await fs.rm(path.dirname(filesystemDeleted.filePath), { recursive: true, force: true });
-  };
+  const stageWorkspace = syncWorkspace && workspaceInboundMode !== "adopt_remote";
+  const prepareWorkspaceSeed = syncWorkspace && workspaceInboundMode === "adopt_remote" && input.workspaceDurableSeed !== undefined;
   try {
-  // A selected subfolder has no cloneable Git snapshot, but its parent
-  // repository's ignore rules still govern which files may leave the host.
-  // Use the same bounded, path-relative resolver as referenced project trees.
-  const directoryIgnore = syncWorkspace && !gitSnapshot && input.workspaceFileMode !== "all"
-    ? await runStepSpan("workspace.ignore_rules", () => resolveReferencedSourceIgnore(input.workspaceLocalDir))
-    : null;
-  if (directoryIgnore?.kind === "failed") {
-    throw new Error(`Workspace ignore scan failed: ${directoryIgnore.reason}`);
-  }
-  const gitIgnoredExcludes = directoryIgnore?.kind === "git" ? directoryIgnore.ignoredPaths : undefined;
-  const workspaceArchiveExclude = mergeExcludes(
-    [".paperclip-runtime"],
-    repositoryMetadataExcludes,
-    repositoryStagingExcludes,
-    input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
-    input.workspaceFileMode === "all" && !gitSnapshot ? [] : [...GIT_ARCHIVE_EXCLUDES],
-    input.workspaceExclude,
-    gitIgnoredExcludes,
-  );
-  const restoreExclude = mergeExcludes(
-    repositoryMetadataExcludes,
-    repositoryStagingExcludes,
-    input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
-    input.workspaceFileMode === "all" && !gitSnapshot ? [] : [...GIT_ARCHIVE_EXCLUDES],
-    [".paperclip-runtime"],
-    input.preserveAbsentOnRestore,
-    input.workspaceExclude,
-    gitIgnoredExcludes,
-  );
-  const workspaceRestoreExclude = mergeExcludes(restoreExclude, repositories.map((repo) => repo.path));
-  // The baseline "before" snapshot: a recursive walk of the whole workspace that
-  baselineSnapshot = syncWorkspace
-    ? (input.workspaceBaseline ??
-      (await runStepSpan("snapshot.baseline", () =>
-        captureWorkspaceSnapshot(input.workspaceLocalDir, {
-          exclude: restoreExclude,
-          ignoredPaths,
-          diskBacked: true,
-        }),
-      )))
-    : null;
-  if (input.workspaceBaseline && repositoryMetadataExcludes.length) {
-    baselineSnapshot = await selectDirectorySnapshot(input.workspaceBaseline, {
-      omit: repositoryMetadataExcludes, exclude: mergeExcludes(input.workspaceBaseline.exclude, repositoryMetadataExcludes),
-      ignoredPaths: input.workspaceBaseline.ignoredPaths,
-    });
-  }
-  if (input.workspaceFileMode === "all" && baselineSnapshot
-    && (isPathManifest(deletedPaths) ? deletedPaths.count : deletedPaths.length) > 0) {
-    filesystemDeleted = await createWorkspaceManifest();
-    try {
-      for (const relative of workspacePaths(deletedPaths)) {
-        if (!baselineSnapshot.entries.has(relative)) filesystemDeleted.add("deleted", relative);
-      }
-      deletedPaths = filesystemDeleted.paths("deleted");
-    } finally { filesystemDeleted.close(); }
-  }
 
   const seedGeneration = input.workspaceSeedCacheDirectory && baselineSnapshot && workspaceInboundMode !== "durable_seed"
     ? await runStepSpan("workspace.seed_generation", async () => workspaceSeedGeneration(baselineSnapshot!, gitSnapshot, repositories, input.workspaceSeedCacheScope)) : null;

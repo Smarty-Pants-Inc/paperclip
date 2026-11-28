@@ -1,5 +1,6 @@
 import { NATIVE_REMOTE_RECOVERY_LEASE_MISMATCH, remoteRecoveryLeaseMismatch } from "../native-runtime/remote-recovery-lease-mismatch.js";
 import { readInheritedRunnerRetainedSandbox } from "../native-runtime/native-inherited-runner-retry.js";
+import { prepareNativeWorkspaceSnapshot } from "../native-runtime/native-workspace-sync.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
 import { assertEphemeralWorkspaceExecution, readRemoteWorkspaceAuthority, RemoteWorkspaceWriterActiveError, reserveRemoteWorkspace, shouldUseRemoteWorkspaces } from "../remote-workspaces.js";
 import { assertProjectStorageEnvironment, listProjectWorkspaceProviders } from "../project-workspace-provider.js";
@@ -57,8 +58,10 @@ import { parseObject } from "../../adapters/utils.js";
 import { materializeNativeChatTaskRoot } from "../native-runtime/native-chat-workspace.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
 import { withIndependentWorkspaceSourceLocks } from "../workspace-source-lock.js";
+import { canonicalRepositoryRoot } from "../execution-workspace-source-roots.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
+  listConfiguredRuntimeServiceEntries,
   ensurePersistedExecutionWorkspaceAvailable,
   realizeExecutionWorkspace,
   renderWorkspaceTemplate, sanitizeBranchName,
@@ -113,6 +116,7 @@ export class RetryWorkspaceRefused extends Error {}
 /** Prepares the workspace and environment; dispatch and terminal lease release stay with the caller. */
 export interface HeartbeatWorkspacePreparationInput {
   signal?: AbortSignal;
+  onWorkspaceSnapshotPhase?: Parameters<typeof prepareNativeWorkspaceSnapshot>[1];
   run: typeof heartbeatRuns.$inferSelect;
   agent: typeof agents.$inferSelect;
   task: {
@@ -1501,13 +1505,14 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       realizationResult: { remoteExecution: null, executionTarget: null, persistedExecutionWorkspace: null,
         lease: null, workspaceRealization: null },
       environmentRealizeEndedAtMs: Date.now(), workspaceRealization: null,
-      executionTarget: null, workspaceRestoreSource: null,
+      executionTarget: null, workspaceRestoreSource: null, nativeWorkspaceSnapshot: undefined,
     };
   }
   const environmentAcquireStartedAtMs = workspaceAcquireStartedAtMs ?? Date.now();
   let acquiredEnvironment: Awaited<
     ReturnType<typeof envOrchestrator.acquireForRun>
   >;
+  let nativeWorkspaceSnapshot: ReturnType<typeof prepareNativeWorkspaceSnapshot> | undefined;
   try {
     await controllerLease.assertOwned();
     const remoteRecovery = runOptions.nativeRestartRecovery?.kind === "reattach_remote_runner"
@@ -1544,6 +1549,39 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     };
     if (workspaceAcquisition && workspaceAcquisition.lease.executionWorkspaceId !== persistedExecutionWorkspace?.id)
       throw new Error("Workspace Launcher lease changed before task admission");
+    // Only the admitted host-copy Pi lane has stable server-disk inputs here.
+    // No guessed lease/target, recovery seed, or remote-authoritative path enters
+    // the host snapshot owner. Its rejection is observed immediately, even while
+    // acquisition is in flight. Success hands the job to heartbeat; failures
+    // join it here before releasing the workspace-preparation owner.
+    if (!workspaceAcquisition && !controllerOnly && !remoteAuthority && issueRef
+      && selectedEnvironmentForConfig?.driver === "sandbox"
+      && agent.adapterType === "paperclip_runner" && mergedConfig.provider === "pi_rpc"
+      && parseObject(agent.adapterConfig).provider === "pi_rpc"
+      && resolvedInstanceSettings.experimental.enableNativeRunner === true
+      // A later Core service/provision command may generate host workspace files.
+      && listConfiguredRuntimeServiceEntries(hostExecutionWorkspaceConfig).length === 0
+      && !runOptions.nativeRestartRecovery && !runOptions.nativeLeaseOwner
+      && !persistedNativeExecutionInput && !parseObject(run.runnerProfileJson).nativeWorkspaceSync) {
+      // Instructions may retire/collect a prior owner after acquire. Those
+      // writes belong to managed agent storage, not the task workspace. Reject
+      // aliases/ancestors in either direction, including not-yet-created roots;
+      // an unprovable identity simply keeps the original serial road.
+      const roots = await Promise.all([
+        canonicalRepositoryRoot(executionWorkspace.cwd),
+        canonicalRepositoryRoot(path.join(resolvePaperclipInstanceRoot(), "companies", agent.companyId, "agents", agent.id)),
+      ]).catch(() => null);
+      await controllerLease.assertOwned();
+      if (roots) {
+        const within = (root: string, candidate: string) => {
+          const relative = path.relative(root, candidate);
+          return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+        };
+        if (!within(roots[0], roots[1]) && !within(roots[1], roots[0])) {
+          nativeWorkspaceSnapshot = prepareNativeWorkspaceSnapshot(executionWorkspace.cwd, input.onWorkspaceSnapshotPhase);
+        }
+      }
+    }
     acquiredEnvironment = workspaceAcquisition ?? await timeWorkspace("workspace_environment_acquire", () => acquireRetainedOrNew({
       ...environmentAcquisitionInput(persistedExecutionWorkspace, executionWorkspace.projectId, executionWorkspace.additionalWorkspaces),
       ...(pluginRecovery ? { reattachRemoteLease: pluginRecovery } : sandboxRecovery && (recoveryWorkspace || remoteRecoveryLocation) ? { reattachRemoteLease: {
@@ -1561,6 +1599,9 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       attributes: { adapter: agent.adapterType },
     });
   } catch (error) {
+    const firstPreparationFailure = nativeWorkspaceSnapshot?.failure ?? { error };
+    // Acquisition cannot abandon the snapshot worker or its disk-backed manifests.
+    await nativeWorkspaceSnapshot?.cleanupUnused().catch(cleanupError => logger.warn({ runId: run.id, err: cleanupError }, "Unused workspace snapshot cleanup failed"));
     nativeRunnerPreparationSpans.push({
       name: "environment.acquire",
       parentName: "task.provider_session",
@@ -1569,8 +1610,11 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       outcome: "failed",
       attributes: { adapter: agent.adapterType },
     });
-    throw error;
+    throw firstPreparationFailure.error;
   }
+  // Leave the host job running beside realization and later preparation. Its
+  // consumer joins it in native workspace sync; failure exits drain it below.
+  try {
   const selectedEnvironment = acquiredEnvironment.environment;
   assertAllowedEnvironment(selectedEnvironment);
   let activeEnvironmentLease = {
@@ -1750,5 +1794,11 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     workspaceRealization,
     executionTarget,
     workspaceRestoreSource,
+    nativeWorkspaceSnapshot,
   };
+  } catch (error) {
+    const firstPreparationFailure = nativeWorkspaceSnapshot?.failure ?? { error };
+    await nativeWorkspaceSnapshot?.cleanupUnused().catch(cleanupError => logger.warn({ runId: run.id, err: cleanupError }, "Unused workspace snapshot cleanup failed"));
+    throw firstPreparationFailure.error;
+  }
 }

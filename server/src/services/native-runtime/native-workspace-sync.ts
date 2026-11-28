@@ -2,7 +2,7 @@ import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js
 import { hasMigratedLegacyWorkspaceSource } from "../legacy-workspace-recovery-migration.js";
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
 import { notifyEnvironmentCleanup } from "../environment-cleanup-notifications.js";
-import { measureRunPhase } from "../execution-preparation-timing.js";
+import { measureRunPhase, measureWorkspaceSyncPhase } from "../execution-preparation-timing.js";
 import { emitStartupReuse, type StartupReuseReason } from "@paperclipai/adapter-utils/startup-reuse";
 import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import type { WorkspaceCheckpointMetrics } from "@paperclipai/adapter-utils/workspace-checkpoint";
@@ -30,9 +30,11 @@ import {
   type DirectorySnapshot,
   type SerializedDirectorySnapshot,
 } from "@paperclipai/adapter-utils/workspace-restore-merge";
-import type {
-  WorkspaceDurableSeedPaths,
-  WorkspaceInboundMode,
+import {
+  prepareSandboxWorkspaceSnapshot,
+  type PreparedSandboxWorkspaceSnapshot,
+  type WorkspaceDurableSeedPaths,
+  type WorkspaceInboundMode,
 } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import { assertWorkspaceManifestDiskSpace, isPathManifest, manifestFileSha256, readManifestRecords, type PathManifest, type WorkspacePaths } from "@paperclipai/adapter-utils/workspace-manifest";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
@@ -804,6 +806,31 @@ function finalizedWorkspaceStamp(input: {
   };
 }
 
+export interface NativeWorkspaceSnapshotPreparation {
+  result: Promise<PreparedSandboxWorkspaceSnapshot>;
+  failure: { error: unknown } | null;
+  cleanupUnused(): Promise<void>;
+}
+
+/** The fresh sandbox lane may capture these server-disk inputs while acquiring
+ * its lease. The preparation owner joins unused work on every exit, while a
+ * consumed snapshot follows the runtime's existing (possibly deferred) lifetime. */
+export function prepareNativeWorkspaceSnapshot(workspaceLocalDir: string, onPhase: RuntimeSpanRunner = measureWorkspaceSyncPhase): NativeWorkspaceSnapshotPreparation {
+  let failure: NativeWorkspaceSnapshotPreparation["failure"] = null;
+  const result = prepareSandboxWorkspaceSnapshot({ workspaceLocalDir, workspaceSnapshotIsolation: "worker", runtimeSpan: onPhase })
+    .catch(error => { failure = { error }; throw error; });
+  // Install the rejection observer at start, not at the later runtime join.
+  void result.catch(() => undefined);
+  return {
+    result,
+    get failure() { return failure; },
+    cleanupUnused: async () => {
+      const snapshot = await result.catch(() => undefined);
+      if (snapshot && !snapshot.retainedByRuntime) await snapshot.cleanupWorkspaceSnapshot();
+    },
+  };
+}
+
 async function prepareRuntime(input: {
   runId: string;
   target: Extract<AdapterExecutionTarget, { transport: "sandbox" }>;
@@ -815,6 +842,7 @@ async function prepareRuntime(input: {
   durableSeed?: WorkspaceDurableSeedPaths;
   seedCacheDirectory?: string;
   seedCacheCompanyDirectory?: string;
+  workspaceSnapshot?: PreparedSandboxWorkspaceSnapshot;
   workspaceGitIndexRefresh?: boolean;
   onPhase?: RuntimeSpanRunner;
   onCheckpoint?: (metrics: WorkspaceCheckpointMetrics) => Promise<void>;
@@ -832,6 +860,7 @@ async function prepareRuntime(input: {
     workspaceRemoteDir: input.target.remoteCwd,
     workspaceInboundMode: input.mode,
     workspaceSnapshotIsolation: "worker",
+    workspaceSnapshot: input.workspaceSnapshot,
     workspaceGitIndexRefresh: input.workspaceGitIndexRefresh,
     workspaceDurableSeed: input.durableSeed,
     workspaceBaseline: input.baseline,
@@ -900,6 +929,7 @@ export async function prepareNativeWorkspaceSync(input: {
   companyId: string;
   workspaceId: string;
   workspaceLocalDir: string;
+  workspaceSnapshot?: NativeWorkspaceSnapshotPreparation;
   target: AdapterExecutionTarget | null;
   lease: EnvironmentLease;
   restartRecovery?: NativeRestartRecoveryClaim;
@@ -1015,6 +1045,9 @@ export async function prepareNativeWorkspaceSync(input: {
     });
     const seedCacheCompanyDirectory = path.join(resolvePaperclipInstanceRoot(), STATE_ROOT_NAME, "generations", requireSafeSegment(input.companyId, "company_id"));
     const seedCacheDirectory = path.join(seedCacheCompanyDirectory, "shared-v1");
+    // Join the host-only work at its original consumer, never before realize or
+    // instructions. Acquired mode, warm stamp, and all writes stay with this owner.
+    const workspaceSnapshot = await input.workspaceSnapshot?.result;
     runtime = await prepareRuntime({
       runId: input.runId,
       target,
@@ -1024,6 +1057,10 @@ export async function prepareNativeWorkspaceSync(input: {
       mode,
       seedCacheCompanyDirectory,
       seedCacheDirectory,
+      // An in-place realization or rebound source must not consume a host-copy
+      // snapshot. The caller still owns cleanup of an unused early result.
+      workspaceSnapshot: workspaceSnapshot?.sourcePath === input.workspaceLocalDir
+        && target.workspaceRealization?.mode !== "in_place" ? workspaceSnapshot : undefined,
       workspaceGitIndexRefresh: input.workspaceGitIndexRefresh === true
         && acquisition === "created" && mode === "host_current"
         && !input.restartRecovery && !input.sameRunRecovery,
