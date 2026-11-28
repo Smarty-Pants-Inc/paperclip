@@ -244,6 +244,28 @@ function assertSuspendedRunnerState(
   }
 }
 
+/** Cold continuation may also retire an exited Runner's settled bootstrap failure.
+ * Keep suspension-only callers (in particular close) on their stricter guard.
+ * Remote process-exit authority remains the embedding server's prerequisite.
+ */
+function assertColdRestorableRunnerState(
+  state: Record<string, unknown>,
+  expected: DurableRecoveryIdentity,
+): void {
+  const failure = typeof state.recoverableFailure === "string" ? state.recoverableFailure
+    : typeof state.recoverable_failure === "string" ? state.recoverable_failure : null;
+  if (state.lifecycle === "recoverable_failure"
+    && state.schema === "paperclip.runner.durable.state.v1"
+    && recoveryIdentityMatches(state, expected)
+    && [expected.runnerInstanceId, expected.environmentLeaseId, expected.runId,
+      expected.normalizedSessionId, expected.turnId, expected.itemId].every(value => typeof value === "string" && value.length > 0)
+    && ["lease_expired_requires_bootstrap", "transport_reconnect_deadline_exceeded", "transport_reconnect_grace_exceeded"]
+      .includes(failure ?? "")
+    && Array.isArray(state.outbox) && state.outbox.length === 0
+    && state.pendingTerminalDelivery === null && state.pendingProviderCleanup == null && state.warmTransition == null) return;
+  assertSuspendedRunnerState(state, expected);
+}
+
 export function isSettledReleasedRunnerCut(
   state: Record<string, unknown>,
   expected: DurableRecoveryIdentity,
@@ -461,7 +483,7 @@ function localRunnerStateArchive(root: string): RunnerStateArchive {
         "runner-state.json",
       );
       if (existsSync(live)) {
-        assertSuspendedRunnerState(readLive(), priorIdentity);
+        assertColdRestorableRunnerState(readLive(), priorIdentity);
         if (!existsSync(archived)) {
           renameSync(live, archived);
         } else if (sameRegularFile(live, archived)) {
@@ -527,7 +549,7 @@ async function rotateAuthorityEpoch(
       priorIdentity,
     );
   } else {
-    if (!runnerState.archivedByLaunch) assertSuspendedRunnerState(await runnerState.read(), priorIdentity);
+    if (!runnerState.archivedByLaunch) assertColdRestorableRunnerState(await runnerState.read(), priorIdentity);
     if (!existsSync(activeControlPlane)) {
       throw new Error("native_runner_authority_archive_incomplete");
     }
@@ -539,7 +561,7 @@ async function rotateAuthorityEpoch(
     archiveKey: basename(archive).replace(/^epoch-/, ""),
     priorIdentity,
   });
-  assertSuspendedRunnerState(archivedRunnerState, priorIdentity);
+  assertColdRestorableRunnerState(archivedRunnerState, priorIdentity);
   return resumedState ?? controlPlaneState;
 }
 
@@ -7075,11 +7097,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (!this.options.adoptExistingRunner) {
         if (localStateOwner) {
           if (!candidateRunnerState) throw new Error("native_runner_authority_rotation_state_unavailable");
-          assertSuspendedRunnerState(candidateRunnerState, identity);
+          assertColdRestorableRunnerState(candidateRunnerState, identity);
         } else {
           if (!this.options.readRunnerState || !this.options.prepareExternalRunnerState) throw new Error("native_runner_prp_run_rotation_unavailable");
           await this.options.prepareExternalRunnerState();
-          assertSuspendedRunnerState(await this.options.readRunnerState(), identity);
+          assertColdRestorableRunnerState(await this.options.readRunnerState(), identity);
         }
       }
       sourceAttachmentTarget = queuedSourceAttachment ? null : desiredIdentity;
