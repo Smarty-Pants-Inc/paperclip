@@ -143,6 +143,28 @@ describe("workspace restore merge", () => {
     ).resolves.toBe("ssh codex\n");
   });
 
+  it("never deletes outside the target through a parent directory replaced by a symlink", async () => {
+    const rootDir = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-symlink-parent-")));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const sourceDir = path.join(rootDir, "source");
+    const outsideDir = path.join(rootDir, "outside");
+    await mkdir(path.join(targetDir, "a"), { recursive: true });
+    await mkdir(sourceDir);
+    await mkdir(outsideDir);
+    await writeFile(path.join(targetDir, "a", "b.txt"), "same bytes");
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked: true });
+    try {
+      await rm(path.join(targetDir, "a"), { recursive: true });
+      await writeFile(path.join(outsideDir, "b.txt"), "same bytes");
+      await symlink(outsideDir, path.join(targetDir, "a"));
+      await writeFile(path.join(sourceDir, "other.txt"), "sandbox change");
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+      expect(await readFile(path.join(outsideDir, "b.txt"), "utf8")).toBe("same bytes");
+      expect(await readFile(path.join(targetDir, "other.txt"), "utf8")).toBe("sandbox change");
+    } finally { await disposeDirectorySnapshot(baseline); }
+  });
+
   it("preserves a host file replacing a deleted baseline directory and continues the restore", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-conflict-"));
     cleanupDirs.push(rootDir);
