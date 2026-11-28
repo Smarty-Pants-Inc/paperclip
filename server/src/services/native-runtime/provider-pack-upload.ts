@@ -75,11 +75,13 @@ export async function uploadVerifiedProviderPack(input: {
     await input.stageDirectory(source.root);
   });
   await measure("provider_pack.verify_uploaded", input.verifyUploaded);
-  // Smarty seam: trees that e1e16dd3 (reverted) renamed aside are deleted once, off the run's path; nothing creates them any more.
+  // Smarty seam: trees that e1e16dd3 (reverted) renamed aside are deleted once (nothing creates them any more), inside
+  // this step with a short budget so no command outlives it; a failure only warns.
   const leftovers = `${posix.basename(input.targetPath).replace(/[\\*?[\]]/g, "\\$&")}.stale-*`;
-  void input.runner.execute({ command: "sh", args: ["-c",
-    `find ${quote(posix.dirname(input.targetPath))} -mindepth 1 -maxdepth 1 -name ${quote(leftovers)} -exec rm -rf -- {} +`],
-  cwd: input.cwd, bypassSession: true, timeoutMs: 300_000 }).then(result => {
+  const directory = quote(posix.dirname(input.targetPath));
+  await input.runner.execute({ command: "sh", args: ["-c",
+    `[ -z "$(find ${directory} -mindepth 1 -maxdepth 1 -name ${quote(leftovers)} -print -quit)" ] || find ${directory} -mindepth 1 -maxdepth 1 -name ${quote(leftovers)} -exec rm -rf -- {} +`],
+  cwd: input.cwd, bypassSession: true, timeoutMs: 60_000 }).then(result => {
     if (result.exitCode !== 0 || result.timedOut) logger.warn({ pack: posix.basename(input.targetPath) }, "Old renamed provider packs were not removed; continuing");
   }, () => { logger.warn({ pack: posix.basename(input.targetPath) }, "Old renamed provider packs were not removed; continuing"); });
 }
