@@ -498,7 +498,13 @@ function validWebBinding(facts: Awaited<ReturnType<typeof databaseFacts>>, web: 
       || !Array.isArray(web.skills) || !Array.isArray(web.excluded)
       || web.entries.length + web.excluded.length > NATIVE_CONTROLLER_WEB_LIMITS.entries
       || digest(web.skills) !== digest(webSkills(facts))) return false;
-    const profiles = webProfile(facts), manifests = new Map(web.skills.map(skill => [skill.bundleDigest, skill.manifestDigest]));
+    let profiles = webProfile(facts);
+    const manifests = new Map(web.skills.map(skill => [skill.bundleDigest, skill.manifestDigest]));
+    // C99 (smarty-dev#4605): a pi_rpc receipt written before the runner directory left the session's tool stores out
+    // of its save is checked against the profile it was written under (the same directories, no exclusions).
+    const beforePiExclusions = resolveNativeHarnessPersistenceProfile(facts.execution).providerKind === "pi_rpc"
+      ? profiles.map(profile => profile.name === "runner" ? { ...profile, excludeEntries: [] } : profile) : null;
+    if (beforePiExclusions && web.profileDigest === digest(beforePiExclusions)) profiles = beforePiExclusions;
     const profileDigest = digest(profiles);
     if (web.profileDigest !== profileDigest && !(resolveNativeHarnessPersistenceProfile(facts.execution).providerKind === "codex"
       && profileDigest === CODEX_WEB_PROFILE_WITH_AUTH_REFRESH
