@@ -1,4 +1,6 @@
+import { posix } from "node:path";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import { logger } from "../../middleware/logger.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { readProviderPackArchive, stageProviderPackArchive } from "./provider-pack-archive.js";
 import type { ProviderPackIdentity } from "./remote-provider-pack-verification.js";
@@ -73,4 +75,11 @@ export async function uploadVerifiedProviderPack(input: {
     await input.stageDirectory(source.root);
   });
   await measure("provider_pack.verify_uploaded", input.verifyUploaded);
+  // Smarty seam: trees that e1e16dd3 (reverted) renamed aside are deleted once, off the run's path; nothing creates them any more.
+  const leftovers = `${posix.basename(input.targetPath).replace(/[\\*?[\]]/g, "\\$&")}.stale-*`;
+  void input.runner.execute({ command: "sh", args: ["-c",
+    `find ${quote(posix.dirname(input.targetPath))} -mindepth 1 -maxdepth 1 -name ${quote(leftovers)} -exec rm -rf -- {} +`],
+  cwd: input.cwd, bypassSession: true, timeoutMs: 300_000 }).then(result => {
+    if (result.exitCode !== 0 || result.timedOut) logger.warn({ pack: posix.basename(input.targetPath) }, "Old renamed provider packs were not removed; continuing");
+  }, () => { logger.warn({ pack: posix.basename(input.targetPath) }, "Old renamed provider packs were not removed; continuing"); });
 }
