@@ -811,8 +811,13 @@ export async function mergeDirectoryWithBaseline(input: {
       }
       // Strict preflight must see excluded children before a directory is
       // replaced. The merge still applies only the filtered source/baseline.
-      const current = input.snapshots?.current ?? await capture(canonicalTargetDir,
-        input.conflictPolicy === "reject" ? { exclude: [], diskBacked: true } : options);
+      // Without the strict preflight, the current tree is consulted only for the baseline entries the source dropped
+      // (the delete pass below), so it is read per path there instead of capturing and hashing the whole target
+      // (Smarty speed/one: a second full hash pass over a 16k-file workspace on every repository turn).
+      const current = input.snapshots?.current ?? (input.conflictPolicy === "reject"
+        ? await capture(canonicalTargetDir, { exclude: [], diskBacked: true }) : null);
+      const currentEntry = async (relative: string) => current
+        ? current.entries.get(relative) : await readSnapshotEntry(canonicalTargetDir, relative);
       try {
         if (input.conflictPolicy === "reject") {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
@@ -820,7 +825,7 @@ export async function mergeDirectoryWithBaseline(input: {
         }
         for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
-          if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
+          if (!entriesMatch(await currentEntry(relative), baselineEntry)) continue;
           await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
         }
         // Reverse path order visits descendants before their parent directory.
@@ -837,7 +842,7 @@ export async function mergeDirectoryWithBaseline(input: {
         try {
           for (const [relative, entry] of orderedEntries(source)) {
             if (entriesMatch(input.baseline.entries.get(relative), entry) ||
-                (input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) continue;
+                (input.conflictPolicy === "reject" && entriesMatch(current?.entries.get(relative), entry))) continue;
             if (entry.kind !== "file") {
               await settle();
               await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
