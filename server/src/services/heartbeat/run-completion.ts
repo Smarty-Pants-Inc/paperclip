@@ -1694,8 +1694,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // A preserved sandbox that could not be resumed before provider dispatch
     // is retried with the same bounded bootstrap budget. The retry resumes the
     // same recorded lease; it never creates a replacement or a second executor.
+    const reusableSandboxResumeError = findReusableSandboxResumeError(outerErr);
     const reusableSandboxResumeFailure = !providerDispatchStarted && run.runtimeMode === "legacy"
-      && run.nativeSessionId === null && run.runnerInstanceId === null ? findReusableSandboxResumeError(outerErr) : null;
+      && run.nativeSessionId === null && run.runnerInstanceId === null ? reusableSandboxResumeError : null;
     // A saved workspace that could not be restored before provider dispatch
     // keeps its saved version. Retry it within the bootstrap budget only when
     // the owner proved the same clean writer and saved version; otherwise, and
@@ -1797,6 +1798,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const connectionFailure = readGitConnectionFailure(outerErr);
     const setupFailureResultJson = {
       ...setupFailureDetails,
+      ...(reusableSandboxResumeError?.reason ? { reusableSandboxResumeReason: reusableSandboxResumeError.reason } : {}),
       ...(nativePromptCauseFromError(outerErr) ? { nativeTurnPromptRefusalCause: nativePromptCauseFromError(outerErr) } : {}),
       ...await nativeInputRefusalEvidence(db, run, outerErr, setupFailureErrorCode),
       ...(nonRetryablePreflightCode === PI_MODEL_PROVIDER_REQUIRED && outerErr instanceof HttpError

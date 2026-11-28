@@ -1554,6 +1554,8 @@ export function environmentService(db: Db) {
        * database owner for the same run and provider resource.
        */
       reusesReusableLeaseId?: string | null;
+      /** Verified historical null-task binding, filled only with this handoff. */
+      reusableLeaseTaskBinding?: { leaseId: string; heartbeatRunId: string };
       /**
        * Re-check the environment company binding inside the lease insert
        * transaction. The login routes set this to close the check-to-lease
@@ -1613,6 +1615,10 @@ export function environmentService(db: Db) {
           "A reusable lease cannot be replaced and reacquired in the same operation.",
         );
       }
+      if (input.reusableLeaseTaskBinding && (!input.issueId || input.executionWorkspaceId ||
+          input.reusableLeaseTaskBinding.leaseId !== (input.replacesReusableLeaseId ?? input.reusesReusableLeaseId))) {
+        throw new Error("A reusable lease task binding requires its selected projectless ownership handoff.");
+      }
       const row =
         input.assertCompanyBinding ||
         input.replacesReusableLeaseId ||
@@ -1623,6 +1629,17 @@ export function environmentService(db: Db) {
               });
               if (input.assertCompanyBinding) {
                 await assertEnvironmentCompanyBinding(tx as unknown as Db, input.environmentId, input.companyId);
+              }
+              if (input.reusableLeaseTaskBinding) {
+                // Candidate matching never writes. Fill the selected source's
+                // verified null binding in the ownership transaction, so a lost
+                // handoff CAS rolls it back rather than changing cleanup scope.
+                const binding = input.reusableLeaseTaskBinding;
+                const [bound] = await tx.update(environmentLeases).set({ issueId: input.issueId! }).where(and(
+                  eq(environmentLeases.id, binding.leaseId), eq(environmentLeases.companyId, input.companyId),
+                  eq(environmentLeases.heartbeatRunId, binding.heartbeatRunId), isNull(environmentLeases.issueId),
+                )).returning({ id: environmentLeases.id });
+                if (!bound) throw conflict("Reusable sandbox lease task binding changed during acquisition.");
               }
               if (input.replacesReusableLeaseId) {
                 await notifyChatInboundWakeNotices(tx, { companyId: input.companyId });

@@ -19,11 +19,13 @@ export class ReusableSandboxResumeError extends Error {
    * the provider, not a refusal of this sandbox, so the bounded retry owns it.
    */
   readonly providerOutage: boolean;
+  readonly reason?: "reusable_sandbox_terminal_stop_unsettled";
 
   constructor(input: {
     provider: string;
     providerLeaseId: string;
     cause?: unknown;
+    reason?: "reusable_sandbox_terminal_stop_unsettled";
   }) {
     // Record why the provider refused with closed labels only. The provider
     // message stays on `cause` and off the run record.
@@ -39,13 +41,14 @@ export class ReusableSandboxResumeError extends Error {
       ? ` (cause=${failure.label}${failure.status !== null ? ` status=${failure.status}` : ""}${failure.code ? ` code=${failure.code}` : ""})`
       : "";
     super(
-      `Reusable sandbox lease "${input.providerLeaseId}" could not be resumed${detail}; ` +
+      `Reusable sandbox lease "${input.providerLeaseId}" could not be resumed${detail}${input.reason ? ` (${input.reason})` : ""}; ` +
         "the lease was preserved and no replacement was created.",
       input.cause === undefined ? undefined : { cause: input.cause },
     );
     this.name = "ReusableSandboxResumeError";
     this.provider = input.provider;
     this.providerLeaseId = input.providerLeaseId;
+    this.reason = input.reason;
     // Only the closed status decides: a gateway page's text can also read as a timeout.
     this.providerOutage = failure?.status != null && failure.status >= 500 && failure.status <= 599;
   }

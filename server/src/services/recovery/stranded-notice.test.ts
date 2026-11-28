@@ -10,6 +10,7 @@ import {
   buildNoRunningExecutionNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
   buildWorkspaceValidationRecoveryNoticeSeed,
+  classifiedRunFailure,
 } from "./stranded-notice.js";
 
 function allRows(metadata: { sections: Array<{ rows: unknown[] }> }) {
@@ -189,6 +190,20 @@ describe("buildStrandedRecoveryEscalationNotice", () => {
       }
     }
   });
+  it.each([true, false])("distinguishes a terminal stop fence from provider resume failure (continues=%s)", continuesAutomatically => {
+    const sourceRun = { id: "failed-run", status: "failed", errorCode: "reusable_sandbox_resume_failed",
+      resultJson: { reusableSandboxResumeReason: "reusable_sandbox_terminal_stop_unsettled" } };
+    const notice = buildStrandedRecoveryEscalationNotice({ recoveryActionId: "terminal-stop", recoveryOwner: null,
+      continuesAutomatically, sourceRun });
+    expect(notice.presentation.title).toBe("Saved sandbox is still being stopped");
+    expect(notice.body).toContain("to keep its conversation");
+    expect(notice.body).toContain("stop has not finished");
+    expect(notice.body).toContain("instance operator");
+    expect(JSON.stringify(notice)).not.toMatch(/tries again automatically|Press Retry|did not start the saved sandbox in time/);
+    expect(classifiedRunFailure(sourceRun)).toMatchObject({ code: "reusable_sandbox_terminal_stop_unsettled",
+      title: notice.presentation.title, detail: expect.stringContaining("stop has not finished") });
+  });
+
   it("names an environment plugin that was not running after its bounded retries", () => {
     const notice = buildStrandedRecoveryEscalationNotice({
       seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
