@@ -1151,6 +1151,23 @@ function reusableLeaseCanBeResumed(input: {
   return input.lease.status === "active" && input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId;
 }
 
+/** Shared run-start candidate rule. A prewarm has no run, so active owners never qualify. */
+export function reusableSandboxLeaseIsResumeCandidate(input: {
+  lease: EnvironmentLease;
+  heartbeatRunId: string | null;
+  executionWorkspaceId: string | null;
+  issueId: string | null;
+  agentId: string;
+}): boolean {
+  const { lease } = input;
+  return lease.leasePolicy === "reuse_by_environment" &&
+    !reusableSandboxKeptAfterReplacement(lease) &&
+    reusableLeaseCanBeResumed(input) &&
+    lease.executionWorkspaceId === input.executionWorkspaceId &&
+    (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
+    lease.metadata?.agentId === input.agentId;
+}
+
 function reusableLeaseCanBeCleanedUp(lease: Pick<EnvironmentLease, "status" | "metadata">): boolean {
   if (abandonedWorkspaceFilesParked(lease)) return false;
   return lease.status === "released" || lease.status === "retained";
@@ -1836,14 +1853,10 @@ function createSandboxEnvironmentDriver(
           (input.executionWorkspaceId !== null || input.issueId !== null) &&
           input.agentId !== null
           ? (await environmentsSvc.listLeases(input.environment.id))
-              .filter((lease) =>
-                lease.leasePolicy === "reuse_by_environment" &&
-                !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
-                lease.executionWorkspaceId === input.executionWorkspaceId &&
-                (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
-                lease.metadata?.agentId === input.agentId,
-              )
+              .filter((lease) => reusableSandboxLeaseIsResumeCandidate({
+                lease, heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: input.executionWorkspaceId,
+                issueId: input.issueId, agentId: input.agentId!,
+              }))
           : [];
         for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
           // Protected allocations must stay out of both selection and obsolete cleanup.
@@ -2247,14 +2260,10 @@ function createSandboxEnvironmentDriver(
         (input.executionWorkspaceId !== null || input.issueId !== null) &&
         input.agentId !== null
           ? (await environmentsSvc.listLeases(input.environment.id))
-              .filter((lease) =>
-                lease.leasePolicy === "reuse_by_environment" &&
-                !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
-                lease.executionWorkspaceId === input.executionWorkspaceId &&
-                (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
-                lease.metadata?.agentId === input.agentId,
-              )
+              .filter((lease) => reusableSandboxLeaseIsResumeCandidate({
+                lease, heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: input.executionWorkspaceId,
+                issueId: input.issueId, agentId: input.agentId!,
+              }))
           : [];
       for (let index = reusableCandidateLeases.length - 1; index >= 0; index--) {
         // Protected allocations must stay out of both selection and obsolete cleanup.

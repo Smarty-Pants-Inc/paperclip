@@ -79,6 +79,34 @@ The response also includes:
 - `documentSummaries`: metadata for all linked issue documents
 - `legacyPlanDocument`: a read-only fallback when the description still contains an old `<plan>` block
 
+## Prewarm a task sandbox (test-server experiment)
+
+```
+POST /api/issues/{issueId}/sandbox-prewarm
+{}
+```
+
+Off by default: the server requires `PAPERCLIP_SANDBOX_PREWARM=true` (exactly).
+Otherwise it returns `404`. Only a signed-in board user with read access to the
+company and task may call it. The agent is taken from the task's conversation
+agent, or its assignee; the request cannot select another agent or sandbox.
+
+Returns `202 { "accepted": true }` after authorization, without waiting for the
+provider. This is not confirmation that a sandbox is ready. In the background,
+it resumes only the newest eligible retained/released reusable sandbox lease
+for that company, task and agent, using the existing lifecycle resume road with
+a 60-second provider RPC cap. It never acquires a sandbox, starts a run or
+transfers lease ownership. No lease, a live/queued/scheduled-retry task run, an
+in-flight prewarm or a repeat within 30 seconds makes the hint a no-op. Accepted
+calls each produce one `sandbox prewarm` info log with task ID, outcome and ms;
+a successful resume is also attributed to the user in the activity log.
+
+The task chat sends the hint on open and on typing, with a matching client-side
+30-second throttle. There is no polling or automatic retry. Failures do not block
+message submission; ordinary run admission remains authoritative. Throttling is
+in memory per server process, suitable for the single test server, not a
+distributed ownership lock.
+
 ## Create Issue
 
 ```

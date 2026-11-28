@@ -30,6 +30,11 @@ describe("issuesApi.list", () => {
     mockApi.patch.mockResolvedValue({});
   });
 
+  it("posts an optional sandbox readiness hint to the exact task without sending a message", async () => {
+    await issuesApi.prewarmSandbox("task/id");
+    expect(mockApi.post).toHaveBeenCalledExactlyOnceWith("/issues/task%2Fid/sandbox-prewarm", {});
+  });
+
   it("encodes a linked comment id as one path component and forwards cancellation", async () => {
     const signal = new AbortController().signal;
     await issuesApi.getComment("issue-1", "../../health?raw=true#fragment", { signal });

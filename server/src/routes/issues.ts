@@ -368,6 +368,7 @@ import {
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { prewarmIssueSandbox, sandboxPrewarmEnabled } from "../services/sandbox-prewarm.js";
 import { ensurePersonalPrivateProject } from "../services/projects.js";
 import { privateRequestActor } from "./private-request-actor.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -10118,6 +10119,30 @@ export function issueRoutes(
       active,
       actions: [...(active ? [active] : []), ...retainedHolds
         .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)],
+    });
+  });
+
+  router.post("/issues/:id/sandbox-prewarm", async (req, res) => {
+    if (!sandboxPrewarmEnabled()) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    assertBoard(req);
+    if (req.actor.type !== "board" || !req.actor.userId) throw unauthorized("Authentication required");
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    const agentId = issue.conversationAgentId ?? issue.assigneeAgentId;
+    const startedAt = Date.now();
+    res.status(202).json({ accepted: true });
+    // Only speculative readiness runs here. The response never waits for the provider.
+    const work = agentId
+      ? prewarmIssueSandbox({ db, companyId: issue.companyId, issueId: issue.id, agentId,
+          actor: { actorType: "user", actorId: req.actor.userId }, environmentRuntime })
+      : Promise.resolve({ outcome: "skipped", reason: "no_agent" } as const);
+    void work.then((result) => {
+      logger.info({ issueId: issue.id, ...result, ms: "ms" in result ? result.ms : Date.now() - startedAt }, "sandbox prewarm");
+    }).catch(() => {
+      logger.info({ issueId: issue.id, outcome: "failed", ms: Date.now() - startedAt }, "sandbox prewarm");
     });
   });
 
