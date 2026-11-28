@@ -295,7 +295,7 @@ impl CredentialObserver {
             file.write_all(&serde_json::to_vec(state)?)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, &self.state_path)?;
+            crate::atomic_replace::rename_replace_retrying_exdev(&temporary, &self.state_path)?;
             File::open(parent)?.sync_all()?;
             Ok(())
         })();
