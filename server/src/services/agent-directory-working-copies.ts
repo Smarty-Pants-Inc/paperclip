@@ -72,13 +72,24 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.receipt?.warm !== true) return true;
     return await fs.readFile(ownerFile(row), "utf8").then(s => JSON.parse(s).runId === row.runId).catch(error => error.code === "ENOENT" && row.processStoppedAt !== null);
   }
+  async function canonicalMatches(row: Copy) {
+    return store.locked(row.companyId, row.agentId, actor(row), false, async (_tx, agent, root) =>
+      deriveBundleState(agent).entryFile === row.entryFile &&
+      directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(root))) === row.baseHash);
+  }
+  /** Compare the owner's own baseline, not another task's workspace-specific
+   * preparation key. This reads no live provider files and transfers no authority. */
+  async function isCanonicalCurrent(companyId: string, agentId: string, runId: string) {
+    const row = await get(companyId, runId);
+    return Boolean(row && row.agentId === agentId && isAgentDirectoryCopy(row) &&
+      !row.receipt?.retainedByRunId && !row.processStoppedAt && await canonicalMatches(row));
+  }
   async function canReuse(companyId: string, agentId: string, runId: string) {
     const row = await get(companyId, runId);
     if (!row || row.agentId !== agentId || row.state !== "warm_saved" || row.errorCode || !await owns(row)) return false;
     const entry = baseline(row).entries.get(row.entryFile);
     if (entry?.kind !== "file" || entry.hash !== row.receipt?.sessionEntryHash) return false;
-    return store.locked(companyId, agentId, actor(row), false, async (_tx, _agent, root) =>
-      directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(root))) === row.baseHash);
+    return canonicalMatches(row);
   }
   async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
     if (target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
@@ -682,7 +693,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
     }));
   }
-  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable,
+  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, isCanonicalCurrent, recoverUnavailable,
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
     checkpointWarm: async (row: Copy, target?: AdapterExecutionTarget | null) => {
       const early = await precapture(row, target);

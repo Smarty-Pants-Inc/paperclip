@@ -4,11 +4,12 @@ import { AGENT_FILES_CONTRACT } from "../agent-file-store.js";
 import { AgentDirectoryReuseInvalidatedError } from "../agent-directory-working-copies.js";
 import { resolveHeartbeatNativeLifecyclePolicy } from "./native-lifecycle.js";
 
-const native = vi.hoisted(() => ({ reserve: vi.fn(), claim: vi.fn() }));
+const native = vi.hoisted(() => ({ reserve: vi.fn(), claim: vi.fn(), retire: vi.fn() }));
 vi.mock("../native-runtime/index.js", async importOriginal => ({
   ...await importOriginal<typeof import("../native-runtime/index.js")>(),
   reserveWarmNativeInstructionDirectory: native.reserve,
   claimWarmNativeInstructionCopy: native.claim,
+  retireStaleWarmNativeInstructionCopies: native.retire,
 }));
 
 type Input = Parameters<typeof createHeartbeatInstructionWorkingCopy>[0];
@@ -27,6 +28,7 @@ function fixture(executionTarget: Input["workspace"]["executionTarget"] = null, 
     checkpointWarm: vi.fn<Input["instructionCopies"]["checkpointWarm"]>().mockResolvedValue({ ...copy, state: "warm_saved", receipt: { ...copy.receipt, checkpointState: "unchanged" } }),
     hasChanges: vi.fn().mockResolvedValue(false), canReuseWarm: vi.fn().mockResolvedValue(true),
     reportRetirementUnconfirmed: vi.fn().mockResolvedValue(null),
+    isCanonicalCurrent: vi.fn().mockResolvedValue(true),
   };
   const appendRunEvent = vi.fn().mockResolvedValue(undefined);
   const context = { paperclipWorkspace: { agentHome: "/canonical" } } as Record<string, unknown>;
@@ -139,6 +141,24 @@ describe("instruction working-copy extraction boundary", () => {
     expect(f.controller.nativeInstructionReservation).toBeNull();
     expect(config).toMatchObject({ retained: true, instructionsFilePath: "/workspace/copy/AGENTS.md" });
     expect(f.controller.instructionCopy).toBe(f.copy);
+  });
+
+  it.each([
+    ["saved", null, true], ["unchanged", null, false], ["conflict", null, false],
+    ["saved", "AGENT_FILES_CHECKPOINT_UNSTABLE", false], ["warm_saved", null, true],
+  ] as const)("only starts eager retirement for a changed successful agent-files receipt (%s, %s)", async (state, errorCode, retires) => {
+    const f = fixture();
+    await f.controller.prepare(f.prepare);
+    f.copies.collectStopped.mockResolvedValue({ ...f.copy, state, errorCode,
+      receipt: { ...f.copy.receipt, checkpointState: "saved" } });
+    await f.controller.collectStoppedInstructions();
+    expect(native.retire).toHaveBeenCalledTimes(retires ? 1 : 0);
+    if (retires) {
+      const input = native.retire.mock.calls[0]![0];
+      expect(input).toMatchObject({ companyId: "company", agentId: "agent", runId: "current-run" });
+      expect(await input.isCurrent("other-held-run")).toBe(true);
+      expect(f.copies.isCanonicalCurrent).toHaveBeenCalledWith("company", "agent", "other-held-run");
+    }
   });
 
   it("reads the current run row and receipt during stopped collection and warm checkpoints", async () => {

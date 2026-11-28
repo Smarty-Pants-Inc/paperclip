@@ -614,6 +614,26 @@ owner as quiet or launch a replacement over it. The next retirement attempt uses
 the same owner and must finish provider closure and stopped-file collection.
 The existing explicit-reset exception still requires its typed retirement proof.
 
+A successful changed `agent_files` save (`instruction_save: saved`, including a
+warm checkpoint whose `checkpointState` is `saved`) starts eager retirement of
+this process's other stale, idle warm owners for that company and agent. Each
+owner's canonical file baseline is checked under the existing agent-file lock;
+another task's workspace-specific preparation key is not a comparable identity.
+The saving turn does not wait for this work. Retirement uses the same provider
+close, conversation checkpoint, and stopped-file collection as lazy preparation,
+and forgets the owner only after all of them succeed. It does not delete session
+files or start a replacement/model turn. The next message can then cold-resume
+from the current save without retiring the stale owner in `prepare.instructions`.
+
+Busy, reserved, settling, and already-closing owners are skipped, and ownership
+is rechecked after the asynchronous canonical read. Other-process owners, missed
+notifications, failed eager retirements, and busy turns still use the existing
+lazy road. Pending eager work remains visible to the idle-work probe. A message
+that arrives *during* eager checkpointing must still wait on the existing close
+fence: bypassing that fence could restore an incomplete conversation. Eager
+retirement moves the checkpoint between messages; it does not promise zero wait
+when a message overlaps an unfinished save. No polling or prewarm run is added.
+
 `heartbeatService(...).prepareIdleWarmNativeSessionsForSleep({ canRetire })`
 delegates to the native owner's retirement path for idle owners. Its caller owns
 the admission hold and supplies a synchronous

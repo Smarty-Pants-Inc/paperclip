@@ -1,4 +1,5 @@
 import { sandboxRestartMetadata } from "../sandbox-snapshot-restore.js";
+import { createHeartbeatInstructionWorkingCopy } from "../heartbeat/instruction-working-copy.js";
 import { PROVIDER_PACK_COMPATIBILITY, type NativeSession } from "../../vendor/paperclip-runner/index.js";
 import * as continuousReply from "./native-continuous-reply.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
@@ -479,6 +480,7 @@ import {
   cancelNativeSession,
   closeWarmNativeSessionsForEnvironment,
   claimWarmNativeInstructionCopy,
+  retireStaleWarmNativeInstructionCopies,
   warmRetirementDirectoryWait,
   warmSessionReleaseWait,
   nativeSessionWorkspaceScope,
@@ -13711,6 +13713,151 @@ describe("native warm session supervision", () => {
       await release?.();
     } finally {
       await closeWarmNativeSessionsForEnvironment({ environmentId: identity, reason: "test cleanup" });
+    }
+  });
+
+  function heldSaveGate<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    const promise = new Promise<T>(ready => { resolve = ready; });
+    return { promise, resolve };
+  }
+
+  // Never-OK: a changed save may move idle checkpoint work, never interrupt a
+  // live turn or lose/replace a session transcript.
+  it("eagerly retires task B after task A saves agent files, without blocking A or replacing B in preparation, and skips a busy task", async () => {
+    const identity = "eager-held-agent-save";
+    const root = await realpath(await mkdtemp(join(tmpdir(), identity)));
+    const transcript = join(root, "session.jsonl");
+    const conversation = '{"role":"user","text":"keep this turn exactly"}\n{"role":"assistant","text":"kept"}\n';
+    await writeFile(transcript, conversation);
+    const held = (name: string) => ({ ...execution,
+      binding: { ...execution.binding, runId: `${identity}-${name}`, issueId: `${identity}-${name}-issue`, executionWorkspaceId: `${identity}-${name}-workspace` },
+      session: { ...execution.session, normalizedSessionId: `${identity}-${name}`, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1);
+    const b = held("chat"), busy = held("busy");
+    const result = (run: NativeExecutionInputV1) => ({ result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" as const },
+      turnId: run.binding.runId, normalizedSessionId: run.session.normalizedSessionId, providerSessionId: run.session.normalizedSessionId,
+      driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null });
+    const persistGate = heldSaveGate<void>(), busyGate = heldSaveGate<void>(), busyStarted = heldSaveGate<void>();
+    const closeB = vi.fn(async () => { await persistGate.promise; await writeFile(join(root, "checkpoint.jsonl"), await readFile(transcript)); });
+    const closeBusy = vi.fn(async () => {}), collectB = vi.fn(async () => {
+      expect(await readFile(join(root, "checkpoint.jsonl"), "utf8")).toBe(conversation);
+    });
+    const copy = (run: NativeExecutionInputV1) => ({ runId: run.binding.runId, root, preparationKey: "old-preparation",
+      hasChanges: async () => false, collectStopped: run === b ? collectB : async () => {} });
+    state.execute.mockReset()
+      .mockImplementationOnce(async options => { await options.onSession?.({ close: closeB }); return result(b); })
+      .mockImplementationOnce(async options => { await options.onSession?.({ close: closeBusy }); busyStarted.resolve(); await busyGate.promise; return result(busy); })
+      .mockImplementationOnce(async options => { expect(options.existingSession).toBeUndefined(); await options.onSession?.({ close: async () => {} }); return result(b); });
+    type InstructionInput = Parameters<typeof createHeartbeatInstructionWorkingCopy>[0];
+    const a = { id: `${identity}-saving-task`, companyId: b.binding.companyId, agentId: b.binding.agentId, runnerProfileJson: null } as ReturnType<InstructionInput["readRun"]>;
+    const aCopy = { ...a, runId: a.id, localRoot: root, executionRoot: root, entryFile: "AGENTS.md", state: "prepared",
+      receipt: { schema: AGENT_FILES_CONTRACT }, errorCode: null };
+    const copies = { prepare: vi.fn(async () => aCopy), collectStopped: vi.fn(async () => ({ ...aCopy, state: "saved" })),
+      isCanonicalCurrent: vi.fn(async () => false) };
+    const appendRunEvent = vi.fn(async () => {});
+    const controller = createHeartbeatInstructionWorkingCopy({ db: {} as Db, instructionCopies: copies as unknown as InstructionInput["instructionCopies"],
+      readRun: () => a, agent: { id: a.agentId, companyId: a.companyId, adapterType: "opencode_local", adapterConfig: {}, runtimeConfig: {} } as InstructionInput["agent"],
+      context: {}, session: { taskSession: null, taskSessionForRun: null, sessionConfigMetadata: {} as InstructionInput["session"]["sessionConfigMetadata"] },
+      workspace: { executionTarget: null, executionWorkspace: b.workspace as InstructionInput["workspace"]["executionWorkspace"], persistedExecutionWorkspace: null }, appendRunEvent });
+    let runningBusy: Promise<unknown> | undefined;
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(b), execution: b, runnerInstanceId: identity, instructionWorkingCopy: copy(b) });
+      runningBusy = executePaperclipNativeSession({ db: leaseDb(busy), execution: busy, runnerInstanceId: identity, instructionWorkingCopy: copy(busy) });
+      await busyStarted.promise;
+      await controller.prepare({ runtimeConfig: {}, nativeRuntimeResolution: { kind: "native", profile: { backend: "opencode_server" } } as Parameters<typeof controller.prepare>[0]["nativeRuntimeResolution"],
+        hasInstructionFilesystem: true, nativeLifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } });
+      let savedWithoutWaiting = false;
+      const save = controller.collectStoppedInstructions().then(() => { savedWithoutWaiting = true; });
+      await vi.waitFor(() => expect(savedWithoutWaiting).toBe(true));
+      await save;
+      expect(appendRunEvent).toHaveBeenCalledWith(a, expect.objectContaining({ eventType: "instruction_save", payload: expect.objectContaining({ state: "saved" }) }));
+      await vi.waitFor(() => expect(closeB).toHaveBeenCalledOnce());
+      expect(collectB).not.toHaveBeenCalled(); // checkpoint is still deliberately blocked
+      expect(closeBusy).not.toHaveBeenCalled();
+      expect(copies.isCanonicalCurrent.mock.calls).toEqual([[a.companyId, a.agentId, b.binding.runId]]);
+      expect(readNativeSessionIdleWork()).toBe("present");
+      expect(await readFile(transcript, "utf8")).toBe(conversation);
+      persistGate.resolve();
+      await vi.waitFor(() => expect(collectB).toHaveBeenCalledOnce());
+      const next = { ...b, binding: { ...b.binding, runId: `${identity}-next-message` } };
+      const adopt = vi.fn(async () => ({ ...copy(b), runId: next.binding.runId, preparationKey: "new-preparation" }));
+      expect(await claimWarmNativeInstructionCopy({ priorExecution: b, companyId: b.binding.companyId, agentId: b.binding.agentId,
+        executionWorkspaceId: b.binding.executionWorkspaceId, workspace: b.workspace, environmentId: null,
+        runId: next.binding.runId, preparationKey: "new-preparation", adopt })).toBeNull();
+      expect(adopt).not.toHaveBeenCalled(); // no stale owner left in prepare.instructions
+      const events: AdapterRuntimeEvent[] = [];
+      await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: identity,
+        instructionWorkingCopy: { ...copy(b), runId: next.binding.runId, preparationKey: "new-preparation" }, onEvent: async event => { events.push(event); } });
+      expect(closeB).toHaveBeenCalledOnce(); // no checkpoint/retirement on the next message's road
+      expect(JSON.stringify(events)).not.toMatch(/harness_state\.backup\.persist|runner\.port_holders\.retire/);
+      expect(await readFile(transcript, "utf8")).toBe(conversation);
+      expect(await readFile(join(root, "checkpoint.jsonl"), "utf8")).toBe(conversation);
+      busyGate.resolve();
+      await runningBusy;
+      expect(closeBusy).not.toHaveBeenCalled(); // skipped busy turn was not marked for retirement on release
+    } finally {
+      persistGate.resolve(); busyGate.resolve();
+      await runningBusy;
+      await closeIdleWarmNativeSessionsForRestart();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["current", "foreign-company", "foreign-agent", "close-failure", "busy-after-probe"] as const)("keeps eager retirement within the idle owner's authority: %s", async scenario => {
+    const identity = `eager-retirement-${scenario}`;
+    const first = { ...execution, binding: { ...execution.binding, runId: identity, executionWorkspaceId: `${identity}-workspace` },
+      session: { ...execution.session, normalizedSessionId: identity, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+    let canClose = scenario !== "close-failure";
+    const close = vi.fn(async () => { if (!canClose) throw new Error("checkpoint not confirmed"); });
+    const collect = vi.fn(async () => {});
+    const copy = { runId: identity, preparationKey: "before", hasChanges: async () => false, collectStopped: collect };
+    const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" as const },
+      turnId: identity, normalizedSessionId: identity, providerSessionId: identity, driverKind: "test", driverVersion: "1",
+      nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    const turnGate = heldSaveGate<void>(), probeGate = heldSaveGate<boolean>(), turnStarted = heldSaveGate<void>();
+    state.execute.mockReset().mockImplementationOnce(async options => { await options.onSession?.({ close }); return result; })
+      .mockImplementationOnce(async options => { await options.onSession?.(options.existingSession!); turnStarted.resolve(); await turnGate.promise; return result; });
+    const isCurrent = vi.fn(async () => probeGate.promise);
+    let nextTurn: Promise<unknown> | undefined;
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: identity, instructionWorkingCopy: copy });
+      retireStaleWarmNativeInstructionCopies({ companyId: scenario === "foreign-company" ? "other-company" : first.binding.companyId,
+        agentId: scenario === "foreign-agent" ? "other-agent" : first.binding.agentId, runId: "another-saving-run", isCurrent });
+      if (scenario.startsWith("foreign")) expect(isCurrent).not.toHaveBeenCalled();
+      else await vi.waitFor(() => expect(isCurrent).toHaveBeenCalledOnce());
+      const second = { ...first, binding: { ...first.binding, runId: `${identity}-next` } };
+      const successorCopy = { ...copy, runId: second.binding.runId, preparationKey: scenario === "busy-after-probe" ? "before" : "after" };
+      if (scenario === "busy-after-probe") {
+        await claimWarmNativeInstructionCopy({ priorExecution: first, companyId: first.binding.companyId, agentId: first.binding.agentId,
+          executionWorkspaceId: first.binding.executionWorkspaceId, workspace: first.workspace, environmentId: null,
+          runId: second.binding.runId, preparationKey: "before", adopt: async () => successorCopy });
+        nextTurn = executePaperclipNativeSession({ db: leaseDb(second), execution: second, runnerInstanceId: identity, instructionWorkingCopy: successorCopy });
+        await turnStarted.promise;
+      }
+      probeGate.resolve(scenario === "current");
+      // Join through the existing close fence after a deliberate rejected save.
+      if (scenario === "close-failure") {
+        await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+        expect(collect).not.toHaveBeenCalled();
+        canClose = true;
+        expect(await claimWarmNativeInstructionCopy({ priorExecution: first, companyId: first.binding.companyId, agentId: first.binding.agentId,
+          executionWorkspaceId: first.binding.executionWorkspaceId, workspace: first.workspace, environmentId: null,
+          runId: second.binding.runId, preparationKey: "after", adopt: async () => successorCopy })).toBeNull();
+        expect(close).toHaveBeenCalledTimes(2);
+        expect(collect).toHaveBeenCalledOnce();
+      } else {
+        await new Promise(resolve => setImmediate(resolve));
+        expect(close).not.toHaveBeenCalled();
+        expect(collect).not.toHaveBeenCalled();
+      }
+      turnGate.resolve();
+      await nextTurn;
+      if (scenario === "busy-after-probe") expect(close).not.toHaveBeenCalled();
+    } finally {
+      canClose = true; probeGate.resolve(false); turnGate.resolve();
+      await nextTurn;
+      await closeIdleWarmNativeSessionsForRestart();
     }
   });
 
