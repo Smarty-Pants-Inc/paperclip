@@ -787,6 +787,16 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   return [...conflicts].sort();
 }
 
+/** Where a directory merge spent its time (ms); -1 = step not run (source given by the caller, or no current capture). */
+export interface DirectoryMergeTiming {
+  captureSourceMs: number;
+  captureCurrentMs: number;
+  applyMs: number;
+  flushMs: number;
+  filesWritten: number;
+  entriesRemoved: number;
+}
+
 export async function mergeDirectoryWithBaseline(input: {
   baseline: DirectorySnapshot;
   sourceDir: string;
@@ -798,10 +808,16 @@ export async function mergeDirectoryWithBaseline(input: {
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
   snapshots?: { source: DirectorySnapshot; current?: DirectorySnapshot };
+  /** Called once when the merge applied (not on failure or a no-change merge). */
+  onTiming?: (timing: DirectoryMergeTiming) => void;
 }): Promise<void> {
   const capture = input.workspaceSnapshotIsolation === "worker" ? captureDirectorySnapshotOffThread : captureDirectorySnapshot;
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
+  const timing: DirectoryMergeTiming = { captureSourceMs: -1, captureCurrentMs: -1, applyMs: 0, flushMs: 0, filesWritten: 0, entriesRemoved: 0 };
+  let mark = performance.now();
+  const since = () => { const now = performance.now(), elapsed = Math.round(now - mark); mark = now; return elapsed; };
   const source = input.snapshots?.source ?? await capture(input.sourceDir, options);
+  if (!input.snapshots?.source) timing.captureSourceMs = since();
   try {
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
       await input.beforeApply?.();
@@ -814,8 +830,10 @@ export async function mergeDirectoryWithBaseline(input: {
       // Without the strict preflight, the current tree is consulted only for the baseline entries the source dropped
       // (the delete pass below), so it is read per path there instead of capturing and hashing the whole target
       // (Smarty speed/one: a second full hash pass over a 16k-file workspace on every repository turn).
+      since();
       const current = input.snapshots?.current ?? (input.conflictPolicy === "reject"
         ? await capture(canonicalTargetDir, { exclude: [], diskBacked: true }) : null);
+      if (!input.snapshots?.current && current) timing.captureCurrentMs = since();
       const currentEntry = async (relative: string) => current
         ? current.entries.get(relative) : await readSnapshotEntry(canonicalTargetDir, relative);
       try {
@@ -827,6 +845,7 @@ export async function mergeDirectoryWithBaseline(input: {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(await currentEntry(relative), baselineEntry)) continue;
           await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
+          timing.entriesRemoved++;
         }
         // Reverse path order visits descendants before their parent directory.
         for (const [relative, entry] of orderedEntries(input.baseline, true)) {
@@ -854,7 +873,10 @@ export async function mergeDirectoryWithBaseline(input: {
           }
           await settle();
           if (staged.length) {
+            const flushStart = performance.now();
             await flushTargetFilesystem(canonicalTargetDir, staged.map(file => file.temporary));
+            timing.flushMs = Math.round(performance.now() - flushStart);
+            timing.filesWritten = staged.length;
             for (const file of staged) {
               const existing = await fs.lstat(file.targetPath).catch(() => null);
               if (existing?.isDirectory()) await fs.rm(file.targetPath, { recursive: true, force: true });
@@ -867,6 +889,8 @@ export async function mergeDirectoryWithBaseline(input: {
           await Promise.allSettled(pending);
           await Promise.all(staged.filter(file => file.temporary).map(file => fs.rm(file.temporary, { force: true })));
         }
+        timing.applyMs = since();
+        try { input.onTiming?.(timing); } catch { /* timing is evidence only */ }
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }
     });

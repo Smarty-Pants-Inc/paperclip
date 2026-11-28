@@ -2329,6 +2329,12 @@ export async function prepareSandboxManagedRuntime(input: {
                       sourceDir: extractedDir,
                       ...(checkpointSnapshot ? { snapshots: { source: checkpointSnapshot } } : {}),
                       targetDir: input.workspaceLocalDir,
+                      onTiming: (t) => {
+                        const s = (ms: number) => ms < 0 ? "skipped" : `${(ms / 1000).toFixed(2)}s`;
+                        void Promise.resolve(restoreSink?.(`[paperclip] Directory merge: capture source ${s(t.captureSourceMs)}, `
+                          + `capture current ${s(t.captureCurrentMs)}, apply ${s(t.applyMs)} (flush ${s(t.flushMs)}; `
+                          + `${t.filesWritten} files written, ${t.entriesRemoved} removed)\n`)).catch(() => undefined);
+                      },
                       // Runs under the merge lock, before the first host write.
                       beforeApply: async () => {
                         markHostWriteStarted();
