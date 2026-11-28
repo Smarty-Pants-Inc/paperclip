@@ -305,6 +305,34 @@ function containsTranscriptWords(candidate: TranscriptEntry[], current: Transcri
   });
 }
 
+// Source selection preserves agent prose exactly, but only tool-result identity.
+// The two parsers can format the same execution's output differently.
+function pickerContent(entries: TranscriptEntry[]): string[] {
+  const content: string[] = [];
+  const toolResults = new Set<string>();
+  for (const entry of canonicalTranscript(entries, false)) {
+    if (entry.kind === "assistant" || entry.kind === "thinking") {
+      content.push(JSON.stringify([entry.kind, entry.text]));
+    }
+    if (entry.kind === "tool_result" && entry.toolUseId) toolResults.add(entry.toolUseId);
+    if (entry.kind === "provider_activity" && entry.family === "tool_execution" &&
+      typeof entry.payload.executionId === "string" && typeof entry.payload.output === "string") {
+      toolResults.add(entry.payload.executionId);
+    }
+  }
+  return [...content, ...[...toolResults].map(id => JSON.stringify(["tool_result", id]))];
+}
+
+function containsPickerContent(candidate: TranscriptEntry[], current: TranscriptEntry[]): boolean {
+  const available = new Map<string, number>();
+  for (const item of pickerContent(candidate)) available.set(item, (available.get(item) ?? 0) + 1);
+  return pickerContent(current).every(item => {
+    const count = available.get(item) ?? 0;
+    available.set(item, count - 1);
+    return count > 0;
+  });
+}
+
 function normalizedMessageText(value: string | null | undefined): string {
   return (value ?? "").trim().replace(/\s+/g, " ");
 }
@@ -1472,15 +1500,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const freshness = compareContentVersion(latestTranscriptContent(nativeTranscript), latestTranscriptContent(logTranscript));
       // Read cursors and output share native sequence numbers. A newer log
       // watermark must not replace that layout, including on settled reloads.
-      // A failed native read still permits the durable log fallback below.
+      // Failed reads and terminal native omissions still permit log fallback.
       const hasReadLayout = steeringDeliveryPoints(nativeTranscript).byQuestion.size > 0;
+      // Written only from this memo's output after commit (or that output's
+      // retained paint through a read gap); this is the previous drawn source.
       const drawn = drawnByRunRef.current.get(run.id);
-      // Recovery may trail words already shown by the fallback. A newer
-      // native watermark alone is not evidence that it carries those words.
+      // Recovery may trail agent prose or tool results already shown by the
+      // fallback. Tool-result identity matters here, not parser formatting.
       const canReturnToNative = !hasReadLayout || !drawn?.length ||
-        steeringDeliveryPoints(drawn).byQuestion.size > 0 || containsTranscriptWords(nativeTranscript, drawn);
-      const ownsReadLayout = hasReadLayout && !nativeTranscriptErrorsByRun.has(run.id);
-      if (canReturnToNative && nativeTranscript.length > 0 && (ownsReadLayout || !logTranscript.length || freshness > 0 ||
+        steeringDeliveryPoints(drawn).byQuestion.size > 0 || containsPickerContent(nativeTranscript, drawn);
+      const terminalNativeIncomplete = isTerminalRunStatus(run.status) && !containsPickerContent(nativeTranscript, logTranscript);
+      const ownsReadLayout = hasReadLayout && !nativeTranscriptErrorsByRun.has(run.id) && !terminalNativeIncomplete;
+      if (!terminalNativeIncomplete && canReturnToNative && nativeTranscript.length > 0 && (ownsReadLayout || !logTranscript.length || freshness > 0 ||
         (freshness === 0 && containsTranscriptWords(nativeTranscript, logTranscript) &&
           (!nativeTranscriptErrorsByRun.has(run.id) || !containsTranscriptWords(logTranscript, nativeTranscript))))) {
         next.set(run.id, nativeTranscript);

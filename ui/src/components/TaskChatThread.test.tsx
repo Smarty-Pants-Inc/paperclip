@@ -2019,6 +2019,73 @@ describe("native read source stability", () => {
     await assertPlaced(data);
     expect(container.textContent).toContain("Visible fallback continuation.");
   });
+  it.each([false, true])("keeps log-only trailing words on a settled cold reload (compact=%s)", async compactHistory => {
+    const data = fixture();
+    load(data);
+    transcriptState.transcriptByRun.set(data.id, [...log(data, 1),
+      { ...message(at(12), "Durable trailing words missing from native.", "progress"), itemId: "log-tail" },
+    ]);
+    const settled = { ...data.props, activeRun: undefined,
+      linkedRuns: [{ ...data.props.linkedRuns[0]!, status: "succeeded", finishedAt: at(13) }] };
+    render(<TaskChatThread {...settled} compactHistory={compactHistory} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain("Durable trailing words missing from native.");
+  });
+  it("recovers native read placement when the same tool result has different output text", async () => {
+    const data = fixture();
+    data.entries.splice(-1, 0,
+      { kind: "tool_call", ts: at(7.1), name: "bash", toolUseId: "execution-1", input: { command: "echo proof" }, eventSeq: 6 },
+      { kind: "tool_result", ts: at(7.2), toolUseId: "execution-1", content: "Native tool output.", isError: false, eventSeq: 7 },
+    );
+    load(data);
+    transcriptState.transcriptByRun.set(data.id, log(data, 1).map(row => row.kind === "tool_result"
+      ? { ...row, content: "Differently formatted log tool output." } : row));
+    nativeTranscriptState.errorsByRun.set(data.id, { message: "Native read unavailable" });
+    render(<TaskChatThread {...data.props} />);
+    await settleThreadLayout();
+    expect(container.textContent!.indexOf(data.steer.body)).toBeGreaterThan(container.textContent!.indexOf("stable after read."));
+    nativeTranscriptState.errorsByRun.clear();
+    nativeTranscriptState.transcriptByRun.set(data.id, data.entries.map(row => row.kind === "assistant"
+      ? { ...row, contentVersion: { at: at(20), completed: true } } : row));
+    render(<TaskChatThread {...data.props} />);
+    await assertPlaced(data);
+  });
+  it("keeps a settled log result that native lacks despite a newer native watermark", async () => {
+    const data = fixture();
+    load(data);
+    transcriptState.transcriptByRun.set(data.id, [...log(data, 1),
+      { kind: "tool_result", ts: at(12), toolUseId: "log-only-result", content: "Saved tool result.", isError: false },
+    ]);
+    nativeTranscriptState.transcriptByRun.set(data.id, data.entries.map(row => row.kind === "assistant"
+      ? { ...row, contentVersion: { at: at(20), completed: true } } : row));
+    const settled = { ...data.props, activeRun: undefined,
+      linkedRuns: [{ ...data.props.linkedRuns[0]!, status: "succeeded", finishedAt: at(13) }] };
+    render(<TaskChatThread {...settled} />);
+    await settleThreadLayout();
+    // Native has every agent word, but not this result ID. The log must own the run.
+    expect(container.textContent!.indexOf(data.steer.body)).toBeGreaterThan(container.textContent!.indexOf("stable after read."));
+  });
+  it("waits for a drawn tool result id before recovering native read placement", async () => {
+    const data = fixture();
+    load(data);
+    transcriptState.transcriptByRun.set(data.id, [...log(data, 1),
+      { kind: "tool_result", ts: at(12), toolUseId: "log-only-result", content: "Saved tool result.", isError: false },
+    ]);
+    nativeTranscriptState.errorsByRun.set(data.id, { message: "Native read unavailable" });
+    render(<TaskChatThread {...data.props} />);
+    await settleThreadLayout();
+    nativeTranscriptState.errorsByRun.clear();
+    nativeTranscriptState.transcriptByRun.set(data.id, data.entries.map(row => row.kind === "assistant"
+      ? { ...row, contentVersion: { at: at(20), completed: true } } : row));
+    render(<TaskChatThread {...data.props} />);
+    await settleThreadLayout();
+    expect(container.textContent!.indexOf(data.steer.body)).toBeGreaterThan(container.textContent!.indexOf("stable after read."));
+    data.entries.push({ kind: "tool_result", ts: at(12), toolUseId: "log-only-result",
+      content: "Same execution with native formatting.", isError: false, eventSeq: 11 });
+    load(data, 2);
+    render(<TaskChatThread {...data.props} />);
+    await assertPlaced(data);
+  });
   it("falls back to newer log words when the native read fails", async () => {
     const data = fixture();
     load(data);
