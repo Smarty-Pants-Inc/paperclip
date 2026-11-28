@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -598,43 +600,75 @@ async function withCanonicalDirectoryMergeLock<T>(
   }
 }
 
-async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry): Promise<void> {
+type StagedFile = { temporary: string; targetPath: string };
+
+/** Directories and symlinks are applied in path order at once; a regular file is copied to a temporary sibling and
+ * returned for the batch publish in mergeDirectoryWithBaseline (Smarty speed/one: the per-file fsync made a 16k-file
+ * repository merge take ~80 s). */
+async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry): Promise<StagedFile | null> {
   const sourcePath = path.join(sourceDir, relative);
   const targetPath = path.join(targetDir, relative);
 
   if (entry.kind === "dir") {
     const existing = await fs.lstat(targetPath).catch(() => null);
     if (existing?.isDirectory()) {
-      return;
+      return null;
     }
     if (existing) {
       await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
     }
     await fs.mkdir(targetPath, { recursive: true });
-    return;
+    return null;
   }
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   if (entry.kind === "symlink") {
     await fs.rm(targetPath, { recursive: true, force: true });
     await fs.symlink(entry.target, targetPath);
-    return;
+    return null;
   }
-  // An interrupted restore must not leave a truncated current file. Keep the
-  // incoming tree until its owner records success; exact retries deduplicate.
+  // An interrupted restore must not leave a truncated current file. The incoming bytes go to a temporary sibling; the
+  // caller makes every staged file durable in ONE flush before any rename publishes it, then flushes the renames.
   const temporary = path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
   try {
     await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
       await fs.copyFile(sourcePath, temporary);
     });
     await fs.chmod(temporary, entry.mode);
-    const file = await fs.open(temporary, "r");
-    try { await file.sync(); } finally { await file.close(); }
-    const existing = await fs.lstat(targetPath).catch(() => null);
-    if (existing?.isDirectory()) await fs.rm(targetPath, { recursive: true, force: true });
-    await fs.rename(temporary, targetPath);
-  } finally { await fs.rm(temporary, { force: true }); }
+    return { temporary, targetPath };
+  } catch (error) {
+    await fs.rm(temporary, { force: true });
+    throw error;
+  }
+}
 
+const MERGE_COPY_CONCURRENCY = 32;
+const execFileAsync = promisify(execFile);
+
+/** One flush of the target filesystem (syncfs through coreutils `sync -f`); if that is unavailable, fsync every given
+ * path (the staged files before the renames, their directories after), MERGE_COPY_CONCURRENCY at a time. Either way
+ * nothing is renamed into place before its bytes are durable, and success is not recorded before the renames are. */
+async function flushTargetFilesystem(targetDir: string, files: readonly string[]): Promise<void> {
+  try {
+    await execFileAsync("sync", ["-f", targetDir], { timeout: 120_000 });
+    return;
+  } catch { /* fall through to per-file fsync */ }
+  await runBounded(files, async file => {
+    const handle = await fs.open(file, "r");
+    try { await handle.sync(); } finally { await handle.close(); }
+  });
+}
+
+async function runBounded<T>(items: readonly T[], work: (item: T) => Promise<void>): Promise<void> {
+  let next = 0, failure: unknown = null;
+  const worker = async () => {
+    while (failure === null && next < items.length) {
+      const item = items[next++]!;
+      try { await work(item); } catch (error) { failure ??= error; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(MERGE_COPY_CONCURRENCY, items.length) }, worker));
+  if (failure !== null) throw failure;
 }
 
 export async function captureDirectorySnapshot(
@@ -795,9 +829,38 @@ export async function mergeDirectoryWithBaseline(input: {
             if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
           });
         }
-        for (const [relative, entry] of orderedEntries(source)) {
-          if (!entriesMatch(input.baseline.entries.get(relative), entry) &&
-              !(input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+        // Directories and symlinks in path order; regular files copied to temporaries in a bounded pool, made durable in
+        // one flush, renamed into place, and the renames flushed, all before the owner records success (afterApply).
+        const staged: StagedFile[] = [];
+        let pending: Promise<void>[] = [], failure: unknown = null;
+        const settle = async () => { await Promise.all(pending); pending = []; if (failure !== null) throw failure; };
+        try {
+          for (const [relative, entry] of orderedEntries(source)) {
+            if (entriesMatch(input.baseline.entries.get(relative), entry) ||
+                (input.conflictPolicy === "reject" && entriesMatch(current.entries.get(relative), entry))) continue;
+            if (entry.kind !== "file") {
+              await settle();
+              await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+              continue;
+            }
+            if (pending.length >= MERGE_COPY_CONCURRENCY) await settle();
+            pending.push(copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry)
+              .then(file => { if (file) staged.push(file); }, error => { failure ??= error; }));
+          }
+          await settle();
+          if (staged.length) {
+            await flushTargetFilesystem(canonicalTargetDir, staged.map(file => file.temporary));
+            for (const file of staged) {
+              const existing = await fs.lstat(file.targetPath).catch(() => null);
+              if (existing?.isDirectory()) await fs.rm(file.targetPath, { recursive: true, force: true });
+              await fs.rename(file.temporary, file.targetPath);
+              file.temporary = "";
+            }
+            await flushTargetFilesystem(canonicalTargetDir, [...new Set(staged.map(file => path.dirname(file.targetPath)))]);
+          }
+        } finally {
+          await Promise.allSettled(pending);
+          await Promise.all(staged.filter(file => file.temporary).map(file => fs.rm(file.temporary, { force: true })));
         }
         await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }
