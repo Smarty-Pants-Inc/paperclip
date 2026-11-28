@@ -47,7 +47,7 @@ const WORKSPACE_RECOVERY_NEXT_ACTION = "The run stopped before it finished, and 
   + "Press Retry to try again; it may start a new conversation.";
 const WORKSPACE_RECOVERY_CAUSES: Record<string, string> = {
   // A mismatch does not prove a move; a failed remote read does not prove release or an absent backup.
-  runner_harness_state_mismatch: "The sandbox's previous conversation could not be reused. Press Retry to try again; it may start a new conversation.",
+  runner_harness_state_mismatch: "The sandbox's previous conversation could not be reused. Press Retry to continue the work in a new conversation.",
   runner_remote_provider_verification_unavailable: "The sandbox's tool pack could not be checked. Press Retry to check it again.",
   runner_remote_state_unavailable: "The sandbox's conversation could not be read. Press Retry to continue the work in a new conversation.",
 };
