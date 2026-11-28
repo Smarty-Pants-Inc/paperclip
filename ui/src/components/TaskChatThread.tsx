@@ -1433,6 +1433,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     transcriptByRun: nativeTranscriptByRun,
     activityLabelByRun: nativeActivityLabelByRun,
     errorsByRun: nativeTranscriptErrorsByRun,
+    catchingUpRunIds: nativeCatchingUpRunIds,
     isInitialHydrating: nativeEventsAreInitiallyHydrating,
     hydratedRunIds: hydratedNativeRunIds,
     terminalHydratedRunIds,
@@ -4330,6 +4331,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // A successful read can still trail the live stream's sequence watermark.
     // It is loading, even after initial hydration, unless the repair read failed.
     if (logCatchingUpRunIds?.has(run.id) && !logErrorsByRun.has(run.id) && !selectedNativeRunIds.has(run.id)) return true;
+    if (nativeCatchingUpRunIds?.has(run.id) && !nativeTranscriptErrorsByRun.has(run.id) && selectedNativeRunIds.has(run.id)) return true;
     if (unavailableRunIds.has(run.id)) return false;
     if (historyWaitExpired && isTerminalRunStatus(run.status) && rawTranscriptByRun.get(run.id)?.length &&
       !logsAreInitiallyHydrating && !(run.runtimeMode === "native" && nativeEventsAreInitiallyHydrating)) return false;
@@ -4382,10 +4384,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   useEffect(() => {
     recordIssueDetailReadiness({ plan: !planLoading, transcripts: !transcriptHistoryPending, history: !historyPending });
   }, [issueId, planLoading, transcriptHistoryPending, historyPending]);
-  const historyError =
-    initialHistoryError ||
-    planError ||
-    transcriptHistoryErrors.size > 0 || questionReads.some(read => read.isError);
+  const failedHistorySources = [
+    initialHistoryError && "saved conversation",
+    planError && "plan",
+    transcriptHistoryErrors.size > 0 && `run activity for ${transcriptHistoryErrors.size} ${transcriptHistoryErrors.size === 1 ? "turn" : "turns"}`,
+    questionReads.some(read => read.isError) && "referenced questions",
+  ].filter(Boolean);
+  const historyError = failedHistorySources.length > 0;
   const [revealedHistoryKey, setRevealedHistoryKey] = useState<string | null | undefined>(undefined);
   const revealCachedHeader = connectionStatus !== "online" && Boolean(threadHeader);
   const historyRevealed = revealedHistoryKey === historyKey || revealCachedHeader;
@@ -4524,7 +4529,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                   role="status"
                   className="absolute inset-x-0 top-0 z-20 mx-auto flex w-full max-w-(--tc-shell-max-w) items-center gap-2 border border-border bg-background px-4 py-2 text-sm text-muted-foreground"
                 >
-                  {historyError ? "Some task history could not be loaded." : "Some task history is still loading."}
+                  {historyError ? `Some task history could not be loaded. Missing: ${failedHistorySources.join(", ")}.` : "Some task history is still loading."}
                   {historyError ? (
                     <Button variant="ghost" size="sm" onClick={retryHistory}>
                       Retry

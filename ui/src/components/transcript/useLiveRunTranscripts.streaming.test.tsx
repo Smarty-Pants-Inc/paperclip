@@ -16,7 +16,8 @@ const { useQueryMock, logMock, buildTranscriptMock } = vi.hoisted(() => ({
   buildTranscriptMock: vi.fn((chunks: unknown[]) => chunks),
 }));
 
-vi.mock("@tanstack/react-query", () => ({
+vi.mock("@tanstack/react-query", async importOriginal => ({
+  ...await importOriginal<typeof import("@tanstack/react-query")>(),
   useQuery: useQueryMock,
 }));
 
@@ -155,7 +156,10 @@ describe("useLiveRunTranscripts shared-stream recovery", () => {
       await act(async () => finish({ runId: "run-1", store: "memory", logRef: "log-1", content: row(1), nextOffset: 100 }));
       expect(value.errorsByRun.size).toBe(0);
       expect(value.catchingUpRunIds.has("run-1")).toBe(true);
-      logMock.mockRejectedValueOnce(new ApiError("Storage unavailable", 503, {}));
+      logMock.mockRejectedValueOnce(new ApiError("Storage unavailable", 503, {}))
+        .mockRejectedValueOnce(new ApiError("Storage unavailable", 503, {}));
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(value.errorsByRun.size).toBe(0);
       await act(async () => vi.advanceTimersByTimeAsync(2_000));
       expect(value.errorsByRun.get("run-1")?.message).toBe("Storage unavailable");
       logMock.mockResolvedValueOnce({ runId: "run-1", store: "memory", logRef: "log-1", content: row(2) + row(3), nextOffset: 300 });
@@ -244,8 +248,10 @@ describe("useLiveRunTranscripts shared-stream recovery", () => {
       expect(value.incompleteRunIds?.size ?? 0).toBe(0);
       expect(value.errorsByRun.size).toBe(0);
       const error = new ApiError("Storage unavailable", 503, {});
-      logMock.mockRejectedValueOnce(error);
+      logMock.mockRejectedValueOnce(error).mockRejectedValueOnce(error);
       await act(async () => root.render(<Harness status="succeeded" />));
+      expect(value.errorsByRun.size).toBe(0);
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
       expect(value.errorsByRun.get("run-1")).toBe(error);
       expect(value.catchingUpRunIds.has("run-1")).toBe(true);
       expect(value.incompleteRunIds?.size ?? 0).toBe(0);

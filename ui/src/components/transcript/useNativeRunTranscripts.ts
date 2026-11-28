@@ -83,6 +83,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     return value;
   };
   const gapPendingRef = useRef(new Set<string>());
+  const [catchingUpRunIds, setCatchingUpRunIds] = useState<ReadonlySet<string>>(new Set());
   const historyReadsRef = useRef(new Map<string, AbortSignal>());
   const interruptedReadsRef = useRef(new Set<string>());
   const refreshByRunRef = useRef(new Map<string, (force?: boolean) => void>());
@@ -94,7 +95,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     setEventsByRun(new Map()); setErrorsByRun(new Map()); setHydratedRunIds(new Set()); setHydratedStatusByRun(new Map());
     projectionCacheRef.current.clear(); cursorByRunRef.current.clear(); conversationOnlyByRunRef.current.clear();
     persistedEventsByRunRef.current.clear(); pendingEventsByRunRef.current.clear();
-    sequencesRef.current.clear(); gapPendingRef.current.clear(); interruptedReadsRef.current.clear();
+    sequencesRef.current.clear(); gapPendingRef.current.clear(); setCatchingUpRunIds(new Set()); interruptedReadsRef.current.clear();
   }, [options.companyId]);
   const stream = useTranscriptLiveStream(nativeRuns.filter(run => isLive(run.status)).map(run => run.id), options, event => {
     const runId = typeof event.payload.runId === "string" ? event.payload.runId : null;
@@ -110,9 +111,9 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     if (!hasTranscriptBody) cursor.requireHistory(row.seq);
     if (cursor.observe(row.seq) && !gapPendingRef.current.has(runId)) {
       gapPendingRef.current.add(runId);
-      setErrorsByRun(previous => previous.has(runId) ? previous : new Map(previous).set(runId, {
-        message: "Native run history is incomplete", failedAt: new Date().toISOString(),
-      }));
+      // A stream watermark ahead of persistence requests catch-up, not an
+      // error. Only a failed read or a completed run's missing history fails.
+      setCatchingUpRunIds(new Set(gapPendingRef.current));
       refreshByRunRef.current.get(runId)?.();
     }
     if (!hasTranscriptBody) return;
@@ -175,6 +176,8 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
     for (const map of [persistedEventsByRunRef.current, pendingEventsByRunRef.current]) {
       for (const id of map.keys()) if (!retainedIds.has(id)) map.delete(id);
     }
+    for (const id of gapPendingRef.current) if (!retainedIds.has(id)) gapPendingRef.current.delete(id);
+    setCatchingUpRunIds(previous => previous.size === gapPendingRef.current.size ? previous : new Set(gapPendingRef.current));
 
     const refreshRun = async (run: NativeRunTranscriptSource) => {
       if (cancelled || historyReadsRef.current.has(run.id)) return;
@@ -209,7 +212,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
         cursorByRunRef.current.set(run.id, coveredCursor);
         sequence(run.id).confirm(coveredCursor);
         failed = sequence(run.id).needsCatchup;
-        if (!failed) gapPendingRef.current.delete(run.id);
+        if (!failed && gapPendingRef.current.delete(run.id)) setCatchingUpRunIds(new Set(gapPendingRef.current));
         const pending = pendingEventsByRunRef.current.get(run.id) ?? [];
         const ready = pending.filter(row => !failed || row.seq <= coveredCursor);
         pendingEventsByRunRef.current.set(run.id, pending.filter(row => failed && row.seq > coveredCursor));
@@ -229,7 +232,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
           });
         }
         setErrorsByRun((previous) => {
-          if (failed) return previous.has(run.id) ? previous : new Map(previous).set(run.id, {
+          if (failed && !isLive(run.status)) return previous.has(run.id) ? previous : new Map(previous).set(run.id, {
             message: "Native run history is incomplete", failedAt: new Date().toISOString(),
           });
           if (!previous.has(run.id)) return previous;
@@ -315,7 +318,7 @@ export function useNativeRunTranscripts(runs: readonly NativeRunTranscriptSource
   const availableRunIds = useMemo(() => new Set([...savedHistory.keys(), ...hydratedRunIds]), [savedHistory, hydratedRunIds]);
   const availableTerminalRunIds = useMemo(() => new Set([...savedHistory.keys(), ...terminalHydratedRunIds]), [savedHistory, terminalHydratedRunIds]);
   return {
-    transcriptByRun, activityLabelByRun, errorsByRun, hydratedRunIds: availableRunIds, terminalHydratedRunIds: availableTerminalRunIds, retry,
+    transcriptByRun, activityLabelByRun, errorsByRun, catchingUpRunIds, hydratedRunIds: availableRunIds, terminalHydratedRunIds: availableTerminalRunIds, retry,
     isInitialHydrating: nativeRuns.some((run) => !availableRunIds.has(run.id)),
   };
 }
