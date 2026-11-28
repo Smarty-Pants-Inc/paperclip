@@ -15045,6 +15045,12 @@ const REMOTE_PROVIDER_PACK_PROFILE_DIGESTS = {
   codex:
     QUALIFIED_ACPX_PROFILES.codex.commandDigest,
 } as const;
+/** Smarty seam (pack-declared providers, 11-28): a provider pack whose compatibility declares only pi_rpc. */
+export function isPiRpcOnlyProviderPack(payload: unknown): boolean {
+  const compatibility = payload && typeof payload === "object" ? (payload as { compatibility?: unknown }).compatibility : undefined;
+  return compatibility !== undefined
+    && canonicalJson(compatibility) === canonicalJson({ pi_rpc: (PROVIDER_PACK_COMPATIBILITY as Record<string, unknown>).pi_rpc });
+}
 const REMOTE_PROVIDER_PACK_ARTIFACT_PATHS = {
   grokLauncher: "dist/providers/grok/launcher.cjs",
   nodeCommand: "node_modules/node/bin/node",
@@ -15215,13 +15221,17 @@ function* providerPackIdentityChecks(
   // stock pack stays stock even when its execution identity needs repair.
   // Execution never supplies this option and retains every admission check.
   if (optionalProvider && payload && typeof payload === "object" && !(optionalProvider in payload)) return manifest;
+  // Smarty seam (pack-declared providers, 11-28 cold-start rows): a pack that declares ONLY pi_rpc carries what a
+  // Pi run uses (Node, lockfile, dist, the Pi runtime) and none of the other harnesses' pins, artifacts or assets.
+  const piRpcOnly = isPiRpcOnlyProviderPack(payload);
   if (
     manifest?.schema !== REMOTE_PROVIDER_PACK_SCHEMA ||
     !payload ||
-    (payload.compatibility !== undefined && canonicalJson(payload.compatibility) !== canonicalJson(PROVIDER_PACK_COMPATIBILITY)) ||
-    canonicalJson(payload.pins) !== canonicalJson(REMOTE_PROVIDER_PACK_PINS) ||
-    canonicalJson(payload.acpxProfileDigests) !==
-      canonicalJson(REMOTE_PROVIDER_PACK_PROFILE_DIGESTS) ||
+    (payload.compatibility !== undefined && !piRpcOnly && canonicalJson(payload.compatibility) !== canonicalJson(PROVIDER_PACK_COMPATIBILITY)) ||
+    canonicalJson(payload.pins) !== canonicalJson(piRpcOnly ? { nodeMinimum: REMOTE_PROVIDER_PACK_PINS.nodeMinimum } : REMOTE_PROVIDER_PACK_PINS) ||
+    (piRpcOnly ? payload.acpxProfileDigests !== undefined || payload.providers !== undefined || payload.candidateProviders !== undefined
+      || payload.bridgeDigest !== undefined || !payload.pi_rpc
+      : canonicalJson(payload.acpxProfileDigests) !== canonicalJson(REMOTE_PROVIDER_PACK_PROFILE_DIGESTS)) ||
     typeof payload.target?.platform !== "string" ||
     typeof payload.target?.architecture !== "string" ||
     !/^[0-9a-f]{40}(?:-dirty)?$/.test(payload.runnerSourceRevision) ||
@@ -15273,6 +15283,10 @@ function* providerPackIdentityChecks(
     ],
   ] as const;
   for (const [label, artifact, expectedPath] of artifactEntries) {
+    if (piRpcOnly && expectedPath !== REMOTE_PROVIDER_PACK_ARTIFACT_PATHS.nodeCommand && expectedPath !== REMOTE_PROVIDER_PACK_ARTIFACT_PATHS.productionLock) {
+      if (artifact !== undefined) throw new Error(`runner_remote_provider_artifact_incompatible: a pi_rpc-only pack carries no ${label}`);
+      continue;
+    }
     const artifactPath = providerPackRelativePath(
       artifact?.path,
       `${label} path`,
@@ -15354,6 +15368,7 @@ function* providerPackIdentityChecks(
       }
     }
   }
+  if (piRpcOnly) return structuredClone(manifest);
   const bridgeDigest = `sha256:${createHash("sha256")
     .update(payload.artifacts.opencodeProxy.sha256)
     .update("\n")
@@ -18035,7 +18050,11 @@ async function createRunnerdBackendWithinSessionClaim(
           ? readBundledRemoteProviderPackManifest(bundledClaudeManifest, remoteClaudeTarget)
           : readBundledRemoteProviderPackManifest();
       }
-      return resolveRemoteProviderPackSource(configuredProviderPackRoot).manifest;
+      const selected = resolveRemoteProviderPackSource(configuredProviderPackRoot).manifest;
+      if (isPiRpcOnlyProviderPack(selected.payload) && input.execution.provider.kind !== "pi_rpc") {
+        throw new Error("runner_remote_provider_artifact_incompatible: the selected provider pack declares only pi_rpc");
+      }
+      return selected;
     })();
     return currentProviderPackManifest;
   };
@@ -19724,6 +19743,8 @@ async function createRunnerdBackendWithinSessionClaim(
                 expectedProviderPackManifest.payload.artifacts.nodeCommand
                   .sha256,
               providerPackAuthorityDigest: expectedProviderPackManifest.digest,
+              // A pi_rpc-only pack (Smarty seam) has no OpenCode / ACPX artifacts to name.
+              ...(isPiRpcOnlyProviderPack(expectedProviderPackManifest.payload) ? {} : {
               opencodeCommand: posix.join(
                 activeRemoteProviderPackRoot,
                 expectedProviderPackManifest.payload.artifacts
@@ -19747,6 +19768,7 @@ async function createRunnerdBackendWithinSessionClaim(
               acpxSidecarSha256:
                 expectedProviderPackManifest.payload.artifacts.acpxSidecar
                   .sha256,
+              }),
             }
           : {}),
         ...(input.execution.provider.kind === "pi_rpc" && expectedProviderPackManifest?.payload.pi_rpc && activeRemoteProviderPackRoot ? {
