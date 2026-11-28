@@ -220,9 +220,14 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
       const next = await nextRun(message, true);
       if (mode.startsWith("exited") || mode === "suspended") {
         await expect(next.outcome).resolves.toMatchObject({ exitCode: 0, sessionId: identity.normalizedSessionId });
-        if (mode === "suspended") console.info(JSON.stringify({ row: "ordinary-suspended-command-count", timing,
-          commands: target.runner.execute.mock.calls.slice(commandStart).map(([request]) => ({ command: request.command,
-            argsSha256: createHash("sha256").update(JSON.stringify(request.args)).digest("hex") })) }));
+        if (mode === "suspended") {
+          const commands = target.runner.execute.mock.calls.slice(commandStart);
+          // Preserve the pass-2 budget: an eager exit-proof read must fail this row.
+          expect(commands).toHaveLength(timing === "saved" ? 2 : 5);
+          console.info(JSON.stringify({ row: "ordinary-suspended-command-count", timing,
+            commands: commands.map(([request]) => ({ command: request.command,
+              argsSha256: createHash("sha256").update(JSON.stringify(request.args)).digest("hex") })) }));
+        }
         expect(prompts[1]).toContain(message);
         expect(await deliveredQueuedCommentIds(f.db, { companyId, issueId: f.issueId, agentId, commentIds: [next.commentId!] })).toEqual(new Set([next.commentId!]));
         expect((await f.db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.runId))).filter(event => event.eventType === "turn.started")).toHaveLength(1);
@@ -248,7 +253,7 @@ describeEmbeddedPostgres("long-idle same-conversation bootstrap", () => {
         const [settled] = await f.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, next.runId));
         expect(settled).toMatchObject({ phase: "terminal_failure", failureCode: "remote_warm_session_not_idle", nextAttemptAt: null });
         expect((settled.failureDetail as { nextAction: string }).nextAction).toBe(
-          "Your message was not answered: this conversation could not be resumed safely. Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent; /new does not carry your unanswered message, so send it again. Automatic retries are stopped.");
+          "Your message was not answered: this conversation could not be resumed safely. Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent and sends your unanswered message to the new conversation; /new does not carry it, so send it again. Automatic retries are stopped.");
         const dispatch = vi.fn();
         for (const delay of [31_000, 62_000]) expect(await dispatchNativeSessionResumptions({ db: f.db,
           runnerInstanceId: "idle-reconciler", runIds: [next.runId], now: new Date(Date.now() + delay), dispatch })).toEqual([]);

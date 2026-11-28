@@ -11194,7 +11194,7 @@ export async function executePaperclipNativeSession(input: {
     if (error instanceof Error && error.message === "runner_state_identity_mismatch: remote_warm_session_not_idle") {
       await input.db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "remote_warm_session_not_idle",
         nextAttemptAt: null, failureDetail: { sourceFailureCode: "remote_warm_session_not_idle",
-          nextAction: "Your message was not answered: this conversation could not be resumed safely. Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent; /new does not carry your unanswered message, so send it again. Automatic retries are stopped." } })
+          nextAction: "Your message was not answered: this conversation could not be resumed safely. Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent and sends your unanswered message to the new conversation; /new does not carry it, so send it again. Automatic retries are stopped." } })
         .where(and(eq(nativeRunFinalizations.runId, runId), eq(nativeRunFinalizations.companyId, input.execution.binding.companyId),
           eq(nativeRunFinalizations.issueId, input.execution.binding.issueId), isNull(nativeRunFinalizations.leaseOwner),
           inArray(nativeRunFinalizations.phase, ["observed", "retryable_failure"])));
@@ -14217,7 +14217,7 @@ async function executePaperclipNativeSessionAttempt(
                   : sourceFailureCode === "native_provider_output_without_result"
                   ? "The provider produced output but no complete answer could be saved. This question remains unanswered. Automatic retries are stopped; nothing was re-sent."
                   : sourceFailureCode === "remote_warm_session_not_idle"
-                  ? "Your message was not answered: this conversation could not be resumed safely. Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent; /new does not carry your unanswered message, so send it again. Automatic retries are stopped."
+                  ? "Your message was not answered: this conversation could not be resumed safely. Both 'Reset sessions' and 'Start fresh context here (/new)' start a new conversation; the earlier one stays visible above. 'Reset sessions' resets every task of this agent and sends your unanswered message to the new conversation; /new does not carry it, so send it again. Automatic retries are stopped."
                   : sourceFailureCode === "native_permission_declined"
                   ? "Provider permission was declined. Inspect the task and give explicit direction before starting further provider work. Automatic recovery is stopped."
                   : sourceFailureCode === "native_provider_approval_required"
