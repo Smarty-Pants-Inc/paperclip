@@ -14,6 +14,7 @@ import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { resolvePaperclipRunnerTransport } from "@paperclipai/adapter-utils/runner-connectivity";
 import { createNativeRunnerExecutionDriver } from "./native-runner-execution-driver.js";
 import { resolvePaperclipRunnerNativeProviderInput } from "./provider-profile.js";
+import { providerPackPathForEnvironment } from "./provider-pack-path.js";
 
 
 const PROBE_TRANSPORT_ENV_KEYS = ["PATH", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy"];
@@ -206,7 +207,7 @@ async function probeRemoteNativePi(context: AdapterEnvironmentTestContext, model
   const provider = resolvePaperclipRunnerNativeProviderInput({ companyId: context.companyId, backend: "pi_rpc", adapterConfig: context.config });
   if (provider.provider !== "pi_rpc") throw new Error("Pi RPC Test requires the Pi RPC driver.");
   const { prepareRemoteProviderPackOnTarget, resolveRemoteProviderPackSource } = await import("./native-session-executor.js");
-  const selected = resolveRemoteProviderPackSource(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH);
+  const selected = resolveRemoteProviderPackSource(providerPackPathForEnvironment(target.environmentId));
   const prepared = await prepareRemoteProviderPackOnTarget({ target, runner: target.runner,
     configuredProviderPackRoot: selected.configuredRoot, manifest: selected.manifest });
   const manifest = selected.manifest;
