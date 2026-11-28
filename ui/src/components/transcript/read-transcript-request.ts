@@ -8,6 +8,7 @@ const TRANSCRIPT_REQUEST_RETRY_MS = 2_000;
  * on timeout so Retry starts a fresh request. Late responses cannot commit. */
 export function readTranscriptRequest<T>(request: (signal: AbortSignal) => Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(new DOMException("History read cancelled", "AbortError"));
+  const deadline = performance.now() + TRANSCRIPT_REQUEST_TIMEOUT_MS;
   return new Promise<T>((resolve, reject) => {
     const controller = new AbortController();
     let settled = false;
@@ -34,11 +35,16 @@ export function readTranscriptRequest<T>(request: (signal: AbortSignal) => Promi
       if (settled) return;
       const kind = classifyError(error);
       if (!retried && (kind === "transient" || kind === "aborted")) {
-        retried = true;
-        retryTimer = window.setTimeout(read, Math.max(
+        const wait = Math.max(
           TRANSCRIPT_REQUEST_RETRY_MS,
           error instanceof ApiError ? error.retryAfterMs ?? 0 : 0,
-        ));
+        );
+        if (performance.now() + wait >= deadline) {
+          finish(() => reject(error));
+          return;
+        }
+        retried = true;
+        retryTimer = window.setTimeout(read, wait);
       } else {
         finish(() => reject(error));
       }

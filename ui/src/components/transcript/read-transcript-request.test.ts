@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
+import { classifyError } from "@/api/errors";
 import { readTranscriptRequest, TRANSCRIPT_REQUEST_TIMEOUT_MS } from "./read-transcript-request";
 
 describe("history retry feedback request budget", () => {
@@ -91,14 +92,52 @@ describe("history retry feedback request budget", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("bounds a Retry-After longer than the request deadline", async () => {
-    const read = vi.fn().mockRejectedValue(new ApiError("Busy", 429, {}, { retryAfterMs: 60_000 }));
+  it.each([15_000, 20_000, 60_000])("rejects immediately with the original error when Retry-After is %s ms", async retryAfterMs => {
+    const failure = new ApiError("Unavailable", 503, {}, { retryAfterMs });
+    const read = vi.fn().mockRejectedValue(failure);
     const rejected = vi.fn();
     const result = readTranscriptRequest(read, new AbortController().signal).catch(rejected);
-    await vi.advanceTimersByTimeAsync(TRANSCRIPT_REQUEST_TIMEOUT_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rejected).toHaveBeenCalledExactlyOnceWith(failure);
+    expect(classifyError(rejected.mock.calls[0][0])).toBe("transient");
     await result;
-    expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("too long") }));
     expect(read).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([13_000, 14_000])("rejects immediately with the original error when the first failure arrives after %s ms", async elapsedMs => {
+    const failure = new ApiError("Unavailable", 503, {});
+    let fail!: (error: unknown) => void;
+    const read = vi.fn(() => new Promise<string>((_resolve, reject) => { fail = reject; }));
+    const rejected = vi.fn();
+    const result = readTranscriptRequest(read, new AbortController().signal).catch(rejected);
+    await vi.advanceTimersByTimeAsync(elapsedMs);
+    expect(rejected).not.toHaveBeenCalled();
+    fail(failure);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rejected).toHaveBeenCalledExactlyOnceWith(failure);
+    expect(classifyError(rejected.mock.calls[0][0])).toBe("transient");
+    await result;
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("still retries when the wait ends just before the deadline", async () => {
+    let fail!: (error: unknown) => void;
+    const read = vi.fn<() => Promise<string>>()
+      .mockImplementationOnce(() => new Promise<string>((_resolve, reject) => { fail = reject; }))
+      .mockResolvedValue("history");
+    const settled = vi.fn();
+    const result = readTranscriptRequest(read, new AbortController().signal).then(settled, settled);
+    await vi.advanceTimersByTimeAsync(12_999);
+    fail(new ApiError("Unavailable", 503, {}));
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(settled).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await result;
+    expect(settled).toHaveBeenCalledExactlyOnceWith("history");
+    expect(read).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(0);
   });
 
