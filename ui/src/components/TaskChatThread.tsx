@@ -305,14 +305,14 @@ function containsTranscriptWords(candidate: TranscriptEntry[], current: Transcri
   });
 }
 
-// Source selection preserves agent prose exactly, but only tool-result identity.
-// The two parsers can format the same execution's output differently.
-function pickerContent(entries: TranscriptEntry[]): string[] {
-  const content: string[] = [];
+// Recovery preserves agent prose (including streamed prefixes), but only
+// tool-result identity: the parsers can format the same output differently.
+function pickerContent(entries: TranscriptEntry[]) {
+  const prose: Array<{ kind: "assistant" | "thinking"; text: string }> = [];
   const toolResults = new Set<string>();
   for (const entry of canonicalTranscript(entries, false)) {
     if (entry.kind === "assistant" || entry.kind === "thinking") {
-      content.push(JSON.stringify([entry.kind, entry.text]));
+      prose.push({ kind: entry.kind, text: entry.text });
     }
     if (entry.kind === "tool_result" && entry.toolUseId) toolResults.add(entry.toolUseId);
     if (entry.kind === "provider_activity" && entry.family === "tool_execution" &&
@@ -320,16 +320,21 @@ function pickerContent(entries: TranscriptEntry[]): string[] {
       toolResults.add(entry.payload.executionId);
     }
   }
-  return [...content, ...[...toolResults].map(id => JSON.stringify(["tool_result", id]))];
+  return { prose, toolResults };
 }
 
 function containsPickerContent(candidate: TranscriptEntry[], current: TranscriptEntry[]): boolean {
-  const available = new Map<string, number>();
-  for (const item of pickerContent(candidate)) available.set(item, (available.get(item) ?? 0) + 1);
-  return pickerContent(current).every(item => {
-    const count = available.get(item) ?? 0;
-    available.set(item, count - 1);
-    return count > 0;
+  const available = pickerContent(candidate);
+  const drawn = pickerContent(current);
+  if (![...drawn.toolResults].every(id => available.toolResults.has(id))) return false;
+  // Longest first prevents a short prefix from consuming a longer row's match.
+  return drawn.prose.sort((a, b) => b.text.length - a.text.length).every(item => {
+    const exact = available.prose.findIndex(row => row.kind === item.kind && row.text === item.text);
+    const index = exact >= 0 ? exact : available.prose.findIndex(row =>
+      row.kind === item.kind && row.text.startsWith(item.text));
+    if (index < 0) return false;
+    available.prose.splice(index, 1);
+    return true;
   });
 }
 
@@ -1500,18 +1505,17 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const freshness = compareContentVersion(latestTranscriptContent(nativeTranscript), latestTranscriptContent(logTranscript));
       // Read cursors and output share native sequence numbers. A newer log
       // watermark must not replace that layout, including on settled reloads.
-      // Failed reads and terminal native omissions still permit log fallback.
+      // A failed native read still permits the durable log fallback below.
       const hasReadLayout = steeringDeliveryPoints(nativeTranscript).byQuestion.size > 0;
-      // Written only from this memo's output after commit (or that output's
+      // Derived only from this memo's output after commit (or that output's
       // retained paint through a read gap); this is the previous drawn source.
       const drawn = drawnByRunRef.current.get(run.id);
       // Recovery may trail agent prose or tool results already shown by the
       // fallback. Tool-result identity matters here, not parser formatting.
       const canReturnToNative = !hasReadLayout || !drawn?.length ||
         steeringDeliveryPoints(drawn).byQuestion.size > 0 || containsPickerContent(nativeTranscript, drawn);
-      const terminalNativeIncomplete = isTerminalRunStatus(run.status) && !containsPickerContent(nativeTranscript, logTranscript);
-      const ownsReadLayout = hasReadLayout && !nativeTranscriptErrorsByRun.has(run.id) && !terminalNativeIncomplete;
-      if (!terminalNativeIncomplete && canReturnToNative && nativeTranscript.length > 0 && (ownsReadLayout || !logTranscript.length || freshness > 0 ||
+      const ownsReadLayout = hasReadLayout && !nativeTranscriptErrorsByRun.has(run.id);
+      if (canReturnToNative && nativeTranscript.length > 0 && (ownsReadLayout || !logTranscript.length || freshness > 0 ||
         (freshness === 0 && containsTranscriptWords(nativeTranscript, logTranscript) &&
           (!nativeTranscriptErrorsByRun.has(run.id) || !containsTranscriptWords(logTranscript, nativeTranscript))))) {
         next.set(run.id, nativeTranscript);
