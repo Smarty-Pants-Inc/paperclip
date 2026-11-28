@@ -1155,9 +1155,20 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     };
     let reusable = false;
     const targetProven = input.target?.kind !== "remote" || input.target.transport !== "sandbox" || Boolean(input.target.sandboxLeaseAcquisition?.providerLeaseId);
-    try { reusable = targetProven && entry.observabilityCompatibilityKey === input.observabilityCompatibilityKey && !entry.closeOnReleaseReason && entry.instructionCopy.targetIdentity === instructionTargetIdentity(input.target) && await input.canReuse(); }
+    // Smarty seam (smarty-dev#4605): name which check refused the warm directory; this retire logged nothing.
+    let refusal = "check_threw";
+    try {
+      refusal = !targetProven ? "target_unproven"
+        : entry.observabilityCompatibilityKey !== input.observabilityCompatibilityKey ? "observability_key"
+        : entry.closeOnReleaseReason ? "close_on_release"
+        : entry.instructionCopy.targetIdentity !== instructionTargetIdentity(input.target) ? "target_identity"
+        : !await input.canReuse() ? "agent_files_changed" : "";
+      reusable = refusal === "";
+    }
     finally {
       if (!reusable) {
+        logger.info({ runId: input.runId, previousRunId: input.previousRunId, agentId: input.agentId, reason: refusal },
+          "warm instruction directory not reused");
         await retire("managed agent files changed or environment replaced");
       }
     }
