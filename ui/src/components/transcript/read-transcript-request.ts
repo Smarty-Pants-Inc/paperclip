@@ -1,5 +1,4 @@
-import { ApiError } from "@/api/client";
-import { classifyError } from "@/api/errors";
+import { classifyError, errorRetryAfterMs } from "@/api/errors";
 
 export const TRANSCRIPT_REQUEST_TIMEOUT_MS = 15_000;
 const TRANSCRIPT_REQUEST_RETRY_MS = 2_000;
@@ -13,6 +12,7 @@ export function readTranscriptRequest<T>(request: (signal: AbortSignal) => Promi
     const controller = new AbortController();
     let settled = false;
     let retried = false;
+    let firstError: unknown;
     let retryTimer: number | undefined;
     const finish = (complete: () => void) => {
       if (settled) return;
@@ -27,7 +27,7 @@ export function readTranscriptRequest<T>(request: (signal: AbortSignal) => Promi
       controller.abort();
     };
     const timer = window.setTimeout(() => {
-      finish(() => reject(new Error("Run history took too long to load. Retry to load it.")));
+      finish(() => reject(retried ? firstError : new Error("Run history took too long to load. Retry to load it.")));
       controller.abort();
     }, TRANSCRIPT_REQUEST_TIMEOUT_MS);
     signal.addEventListener("abort", onAbort, { once: true });
@@ -37,12 +37,13 @@ export function readTranscriptRequest<T>(request: (signal: AbortSignal) => Promi
       if (!retried && (kind === "transient" || kind === "aborted")) {
         const wait = Math.max(
           TRANSCRIPT_REQUEST_RETRY_MS,
-          error instanceof ApiError ? error.retryAfterMs ?? 0 : 0,
+          errorRetryAfterMs(error) ?? 0,
         );
         if (performance.now() + wait >= deadline) {
           finish(() => reject(error));
           return;
         }
+        firstError = error;
         retried = true;
         retryTimer = window.setTimeout(read, wait);
       } else {
