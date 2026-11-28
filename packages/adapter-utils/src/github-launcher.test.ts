@@ -274,8 +274,8 @@ process.exit(result.status ?? 98);
     const git = async (...args: string[]) => (await exec(launcher, args, { cwd: root, env })).stdout.trim();
     await git("init", "-q");
     await git("commit", "--allow-empty", "-m", "Dated fixture");
-    expect(await git("log", "-1", "--format=%aI|%cI"))
-      .toBe("2001-02-03T04:05:06+00:00|2002-03-04T05:06:07+00:00");
+    expect(await git("log", "-1", "--format=%at|%ct"))
+      .toBe("981173106|1015218367");
   });
 
   it.each([[false, false], [false, true], [true, false], [true, true]])(
@@ -305,9 +305,9 @@ process.exit(result.status ?? 98);
     const git = async (...args: string[]) => (await exec(launcher, args, { cwd: root, env })).stdout.trim();
     await git("init", "-q");
     await git("commit", "--allow-empty", "-m", "Managed dated fixture");
-    expect(await git("log", "-1", "--format=%aI|%cI")).toBe(callerDates
-      ? "2001-02-03T04:05:06+00:00|2002-03-04T05:06:07+00:00"
-      : "2003-04-05T06:07:08+00:00|2004-05-06T07:08:09+00:00");
+    expect(await git("log", "-1", "--format=%at|%ct")).toBe(callerDates
+      ? "981173106|1015218367"
+      : "1049522828|1083827289");
     expect(await git("log", "-1", "--format=%an <%ae>|%cn <%ce>"))
       .toBe("Managed Author <author@example.test>|Managed Committer <committer@example.test>");
   });
