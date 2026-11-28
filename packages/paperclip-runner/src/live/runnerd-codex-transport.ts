@@ -248,15 +248,14 @@ function assertSuspendedRunnerState(
  * Keep suspension-only callers (in particular close) on their stricter guard.
  * The embedding server must explicitly attest the exact prior Runner's exit.
  */
-function assertColdRestorableRunnerState(
+async function assertColdRestorableRunnerState(
   state: Record<string, unknown>,
   expected: DurableRecoveryIdentity,
-  exitVerified?: DurableRecoveryIdentity,
-): void {
+  exitVerified?: CapabilityRunnerdCodexTransportOptions["freshBootstrapExitVerified"],
+): Promise<void> {
   const failure = typeof state.recoverableFailure === "string" ? state.recoverableFailure
     : typeof state.recoverable_failure === "string" ? state.recoverable_failure : null;
   if (state.lifecycle === "recoverable_failure"
-    && exitVerified !== undefined && recoveryIdentityMatches(exitVerified, expected)
     && state.schema === "paperclip.runner.durable.state.v1"
     && recoveryIdentityMatches(state, expected)
     && [expected.runnerInstanceId, expected.environmentLeaseId, expected.runId,
@@ -264,7 +263,8 @@ function assertColdRestorableRunnerState(
     && ["lease_expired_requires_bootstrap", "transport_reconnect_deadline_exceeded", "transport_reconnect_grace_exceeded"]
       .includes(failure ?? "")
     && Array.isArray(state.outbox) && state.outbox.length === 0
-    && state.pendingTerminalDelivery === null && state.pendingProviderCleanup == null && state.warmTransition == null) return;
+    && state.pendingTerminalDelivery === null && state.pendingProviderCleanup == null && state.warmTransition == null
+    && recoveryIdentityMatches((typeof exitVerified === "function" ? await exitVerified() : exitVerified) ?? {}, expected)) return;
   assertSuspendedRunnerState(state, expected);
 }
 
@@ -465,7 +465,7 @@ interface RunnerStateArchive {
 }
 
 /** Runner state that this controller owns under `<root>/runner`. */
-function localRunnerStateArchive(root: string, exitVerified?: DurableRecoveryIdentity): RunnerStateArchive {
+function localRunnerStateArchive(root: string, exitVerified?: CapabilityRunnerdCodexTransportOptions["freshBootstrapExitVerified"]): RunnerStateArchive {
   const runnerDirectory = resolve(root, "runner");
   const live = resolve(runnerDirectory, "runner-state.json");
   const readLive = () => {
@@ -485,7 +485,7 @@ function localRunnerStateArchive(root: string, exitVerified?: DurableRecoveryIde
         "runner-state.json",
       );
       if (existsSync(live)) {
-        assertColdRestorableRunnerState(readLive(), priorIdentity, exitVerified);
+        await assertColdRestorableRunnerState(readLive(), priorIdentity, exitVerified);
         if (!existsSync(archived)) {
           renameSync(live, archived);
         } else if (sameRegularFile(live, archived)) {
@@ -513,7 +513,7 @@ async function rotateAuthorityEpoch(
   controlPlaneState: Record<string, unknown>,
   desired: DurableRecoveryIdentity,
   runnerState: RunnerStateArchive,
-  exitVerified?: DurableRecoveryIdentity,
+  exitVerified?: CapabilityRunnerdCodexTransportOptions["freshBootstrapExitVerified"],
 ): Promise<Record<string, unknown>> {
   const priorIdentity = controlPlaneIdentity(controlPlaneState);
   if (
@@ -552,7 +552,7 @@ async function rotateAuthorityEpoch(
       priorIdentity,
     );
   } else {
-    if (!runnerState.archivedByLaunch) assertColdRestorableRunnerState(await runnerState.read(), priorIdentity, exitVerified);
+    if (!runnerState.archivedByLaunch) await assertColdRestorableRunnerState(await runnerState.read(), priorIdentity, exitVerified);
     if (!existsSync(activeControlPlane)) {
       throw new Error("native_runner_authority_archive_incomplete");
     }
@@ -564,7 +564,7 @@ async function rotateAuthorityEpoch(
     archiveKey: basename(archive).replace(/^epoch-/, ""),
     priorIdentity,
   });
-  assertColdRestorableRunnerState(archivedRunnerState, priorIdentity, exitVerified);
+  await assertColdRestorableRunnerState(archivedRunnerState, priorIdentity, exitVerified);
   return resumedState ?? controlPlaneState;
 }
 
@@ -1776,8 +1776,8 @@ export interface CapabilityRunnerdProcessEvidence {
 }
 
 export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
-  /** In-memory server authority, issued only after exact-box process-exit verification; never restored from state. */
-  freshBootstrapExitVerified?: DurableRecoveryIdentity;
+  /** In-memory exact-box exit authority, or a memoized on-demand verifier; never restored from state. */
+  freshBootstrapExitVerified?: DurableRecoveryIdentity | (() => Promise<DurableRecoveryIdentity | undefined>);
   observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   homeMode?: "isolated" | "preconfigured";
   provider?: "cursor_cloud" | "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx";
@@ -7102,11 +7102,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (!this.options.adoptExistingRunner) {
         if (localStateOwner) {
           if (!candidateRunnerState) throw new Error("native_runner_authority_rotation_state_unavailable");
-          assertColdRestorableRunnerState(candidateRunnerState, identity, this.options.freshBootstrapExitVerified);
+          await assertColdRestorableRunnerState(candidateRunnerState, identity, this.options.freshBootstrapExitVerified);
         } else {
           if (!this.options.readRunnerState || !this.options.prepareExternalRunnerState) throw new Error("native_runner_prp_run_rotation_unavailable");
           await this.options.prepareExternalRunnerState();
-          assertColdRestorableRunnerState(await this.options.readRunnerState(), identity, this.options.freshBootstrapExitVerified);
+          await assertColdRestorableRunnerState(await this.options.readRunnerState(), identity, this.options.freshBootstrapExitVerified);
         }
       }
       sourceAttachmentTarget = queuedSourceAttachment ? null : desiredIdentity;

@@ -68,8 +68,10 @@ it.each(["restore", "refuse", "foreign-state"] as const)(
         await rename(join(root, "runner", "runner-state.json"), join(directory, "runner-state.json"));
         return state;
       });
+      const exitVerifier = vi.fn(async () => { throw new Error("suspended resume must not probe exit"); });
       resumed = createCapabilityRunnerdCodexTransport({
         ...options,
+        freshBootstrapExitVerified: exitVerifier,
         prpIdentity: { ...identity, runId: "third-run", turnId: "third-turn", itemId: "third-item" },
         resumeProviderSession: { driverSessionId: thread.id, providerSessionId: thread.sessionId },
         readRunnerState: read,
@@ -97,6 +99,7 @@ it.each(["restore", "refuse", "foreign-state"] as const)(
         expect(calls.filter(call => call === "turn/start")).toHaveLength(0);
         expect(JSON.parse(await readFile(controlPath, "utf8")).identity.runId).toBe("third-run");
         expect(await readFile(join(root, "workspace-sentinel.txt"), "utf8")).toBe(sentinel);
+        expect(exitVerifier).not.toHaveBeenCalled();
       }
     } finally {
       await Promise.allSettled([first.transport.close(), resumed?.transport.close()]);
@@ -121,10 +124,16 @@ const unverifiedBootstrapPaths = ["road-c-copy", "environment-move", "resize", "
 it.each([
   ...bootstrapFailures.flatMap(reason => ["local", "external"].map(placement => ({ mode: "restore", reason, placement }))),
   ...bootstrapRefusals.map(mode => ({ mode, reason: bootstrapFailures[0]!, placement: "external" })),
+  ...bootstrapFailures.flatMap(reason => ["local", "external"].map(placement => ({ mode: "lazy-restore", reason, placement }))),
+  ...bootstrapIdentityFields.map(field => ({ mode: `lazy-exit-proof-${field}`, reason: bootstrapFailures[0]!, placement: "external" })),
+  ...["local", "external", "prp-local", "prp-external"].map(placement => ({ mode: "lazy-no-exit-proof", reason: bootstrapFailures[0]!, placement })),
+  ...["outbox", "terminal", "cleanup", "transition", "other-failure", "ready"].map(mode =>
+    ({ mode: `lazy-${mode}`, reason: bootstrapFailures[0]!, placement: "external" })),
   ...unverifiedBootstrapPaths.flatMap(path => ["local", "external", "prp-local", "prp-external"].map(placement =>
     ({ mode: `no-exit-proof-${path}`, reason: bootstrapFailures[0]!, placement }))),
   ...bootstrapFailures.slice(1, 3).map(reason => ({ mode: "no-exit-proof-reconnect", reason, placement: "external" })),
-])("cold continuation loads only settled fresh-bootstrap state: $placement / $mode / $reason", async ({ mode, reason, placement }) => {
+])("cold continuation loads only settled fresh-bootstrap state: $placement / $mode / $reason", async ({ mode: testMode, reason, placement }) => {
+  const lazy = testMode.startsWith("lazy-"), mode = lazy ? testMode.slice(5) : testMode;
   const root = await mkdtemp(join(tmpdir(), "runnerd-bootstrap-cold-"));
   const callsPath = join(root, "calls.log"), requestsPath = join(root, "requests.jsonl");
   const identity = { runnerInstanceId: "bootstrap-runner", environmentLeaseId: "bootstrap-lease", runId: "prior-run",
@@ -158,10 +167,13 @@ it.each([
     const archived: Record<string, unknown>[] = [];
     const proof = { ...identity };
     if (mode.startsWith("exit-proof-")) proof[mode.slice(11) as typeof bootstrapIdentityFields[number]] = "foreign-owner";
+    const verifyExit = vi.fn(async () => mode === "no-exit-proof" ? undefined : proof);
+    let exitProof: ReturnType<typeof verifyExit> | undefined;
     resumed = createCapabilityRunnerdCodexTransport({ ...options,
       // The fixture has awaited the first real runnerd's exit. Production's
       // server must obtain the equivalent authority from its exact-box verifier.
-      ...(!mode.startsWith("no-exit-proof-") ? { freshBootstrapExitVerified: proof } : {}),
+      ...(lazy ? { freshBootstrapExitVerified: () => exitProof ??= verifyExit() }
+        : !mode.startsWith("no-exit-proof-") ? { freshBootstrapExitVerified: proof } : {}),
       ...(placement.startsWith("prp-") ? { onStagedRunAttachment: async () => {} } : {}),
       prpIdentity: { ...identity, runId: "next-run", turnId: "next-turn", itemId: "next-item" },
       resumeProviderSession: { driverSessionId: thread.id, providerSessionId: thread.sessionId },
@@ -177,6 +189,7 @@ it.each([
     if (mode !== "restore") {
       await expect(resumed.transport.request("thread/read", {})).rejects.toThrow("native_runner_authority_rotation_requires_settled_state");
       expect(archived).toEqual([]);
+      if (lazy) expect(verifyExit).toHaveBeenCalledTimes(mode.startsWith("exit-proof-") || mode === "no-exit-proof" ? 1 : 0);
       const quarantine = (await readdir(dirname(root))).find(name => name.startsWith(`${basename(root)}.quarantine-`));
       const preserved = quarantine ? join(dirname(root), quarantine) : root;
       expect(await readFile(join(preserved, "control-plane/control-plane-state.json"))).toEqual(controlBefore);
@@ -185,6 +198,7 @@ it.each([
       return;
     }
     expect((await resumed.transport.request("thread/read", {})).thread).toMatchObject({ id: thread.id, sessionId: thread.sessionId });
+    if (lazy) expect(verifyExit).toHaveBeenCalledOnce();
     const notifications = resumed.transport.notifications()[Symbol.asyncIterator]();
     const started = expectTurnStarted(notifications);
     const prompt = "The restored conversation owes this exact follow-up.";
