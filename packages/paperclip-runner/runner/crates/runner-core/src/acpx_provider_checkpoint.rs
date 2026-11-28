@@ -278,7 +278,7 @@ impl AcpxSuspensionCheckpointStore {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, &self.path)?;
+            crate::atomic_replace::rename_replace_retrying_exdev(&temporary, &self.path)?;
             #[cfg(unix)]
             File::open(&self.directory)?.sync_all()?;
             Ok(())

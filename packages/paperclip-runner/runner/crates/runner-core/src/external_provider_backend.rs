@@ -478,7 +478,7 @@ impl ExternalCommandExecutor {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, &path)?;
+            crate::atomic_replace::rename_replace_retrying_exdev(&temporary, &path)?;
             #[cfg(unix)]
             File::open(&self.state_dir)?.sync_all()?;
             Ok(())

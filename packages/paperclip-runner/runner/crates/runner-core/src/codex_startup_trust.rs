@@ -96,7 +96,7 @@ pub(crate) fn trust_startup_root(home: &Path, cwd: &Path) -> Result<(), LocalRun
         file.write_all(document.to_string().as_bytes())
             .and_then(|_| file.sync_all())
             .map_err(|_| LocalRunnerError::invalid("codex_startup_trust_write_failed"))?;
-        fs::rename(&temporary, path)
+        crate::atomic_replace::rename_replace_retrying_exdev(&temporary, &path)
             .map_err(|_| LocalRunnerError::invalid("codex_startup_trust_commit_failed"))
     })();
     let _ = fs::remove_file(temporary);

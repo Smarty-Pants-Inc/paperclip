@@ -1694,7 +1694,7 @@ impl AcpxCommandExecutor {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, &path)?;
+            crate::atomic_replace::rename_replace_retrying_exdev(&temporary, &path)?;
             #[cfg(test)]
             if self.fail_after_state_rename {
                 return Err(std::io::Error::other("injected post-rename sync failure"));
