@@ -489,17 +489,27 @@ export async function buildExecutionContinuation(input: {
     .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
   if (input.onNativeReadState) {
     const generation = { nativeSessionId: input.nativeSessionId ?? null, providerSessionId: input.nativeProviderSessionId ?? null };
-    const read = await readByEarlierTurnCommentIds(db, { companyId, issueId, agentId: input.agentId,
-      commentIds: messages.map(message => message.id), currentRunId: input.runId, retainedGeneration: generation });
+    const read = new Set<string>();
     // Carry old saved reads forward only while the same native session is
     // retained. The budgeter's explicit fresh target still drops all reads.
     for (const message of messages) if (legacyReadRevision(message)) read.add(message.id);
     // A stored snapshot alone is not delivery proof: size refusal can precede
     // acceptance. Only a prior accepted turn can make its exact revisions read.
-    if (sameGeneration && accepted && deliveredMessages) for (const message of messages) {
-      if (omittedRevision(message) || deliveredMessages.some(prior => prior.id === message.id && prior.updatedAt === message.updatedAt && prior.body === message.body
-        && prior.deleted === message.deleted && prior.authorId === message.authorId
-        && (prior.createdByRunId ?? null) === message.createdByRunId && JSON.stringify(prior.sourceTrust) === JSON.stringify(message.sourceTrust))) read.add(message.id);
+    if (sameGeneration && accepted && deliveredMessages) {
+      const deliveredById = new Map(deliveredMessages.map(prior => [prior.id, prior]));
+      for (const message of messages) {
+        const prior = deliveredById.get(message.id);
+        if (omittedRevision(message) || (prior && prior.updatedAt === message.updatedAt && prior.body === message.body
+          && prior.deleted === message.deleted && prior.authorId === message.authorId
+          && (prior.createdByRunId ?? null) === message.createdByRunId && JSON.stringify(prior.sourceTrust) === JSON.stringify(message.sourceTrust))) read.add(message.id);
+      }
+    }
+    // Earlier-turn reads only need to resolve revisions not already proven read.
+    const unmarkedIds = messages.filter(message => !read.has(message.id)).map(message => message.id);
+    if (unmarkedIds.length) {
+      const earlierReads = await readByEarlierTurnCommentIds(db, { companyId, issueId, agentId: input.agentId,
+        commentIds: unmarkedIds, currentRunId: input.runId, retainedGeneration: generation });
+      for (const id of earlierReads) read.add(id);
     }
     const lastRun = priorRuns.findLast(run => run.id !== input.runId);
     input.onNativeReadState({ ...generation, lastRunAt: (lastRun?.startedAt ?? lastRun?.createdAt)?.toISOString() ?? null, readCommentIds: [...read] });
