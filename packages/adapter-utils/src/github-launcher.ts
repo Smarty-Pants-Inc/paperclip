@@ -98,6 +98,7 @@ ${options.brokerFile ? String.raw`
   } catch { diagnostic('configuration_directory_unavailable'); }
   {
     for (const key of Object.keys(env)) {
+      if (key === 'GIT_AUTHOR_DATE' || key === 'GIT_COMMITTER_DATE') continue;
       if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_(TOKEN|REPOSITORY)|GIT_AUTHOR_.*|GIT_COMMITTER_.*|GIT_CONFIG_.*|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*)$/.test(key)) delete env[key];
     }
     Object.assign(env, {
@@ -278,7 +279,8 @@ ${options.brokerFile ? String.raw`
       connected = result.status === 'available';
       if (result.status === 'available' && configReady) {
         for (const [key, value] of Object.entries(result.env || {})) {
-          if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_(TOKEN|REPOSITORY)|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL)|GIT_COMMITTER_(NAME|EMAIL)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
+          if ((key === 'GIT_AUTHOR_DATE' || key === 'GIT_COMMITTER_DATE') && env[key] !== undefined) continue;
+          if (/^(GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_(TOKEN|REPOSITORY)|GIT_TERMINAL_PROMPT|GIT_AUTHOR_(NAME|EMAIL|DATE)|GIT_COMMITTER_(NAME|EMAIL|DATE)|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+)$/.test(key) && typeof value === 'string') env[key] = value;
         }
       }
       }
