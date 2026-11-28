@@ -4237,8 +4237,9 @@ describe("sandbox git-bundle export transport", () => {
       if (operations.some((operation) => operation.files.some((file) => file.kind === "directory"))) directoryTransfers++;
       return syncOut(operations);
     };
-    // The merge copies entries in path order, so the first file lands before the
-    // later copy fails with an otherwise retryable I/O error.
+    // The later copy fails with an otherwise retryable I/O error after the host write has started (beforeApply).
+    // Changed files are published together only after every copy succeeded, so the failed merge publishes none of
+    // them, and it is still not retried.
     const failure = Object.assign(new Error("i/o error"), { code: "EIO" });
     const copyFile = fsPromises.copyFile.bind(fsPromises);
     vi.spyOn(fsPromises, "copyFile").mockImplementation(async (source, target, mode) => {
@@ -4248,7 +4249,7 @@ describe("sandbox git-bundle export transport", () => {
     const merge = vi.spyOn(restoreMerge, "mergeDirectoryWithBaseline");
     try {
       await expect(prepared.restoreWorkspace()).rejects.toBe(failure);
-      await expect(readFile(path.join(localWorkspaceDir, "a-first.txt"), "utf8")).resolves.toBe("first\n");
+      await expect(readFile(path.join(localWorkspaceDir, "a-first.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
       expect(directoryTransfers).toBe(1);
       expect(merge).toHaveBeenCalledTimes(1);
     } finally { vi.restoreAllMocks(); }
