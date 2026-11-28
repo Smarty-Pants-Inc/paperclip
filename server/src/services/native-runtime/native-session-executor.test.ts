@@ -4049,8 +4049,8 @@ describe("native harness persistence profiles", () => {
     const [runner] = resolveNativeHarnessPersistenceProfile(execution).directories;
     const home = `pi-sessions/${createHash("sha256").update("session").digest("hex")}/pi-home`;
     expect(runner).toEqual({ name: "runner", location: "runner", excludeEntries: [
-      `${home}/data/pnpm`, `${home}/.rustup`, `${home}/.cargo`, `${home}/cache`, `${home}/node-compile-cache`, `${home}/.npm`] });
-    for (const kept of [`${home}/agent/sessions/2026-11-27.jsonl`, `${home}/agent/models.json`, "pi-sessions/x/session.jsonl", `${home}/data/pi`])
+      `${home}/data/pnpm`, `${home}/.rustup`, `${home}/.cargo`, `${home}/cache`, `${home}/node-compile-cache`, `${home}/.npm/_cacache`] });
+    for (const kept of [`${home}/agent/sessions/2026-11-27.jsonl`, `${home}/agent/models.json`, "pi-sessions/x/session.jsonl", `${home}/data/pi`, `${home}/.npm/_logs/2026-11-27-debug-0.log`])
       expect(runner!.excludeEntries.some(excluded => kept === excluded || kept.startsWith(`${excluded}/`))).toBe(false);
   });
 
