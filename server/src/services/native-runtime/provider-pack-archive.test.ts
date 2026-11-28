@@ -454,3 +454,35 @@ it.skipIf(!tar || !hasZstd).each([
   expect(remote.syncIn).not.toHaveBeenCalled();
   await expect(fs.lstat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
 });
+
+// Smarty seam: e1e16dd3's rename is reverted to Paperclip's delete; its never-OK target fence stays.
+it("refuses an unsafe pack target before any command, and a failed delete stops the upload", async () => {
+  const { root, pack } = await fixture();
+  const { logger } = await import("../../middleware/logger.js");
+  const warn = vi.spyOn(logger, "warn");
+  try {
+    const unsafeTargets = ["", ".", "/", "..", "../pack", "../../pack", "pack/../other", "/tmp/..", "/tmp/../pack", "./pack", "pack//nested", "/tmp/pack/", "pack/"];
+    for (const targetPath of unsafeTargets) {
+      const remote = await runner(await fs.mkdtemp(path.join(root, "guard-")));
+      const stageDirectory = vi.fn(), verifyUploaded = vi.fn();
+      await expect(uploadVerifiedProviderPack({ root: pack, sourceDigest: digest, expectedDigest: digest, runner: remote, cwd: root,
+        targetPath, reuseRoots: [], verifyDirectory: () => {}, stageDirectory, verifyUploaded })).rejects.toThrow("stale provider pack could not be replaced");
+      expect(remote.execute).not.toHaveBeenCalled();
+      expect(remote.syncIn).not.toHaveBeenCalled();
+      expect(stageDirectory).not.toHaveBeenCalled();
+      expect(verifyUploaded).not.toHaveBeenCalled();
+    }
+    expect(warn).toHaveBeenCalledTimes(unsafeTargets.length);
+  } finally { warn.mockRestore(); }
+  for (const result of [{ exitCode: 1, timedOut: false }, { exitCode: 0, timedOut: true }]) {
+    const remote = { syncIn: vi.fn(), execute: vi.fn().mockResolvedValue(result) };
+    const verifyUploaded = vi.fn();
+    await expect(uploadVerifiedProviderPack({ root: pack, sourceDigest: digest, expectedDigest: digest, runner: remote, cwd: root,
+      targetPath: path.join(root, "failed"), reuseRoots: [], verifyDirectory: () => {}, stageDirectory: async () => {}, verifyUploaded }))
+      .rejects.toThrow("stale provider pack could not be replaced");
+    expect(remote.execute).toHaveBeenCalledOnce();
+    expect(remote.execute.mock.calls[0]![0]).toMatchObject({ args: ["-c", `rm -rf -- '${path.join(root, "failed")}'`], timeoutMs: 120_000 });
+    expect(remote.syncIn).not.toHaveBeenCalled();
+    expect(verifyUploaded).not.toHaveBeenCalled();
+  }
+});

@@ -57,8 +57,15 @@ export async function uploadVerifiedProviderPack(input: {
   }
   if (!archive) await verifyDirectory();
   input.signal?.throwIfAborted();
+  // Smarty seam (never-OK): a delete never runs on an empty, root, dot, parent-traversing or non-canonical target.
+  if (!input.targetPath || input.targetPath === "." || input.targetPath === "/" || input.targetPath === ".."
+    || input.targetPath.startsWith("../") || input.targetPath.startsWith("./") || input.targetPath.includes("/../")
+    || input.targetPath.endsWith("/") || posix.normalize(input.targetPath) !== input.targetPath) {
+    logger.warn({ pack: posix.basename(input.targetPath) }, "Skipping unsafe provider pack target");
+    throw new Error("runner_remote_provider_artifact_incompatible: stale provider pack could not be replaced");
+  }
   const cleared = await measure("provider_pack.clear_stale", () => input.runner.execute({
-    command: "sh", args: ["-c", `rm -rf ${quote(input.targetPath)}`],
+    command: "sh", args: ["-c", `rm -rf -- ${quote(input.targetPath)}`],
     // Smarty seam: a multi-gigabyte old pack on a busy sandbox can outlast 10 s (the reason for e1e16dd3, reverted).
     cwd: input.cwd, bypassSession: true, timeoutMs: 120_000,
   }));
@@ -75,13 +82,4 @@ export async function uploadVerifiedProviderPack(input: {
     await input.stageDirectory(source.root);
   });
   await measure("provider_pack.verify_uploaded", input.verifyUploaded);
-  // Smarty seam: trees that e1e16dd3 (reverted) renamed aside are deleted once (nothing creates them any more), inside
-  // this step with a short budget so no command outlives it; a failure only warns.
-  const leftovers = `${posix.basename(input.targetPath).replace(/[\\*?[\]]/g, "\\$&")}.stale-*`;
-  const directory = quote(posix.dirname(input.targetPath));
-  await input.runner.execute({ command: "sh", args: ["-c",
-    `[ -z "$(find ${directory} -mindepth 1 -maxdepth 1 -name ${quote(leftovers)} -print -quit)" ] || find ${directory} -mindepth 1 -maxdepth 1 -name ${quote(leftovers)} -exec rm -rf -- {} +`],
-  cwd: input.cwd, bypassSession: true, timeoutMs: 60_000 }).then(result => {
-    if (result.exitCode !== 0 || result.timedOut) logger.warn({ pack: posix.basename(input.targetPath) }, "Old renamed provider packs were not removed; continuing");
-  }, () => { logger.warn({ pack: posix.basename(input.targetPath) }, "Old renamed provider packs were not removed; continuing"); });
 }
