@@ -3994,6 +3994,19 @@ describe("provider pack read diagnostics", () => {
 });
 
 describe("native harness persistence profiles", () => {
+  it("leaves a Pi session's re-creatable tool stores out of its save, never its conversation", () => {
+    const execution = { provider: { kind: "pi_rpc" }, session: {
+      driverKind: "pi_rpc", normalizedSessionId: "session", protocolVersion: 1,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 28_800_000 },
+    } } as unknown as NativeExecutionInputV1;
+    const [runner] = resolveNativeHarnessPersistenceProfile(execution).directories;
+    const home = `pi-sessions/${createHash("sha256").update("session").digest("hex")}/pi-home`;
+    expect(runner).toEqual({ name: "runner", location: "runner", excludeEntries: [
+      `${home}/data/pnpm`, `${home}/.rustup`, `${home}/.cargo`, `${home}/cache`, `${home}/node-compile-cache`, `${home}/.npm`] });
+    for (const kept of [`${home}/agent/sessions/2026-11-27.jsonl`, `${home}/agent/models.json`, "pi-sessions/x/session.jsonl", `${home}/data/pi`])
+      expect(runner!.excludeEntries.some(excluded => kept === excluded || kept.startsWith(`${excluded}/`))).toBe(false);
+  });
+
   it("does not back up the external Codex home in preconfigured mode", () => {
     const execution = { homeMode: "preconfigured", provider: { kind: "codex" }, session: {
       driverKind: "codex_app_server", normalizedSessionId: "session", protocolVersion: 1,
