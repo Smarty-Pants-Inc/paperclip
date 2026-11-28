@@ -261,6 +261,105 @@ process.exit(result.status ?? 98);
     expect(captures).toBe(0);
   });
 
+  it.each([false, true])("preserves explicit commit dates through the generated launcher (broker file: %s)", async (brokerFile) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-commit-dates-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    const launcher = path.join(bin, "git");
+    await writeFile(launcher, githubLauncherSource({ brokerFile, interpreterPath: process.execPath }), { mode: 0o700 });
+    const env = { ...githubBrokerEnvironment({}, { url: "", token: "" }), HOME: root,
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      GIT_AUTHOR_DATE: "2001-02-03T04:05:06Z", GIT_COMMITTER_DATE: "2002-03-04T05:06:07Z" };
+    const git = async (...args: string[]) => (await exec(launcher, args, { cwd: root, env })).stdout.trim();
+    await git("init", "-q");
+    await git("commit", "--allow-empty", "-m", "Dated fixture");
+    expect(await git("log", "-1", "--format=%at|%ct"))
+      .toBe("981173106|1015218367");
+  });
+
+  it.each([[false, false], [false, true], [true, false], [true, true]])(
+    "preserves explicit commit dates with a connected broker (broker file: %s, caller dates: %s)", async (brokerFile, callerDates) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-broker-dates-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    const launcher = path.join(bin, "git");
+    await writeFile(launcher, githubLauncherSource({ brokerFile, interpreterPath: process.execPath }), { mode: 0o700 });
+    const server = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: {
+        GIT_AUTHOR_NAME: "Managed Author", GIT_AUTHOR_EMAIL: "author@example.test",
+        GIT_COMMITTER_NAME: "Managed Committer", GIT_COMMITTER_EMAIL: "committer@example.test",
+        GIT_AUTHOR_DATE: "2003-04-05T06:07:08Z", GIT_COMMITTER_DATE: "2004-05-06T07:08:09Z",
+      } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const broker = { url: `http://127.0.0.1:${port}`, token: "fixture-capability" };
+    if (brokerFile) await writeFile(path.join(bin, "broker.json"), JSON.stringify(broker));
+    const env = { ...githubBrokerEnvironment({}, broker), HOME: root,
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      ...(callerDates ? { GIT_AUTHOR_DATE: "2001-02-03T04:05:06Z", GIT_COMMITTER_DATE: "2002-03-04T05:06:07Z" } : {}) };
+    const git = async (...args: string[]) => (await exec(launcher, args, { cwd: root, env })).stdout.trim();
+    await git("init", "-q");
+    await git("commit", "--allow-empty", "-m", "Managed dated fixture");
+    expect(await git("log", "-1", "--format=%at|%ct")).toBe(callerDates
+      ? "981173106|1015218367"
+      : "1049522828|1083827289");
+    expect(await git("log", "-1", "--format=%an <%ae>|%cn <%ce>"))
+      .toBe("Managed Author <author@example.test>|Managed Committer <committer@example.test>");
+  });
+
+  it.each([false, true])("keeps non-date environment variables scrubbed (broker file: %s)", async brokerFile => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-date-boundary-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), real = path.join(root, "real");
+    await mkdir(bin); await mkdir(real);
+    await writeFile(path.join(bin, "git"), githubLauncherSource({ brokerFile, interpreterPath: process.execPath }), { mode: 0o700 });
+    const poison = { GH_TOKEN: "ambient-token", GITHUB_TOKEN: "ambient-token",
+      GH_ENTERPRISE_TOKEN: "ambient-token", GITHUB_ENTERPRISE_TOKEN: "ambient-token", PAPERCLIP_GIT_TOKEN: "ambient-token",
+      GIT_AUTHOR_DATE_EXTRA: "poison", GIT_COMMITTER_DATE_EXTRA: "poison", GIT_AUTHOR_OTHER: "poison", GIT_COMMITTER_OTHER: "poison",
+      GIT_CONFIG_OTHER: "poison", GIT_CONFIG_KEY_99: "poison", GIT_CONFIG_VALUE_99: "poison" };
+    await writeFile(path.join(real, "git"), `#!${process.execPath}\nprocess.stdout.write(JSON.stringify(Object.fromEntries(${JSON.stringify(Object.keys(poison))}.map(key => [key, process.env[key] ?? null]))));`, { mode: 0o700 });
+    const server = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      const brokerPoison = Object.fromEntries(Object.entries(poison).filter(([key]) => !/^GIT_CONFIG_(KEY|VALUE)_/.test(key)));
+      res.end(JSON.stringify({ status: "available", env: { ...brokerPoison, GH_TOKEN: "managed-token", GITHUB_TOKEN: "managed-token", PAPERCLIP_GIT_TOKEN: "managed-token" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const broker = { url: `http://127.0.0.1:${port}`, token: "fixture-capability" };
+    if (brokerFile) await writeFile(path.join(bin, "broker.json"), JSON.stringify(broker));
+    const env = { ...githubBrokerEnvironment({}, broker), ...poison, HOME: root,
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${real}:${path.dirname(process.execPath)}:/usr/bin:/bin` };
+    for (const command of ["status", "commit"]) {
+      const result = await exec(path.join(bin, "git"), [command], { cwd: root, env });
+      expect(JSON.parse(result.stdout)).toEqual({ ...Object.fromEntries(Object.keys(poison).map(key => [key, null])),
+        ...(command === "commit" ? { GH_TOKEN: "managed-token", GITHUB_TOKEN: "managed-token", PAPERCLIP_GIT_TOKEN: "managed-token" } : {}) });
+    }
+  });
+
+  it("strips ambient author and committer identity at the launcher boundary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-ambient-identity-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    const launcher = path.join(bin, "git");
+    await writeFile(launcher, githubLauncherSource({ interpreterPath: process.execPath }), { mode: 0o700 });
+    const env = { ...githubBrokerEnvironment({}, { url: "", token: "" }), HOME: root,
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      GIT_AUTHOR_NAME: "Ambient Author", GIT_AUTHOR_EMAIL: "ambient-author@example.test",
+      GIT_COMMITTER_NAME: "Ambient Committer", GIT_COMMITTER_EMAIL: "ambient-committer@example.test" };
+    const git = async (...args: string[]) => (await exec(launcher, args, { cwd: root, env })).stdout.trim();
+    await git("init", "-q");
+    await git("commit", "--allow-empty", "-m", "Identity fixture");
+    expect(await git("log", "-1", "--format=%an <%ae>|%cn <%ce>"))
+      .toBe("Paperclip <noreply@paperclip.ing>|Paperclip <noreply@paperclip.ing>");
+  });
+
   it.each(["missing", "absent", "unavailable", "rejected"])("commits local work without an identity when GitHub access is %s", async (access) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-default-author-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
