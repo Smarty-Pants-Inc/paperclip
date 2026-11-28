@@ -75,7 +75,7 @@ function compatibleInstallation<T extends ProviderPackIdentity>(
     : payload.contractDigest === undefined ? "contract_digest_missing"
     : payload.contractDigest !== expected.payload.contractDigest ? "contract_digest"
     : null;
-  if (failed || !actual || !payload || typeof payload.pins?.opencode !== "string") {
+  if (failed || !actual || !payload || !piRpcOnlyPackPayload(payload) && typeof payload.pins?.opencode !== "string") {
     throw providerPackIncompatible(failed ?? "opencode_pin_missing", "installed provider pack interface or installation is incompatible");
   }
   // Launch profiles and recovery receipts bind the selected installation's own
@@ -139,6 +139,8 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "let actual;try{actual=fs.readFileSync(path.join(root,'provider-pack.json'),'utf8').trim()}catch{fail('manifest_unreadable','provider pack manifest unreadable')}",
     "const canonical=(v)=>Array.isArray(v)?'['+v.map(canonical).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')+'}':JSON.stringify(v)",
     "let manifest;try{manifest=JSON.parse(actual)}catch{fail('manifest_invalid','provider pack manifest invalid')}",
+    // Smarty seam (pack-declared providers): a pi_rpc-only pack carries no OpenCode / ACPX artifacts or pins.
+    "const piOnly=canonical(manifest?.payload?.compatibility)===canonical({pi_rpc:manifest?.payload?.compatibility?.pi_rpc})&&manifest?.payload?.compatibility?.pi_rpc!==undefined",
     "const differing=(a,b)=>[...new Set([...Object.keys(a||{}),...Object.keys(b||{})])].sort().filter(k=>canonical((a||{})[k])!==canonical((b||{})[k]))",
     "const provenance=process.argv[3]==='provenance'",
     "const content=(m)=>{const c=JSON.parse(JSON.stringify(m??null))??{};delete c.digest;if(c.payload&&typeof c.payload==='object'){delete c.payload.runnerSourceRevision;delete c.payload.runnerInputsDigest}return canonical(c)}",
@@ -147,7 +149,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "const hash=(p)=>{try{return 'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(path.join(root,p))).digest('hex')}catch{return 'unreadable'}}",
     "const walk=(treeRoot)=>{const digest=crypto.createHash('sha256');const visit=(directory,prefix='')=>{for(const entry of fs.readdirSync(directory,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))){const relative=prefix?prefix+'/'+entry.name:entry.name;const absolute=path.join(directory,entry.name);if(entry.isDirectory()){digest.update('directory\\0'+relative+'\\n');visit(absolute,relative)}else if(entry.isFile()){digest.update('file\\0'+relative+'\\0'+'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex')+'\\n')}else if(entry.isSymbolicLink()){digest.update('symlink\\0'+relative+'\\0'+fs.readlinkSync(absolute)+'\\n')}else throw new Error('unsupported dist entry '+relative)}};visit(treeRoot);return 'sha256:'+digest.digest('hex')}",
     "const tree=(treeRoot)=>{try{return walk(treeRoot)}catch{return 'unreadable'}}",
-    "for(const name of ['nodeCommand','productionLock','opencodeCommand','opencodeExecutable','opencodeProxy','acpxSidecar','grokLauncher']){const artifact=manifest.payload.artifacts[name];if(hash(artifact.path)!==artifact.sha256)fail('artifact_digest:'+name,name+' digest mismatch')}",
+    "for(const name of ['nodeCommand','productionLock','opencodeCommand','opencodeExecutable','opencodeProxy','acpxSidecar','grokLauncher']){const artifact=manifest.payload.artifacts[name];if(!artifact&&piOnly&&name!=='nodeCommand'&&name!=='productionLock')continue;if(hash(artifact.path)!==artifact.sha256)fail('artifact_digest:'+name,name+' digest mismatch')}",
     "if(tree(path.join(root,'dist'))!==manifest.payload.distDigest)fail('dist_digest','dist tree digest mismatch')",
     "for(const candidate of Object.values({...manifest.payload.providers,...manifest.payload.candidateProviders})){if(tree(path.join(root,candidate.path))!==candidate.sha256)fail('candidate_digest','candidate asset tree digest mismatch')}",
     "const version=process.versions.node.split('.').map(Number)",
@@ -156,7 +158,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "if(process.platform!==manifest.payload.target.platform||process.arch!==manifest.payload.target.architecture)fail('target','provider pack target mismatch')",
     "const packageVersion=(pkg)=>{try{return JSON.parse(fs.readFileSync(path.join(root,'node_modules',...pkg.split('/'),'package.json'),'utf8')).version}catch{return null}}",
     "const expectedPackages={acpx:manifest.payload.pins.acpx,'@agentclientprotocol/claude-agent-acp':manifest.payload.pins.claudeAcp,'@agentclientprotocol/codex-acp':manifest.payload.pins.codexAcp,'opencode-ai':manifest.payload.pins.opencode}",
-    "for(const [pkg,version] of Object.entries(expectedPackages))if(packageVersion(pkg)!==version)fail('package_version:'+pkg,pkg+' version mismatch')",
+    "for(const [pkg,version] of Object.entries(expectedPackages))if(!(piOnly&&version===undefined)&&packageVersion(pkg)!==version)fail('package_version:'+pkg,pkg+' version mismatch')",
     "if(provenance)process.stdout.write('\\npaperclip-pack-manifest='+Buffer.from(canonical(manifest)).toString('base64')+'\\n')",
   ].join(";");
   const verified = await withProviderPackCheck("pack", () => runRemoteProviderVerification(() => runner.execute({
@@ -167,6 +169,8 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     timeoutMs: 30_000,
   }), "provider pack verification"));
   const selected = acceptProvenance ? sameContentManifest(manifest, verified.stdout) : manifest;
+  // A pi_rpc-only pack (Smarty seam) has no OpenCode to start.
+  if (piRpcOnlyPackPayload(manifest.payload)) return structuredClone(selected);
   const opencodeCommand = posix.join(
     packRoot,
     manifest.payload.artifacts.opencodeCommand.path,
@@ -206,4 +210,11 @@ function sameContentManifest<T extends ProviderPackIdentity>(expected: T, stdout
     throw providerPackIncompatible("installed_manifest_invalid", "installed provider pack identity is invalid");
   }
   return installed;
+}
+
+/** Smarty seam (pack-declared providers, 11-28): a pack whose compatibility declares only pi_rpc. */
+function piRpcOnlyPackPayload(payload: unknown): boolean {
+  const compatibility = payload && typeof payload === "object" ? (payload as { compatibility?: Record<string, unknown> }).compatibility : undefined;
+  return !!compatibility && compatibility.pi_rpc !== undefined
+    && canonicalProviderPackJson(compatibility) === canonicalProviderPackJson({ pi_rpc: compatibility.pi_rpc });
 }

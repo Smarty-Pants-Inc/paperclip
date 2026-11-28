@@ -17,6 +17,7 @@ import { nativePostResultFailureCategory, type NativePostResultFailureCategory }
 import { logger } from "../../middleware/logger.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
+import { nativeBackupTipLease } from "./native-backup-tip-lease.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
@@ -655,6 +656,19 @@ const OPENCODE_RUNTIME_CHECKPOINT_EXCLUDED_ENTRIES = [
 const ACPX_RUNTIME_CHECKPOINT_EXCLUDED_ENTRIES = [
   "home/.npm",
   "data/pnpm/store",
+] as const;
+// Smarty seam (C99, smarty-dev#4605): the re-creatable tool stores a Pi session's tools put under its HOME
+// (<runner>/pi-sessions/<sha256(session)>/pi-home; paperclip-pi-driver sets HOME and XDG_DATA_HOME there). A carried
+// session's pnpm store alone made an 11-27 save copy 3.9 GB / 98k files to keep a 1.3 MB conversation. Exact names
+// only: the conversation (pi-home/agent/...) and every other pi-home entry stay in the save.
+const PI_SESSION_HOME_CHECKPOINT_EXCLUDED_ENTRIES = [
+  "data/pnpm",
+  ".rustup",
+  ".cargo",
+  "cache",
+  "node-compile-cache",
+  // npm's cache only: .npm/_logs holds npm's own command logs, which stay in the save.
+  ".npm/_cacache",
 ] as const;
 const RUNNERD_STATE_SCHEMA = "paperclip.runner.durable.state.v1";
 const CODEX_PROVIDER_STATE_SCHEMA = "paperclip.runner.codex-provider-state.v1";
@@ -8154,7 +8168,10 @@ export function resolveNativeHarnessPersistenceProfile(
     providerKind: execution.provider.kind,
     driverKind: execution.session.driverKind,
     directories: [
-      { name: "runner", location: "runner", excludeEntries: [] },
+      { name: "runner", location: "runner", excludeEntries: execution.provider.kind === "pi_rpc"
+        ? PI_SESSION_HOME_CHECKPOINT_EXCLUDED_ENTRIES.map(entry =>
+          `pi-sessions/${createHash("sha256").update(nativeSessionKey(execution)).digest("hex")}/pi-home/${entry}`)
+        : [] },
       ...(providerDirectory ? [providerDirectory] : []),
     ],
   };
@@ -15045,6 +15062,12 @@ const REMOTE_PROVIDER_PACK_PROFILE_DIGESTS = {
   codex:
     QUALIFIED_ACPX_PROFILES.codex.commandDigest,
 } as const;
+/** Smarty seam (pack-declared providers, 11-28): a provider pack whose compatibility declares only pi_rpc. */
+export function isPiRpcOnlyProviderPack(payload: unknown): boolean {
+  const compatibility = payload && typeof payload === "object" ? (payload as { compatibility?: unknown }).compatibility : undefined;
+  return compatibility !== undefined
+    && canonicalJson(compatibility) === canonicalJson({ pi_rpc: (PROVIDER_PACK_COMPATIBILITY as Record<string, unknown>).pi_rpc });
+}
 const REMOTE_PROVIDER_PACK_ARTIFACT_PATHS = {
   grokLauncher: "dist/providers/grok/launcher.cjs",
   nodeCommand: "node_modules/node/bin/node",
@@ -15215,13 +15238,17 @@ function* providerPackIdentityChecks(
   // stock pack stays stock even when its execution identity needs repair.
   // Execution never supplies this option and retains every admission check.
   if (optionalProvider && payload && typeof payload === "object" && !(optionalProvider in payload)) return manifest;
+  // Smarty seam (pack-declared providers, 11-28 cold-start rows): a pack that declares ONLY pi_rpc carries what a
+  // Pi run uses (Node, lockfile, dist, the Pi runtime) and none of the other harnesses' pins, artifacts or assets.
+  const piRpcOnly = isPiRpcOnlyProviderPack(payload);
   if (
     manifest?.schema !== REMOTE_PROVIDER_PACK_SCHEMA ||
     !payload ||
-    (payload.compatibility !== undefined && canonicalJson(payload.compatibility) !== canonicalJson(PROVIDER_PACK_COMPATIBILITY)) ||
-    canonicalJson(payload.pins) !== canonicalJson(REMOTE_PROVIDER_PACK_PINS) ||
-    canonicalJson(payload.acpxProfileDigests) !==
-      canonicalJson(REMOTE_PROVIDER_PACK_PROFILE_DIGESTS) ||
+    (payload.compatibility !== undefined && !piRpcOnly && canonicalJson(payload.compatibility) !== canonicalJson(PROVIDER_PACK_COMPATIBILITY)) ||
+    canonicalJson(payload.pins) !== canonicalJson(piRpcOnly ? { nodeMinimum: REMOTE_PROVIDER_PACK_PINS.nodeMinimum } : REMOTE_PROVIDER_PACK_PINS) ||
+    (piRpcOnly ? payload.acpxProfileDigests !== undefined || payload.providers !== undefined || payload.candidateProviders !== undefined
+      || payload.bridgeDigest !== undefined || !payload.pi_rpc
+      : canonicalJson(payload.acpxProfileDigests) !== canonicalJson(REMOTE_PROVIDER_PACK_PROFILE_DIGESTS)) ||
     typeof payload.target?.platform !== "string" ||
     typeof payload.target?.architecture !== "string" ||
     !/^[0-9a-f]{40}(?:-dirty)?$/.test(payload.runnerSourceRevision) ||
@@ -15273,6 +15300,10 @@ function* providerPackIdentityChecks(
     ],
   ] as const;
   for (const [label, artifact, expectedPath] of artifactEntries) {
+    if (piRpcOnly && expectedPath !== REMOTE_PROVIDER_PACK_ARTIFACT_PATHS.nodeCommand && expectedPath !== REMOTE_PROVIDER_PACK_ARTIFACT_PATHS.productionLock) {
+      if (artifact !== undefined) throw new Error(`runner_remote_provider_artifact_incompatible: a pi_rpc-only pack carries no ${label}`);
+      continue;
+    }
     const artifactPath = providerPackRelativePath(
       artifact?.path,
       `${label} path`,
@@ -15295,6 +15326,19 @@ function* providerPackIdentityChecks(
     throw new Error(
       "runner_remote_provider_artifact_incompatible: provider dist tree digest mismatch",
     );
+  }
+  // Smarty seam (pack-declared providers): the Pi closure that runs is checked like the other harnesses' assets.
+  if (payload.pi_rpc !== undefined) {
+    const piArtifacts = payload.artifacts as Record<string, { path: string; sha256: string } | undefined> | undefined;
+    for (const [label, entry, kind] of [["Pi runtime", payload.pi_rpc?.runtime, "tree"], ["Pi resources", payload.pi_rpc?.resources, "tree"],
+      ["Pi proxy", piArtifacts?.piProxy, "file"], ["Pi executable", piArtifacts?.piExecutable, "file"], ["Pi RPC command", piArtifacts?.piRpcCommand, "file"]] as const) {
+      if (entry === undefined && kind === "file") continue;
+      const entryPath = providerPackRelativePath(entry?.path, `${label} path`);
+      if (!/^sha256:[a-f0-9]{64}$/.test(entry?.sha256 ?? "")
+        || (verifyControllerFiles && (yield { kind, path: resolve(packRoot, entryPath) }) !== entry!.sha256)) {
+        throw new Error(`runner_remote_provider_artifact_incompatible: ${label} digest mismatch`);
+      }
+    }
   }
   for (const [inventory, candidates] of [["providers", payload.providers], ["candidateProviders", payload.candidateProviders]] as const) {
     if (candidates === undefined) continue;
@@ -15354,6 +15398,7 @@ function* providerPackIdentityChecks(
       }
     }
   }
+  if (piRpcOnly) return structuredClone(manifest);
   const bridgeDigest = `sha256:${createHash("sha256")
     .update(payload.artifacts.opencodeProxy.sha256)
     .update("\n")
@@ -18035,7 +18080,11 @@ async function createRunnerdBackendWithinSessionClaim(
           ? readBundledRemoteProviderPackManifest(bundledClaudeManifest, remoteClaudeTarget)
           : readBundledRemoteProviderPackManifest();
       }
-      return resolveRemoteProviderPackSource(configuredProviderPackRoot).manifest;
+      const selected = resolveRemoteProviderPackSource(configuredProviderPackRoot).manifest;
+      if (isPiRpcOnlyProviderPack(selected.payload) && input.execution.provider.kind !== "pi_rpc") {
+        throw new Error("runner_remote_provider_artifact_incompatible: the selected provider pack declares only pi_rpc");
+      }
+      return selected;
     })();
     return currentProviderPackManifest;
   };
@@ -18625,6 +18674,7 @@ async function createRunnerdBackendWithinSessionClaim(
 
   const recordHarnessBackupStampForCurrentLease = async (
     backup: VerifiedHarnessBackup,
+    alsoTip = false,
   ) => {
     if (remoteTarget?.transport !== "sandbox" || !remoteTarget.leaseId) {
       return;
@@ -18635,6 +18685,7 @@ async function createRunnerdBackendWithinSessionClaim(
         providerLeaseId: environmentLeases.providerLeaseId,
         companyId: environmentLeases.companyId,
         heartbeatRunId: environmentLeases.heartbeatRunId,
+        executionWorkspaceId: environmentLeases.executionWorkspaceId,
       })
       .from(environmentLeases)
       .where(eq(environmentLeases.id, remoteTarget.leaseId))
@@ -18660,17 +18711,38 @@ async function createRunnerdBackendWithinSessionClaim(
     const leaseId = remoteTarget.leaseId;
     const updated = await writeEnvironmentCleanup(input.db, tx => tx
       .update(environmentLeases)
+      // Smarty seam: merge the stamp into the CURRENT metadata; a whole-object write could erase a concurrent handoff.
       .set({
-        metadata: {
-          ...(leaseRow.metadata ?? {}),
-          nativeHarnessBackup: stamp,
-        },
+        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackup: stamp })}::jsonb`,
         updatedAt: new Date(),
       })
       .where(eq(environmentLeases.id, leaseId))
       .returning({ id: environmentLeases.id })
       .then((rows) => rows[0] ?? null), { companyId: leaseRow.companyId, runId: leaseRow.heartbeatRunId ?? undefined, leaseId });
     if (!updated) throw new Error("runner_harness_backup_lease_missing");
+    // Smarty seam: a later run that reused this runner owns the sandbox's tip row, which the restore roads read.
+    // The launch row's stamp above is the save; a failed tip write leaves today's state and is logged, not thrown.
+    if (!alsoTip) return;
+    try {
+      const tip = await nativeBackupTipLease(input.db, { stampedLeaseId: leaseId, companyId: leaseRow.companyId,
+        providerLeaseId: leaseRow.providerLeaseId, executionWorkspaceId: leaseRow.executionWorkspaceId,
+        normalizedSessionId: backup.manifest.normalizedSessionId, completedAt: backup.manifest.completedAt,
+        currentRunId: input.execution.binding.runId });
+      if (!tip) return;
+      // Only while it is still the tip (no successor written since it was read); the stamp merges into its current metadata.
+      const stamped = await writeEnvironmentCleanup(input.db, tx => tx.update(environmentLeases)
+        .set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackup: stamp })}::jsonb`,
+          updatedAt: new Date() })
+        .where(and(eq(environmentLeases.id, tip.id), sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`))
+        .returning({ id: environmentLeases.id }).then(rows => rows[0] ?? null),
+      { companyId: leaseRow.companyId, runId: tip.heartbeatRunId ?? undefined, leaseId: tip.id });
+      await input.onLog?.("stderr", stamped
+        ? `[paperclip-runner] backup stamp copied to the sandbox's current lease row ${stamped.id}\n`
+        : `[paperclip-runner] the sandbox's lease row ${tip.id} gained a successor before the stamp; not stamped\n`);
+    } catch (error) {
+      const detail = redactSensitiveText(error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, " ").slice(0, 512);
+      await input.onLog?.("stderr", `[paperclip-runner] the backup stamp was not copied to the sandbox's current lease row: ${detail}\n`);
+    }
   };
 
   // A lease without this session's state may restore the backup when its
@@ -19247,7 +19319,7 @@ async function createRunnerdBackendWithinSessionClaim(
                   stamp: remoteTarget?.transport === "sandbox" && remoteTarget.leaseId ? async currentRoot => {
                     await recordHarnessBackupStampForCurrentLease({
                       root: currentRoot, manifest, bytes: backupSpanAttributes.bytesTransferred,
-                    });
+                    }, true);
                   } : undefined,
                 });
               } finally {
@@ -19724,6 +19796,8 @@ async function createRunnerdBackendWithinSessionClaim(
                 expectedProviderPackManifest.payload.artifacts.nodeCommand
                   .sha256,
               providerPackAuthorityDigest: expectedProviderPackManifest.digest,
+              // A pi_rpc-only pack (Smarty seam) has no OpenCode / ACPX artifacts to name.
+              ...(isPiRpcOnlyProviderPack(expectedProviderPackManifest.payload) ? {} : {
               opencodeCommand: posix.join(
                 activeRemoteProviderPackRoot,
                 expectedProviderPackManifest.payload.artifacts
@@ -19747,6 +19821,7 @@ async function createRunnerdBackendWithinSessionClaim(
               acpxSidecarSha256:
                 expectedProviderPackManifest.payload.artifacts.acpxSidecar
                   .sha256,
+              }),
             }
           : {}),
         ...(input.execution.provider.kind === "pi_rpc" && expectedProviderPackManifest?.payload.pi_rpc && activeRemoteProviderPackRoot ? {

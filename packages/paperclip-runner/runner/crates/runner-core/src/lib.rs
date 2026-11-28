@@ -11,6 +11,7 @@ pub mod acpx_provider_state;
 pub mod acpx_sidecar_transport;
 mod acpx_tool_failure_feedback;
 mod acpx_turn_dispatch;
+pub mod atomic_replace;
 mod attachment_download;
 pub mod aws_agentcore_provider;
 pub mod claude_managed_provider;

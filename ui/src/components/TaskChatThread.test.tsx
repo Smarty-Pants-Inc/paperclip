@@ -44,6 +44,7 @@ const transcriptState = vi.hoisted(() => ({
 const nativeTranscriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
   isInitialHydrating: false,
+  catchingUpRunIds: new Set<string>(),
   errorsByRun: new Map(),
   hydratedRunIds: undefined as Set<string> | undefined,
   terminalHydratedRunIds: undefined as Set<string> | undefined,
@@ -90,6 +91,7 @@ vi.mock("@/components/transcript/useNativeRunTranscripts", () => ({
       transcriptByRun: new Map(nativeTranscriptState.transcriptByRun),
       activityLabelByRun: new Map(),
       errorsByRun: new Map(nativeTranscriptState.errorsByRun),
+      catchingUpRunIds: nativeTranscriptState.catchingUpRunIds,
       isInitialHydrating: nativeTranscriptState.isInitialHydrating,
       retry: () => {},
       hydratedRunIds: nativeTranscriptState.hydratedRunIds ?? new Set(),
@@ -154,6 +156,7 @@ beforeEach(() => {
   transcriptState.errorsByRun.clear();
   nativeTranscriptState.transcriptByRun.clear();
   nativeTranscriptState.isInitialHydrating = false;
+  nativeTranscriptState.catchingUpRunIds.clear();
   nativeTranscriptState.errorsByRun.clear();
   nativeTranscriptState.hydratedRunIds = undefined;
   nativeTranscriptState.terminalHydratedRunIds = undefined;
@@ -2363,16 +2366,18 @@ describe("bounded run output notes", () => {
     },
   );
 
-  it("keeps compact cut history and a live follow-up readable while its sequence gap is loading", async () => {
+  it.each(["log", "native"] as const)("keeps compact cut history and a live follow-up readable while its %s sequence gap is loading", async source => {
     vi.useFakeTimers();
     try {
       const props = fixture();
       props.linkedRuns = props.linkedRuns.filter(run => run.runId === "long");
       transcriptState.truncatedRunIds.add("long");
-      transcriptState.catchingUpRunIds.add("follow-up");
+      const catchingUp = source === "native" ? nativeTranscriptState.catchingUpRunIds : transcriptState.catchingUpRunIds;
+      const errors = source === "native" ? nativeTranscriptState.errorsByRun : transcriptState.errorsByRun;
+      catchingUp.add("follow-up");
       transcriptState.hydratedRunIds!.add("follow-up");
       nativeTranscriptState.hydratedRunIds!.add("follow-up");
-      transcriptState.transcriptByRun.set("follow-up", [assistantEntry("2026-08-25T18:03:01Z", "Working on the follow-up.", "progress")]);
+      (source === "native" ? nativeTranscriptState : transcriptState).transcriptByRun.set("follow-up", [assistantEntry("2026-08-25T18:03:01Z", "Working on the follow-up.", "progress")]);
       const followUp = { ...nativeRunningRun(), id: "follow-up", createdAt: "2026-08-25T18:03:00Z", startedAt: "2026-08-25T18:03:00Z" };
       const page = () => <TaskChatThread {...props} companyId="company" compactHistory onExpandHistory={() => {}}
         activeRun={followUp} issueStatus="in_progress" />;
@@ -2383,12 +2388,12 @@ describe("bounded run output notes", () => {
       expect(container.textContent).toContain("More run output");
       expect(container.textContent).toContain("Some task history is still loading.");
       expect(container.textContent).not.toContain("Some task history could not be loaded.");
-      transcriptState.errorsByRun.set("follow-up", new Error("HTTP 503"));
+      errors.set("follow-up", new Error("HTTP 503"));
       render(page());
       expect(container.textContent).toContain("Some task history could not be loaded.");
       expect([...container.querySelectorAll("button")].some(button => button.textContent === "Retry")).toBe(true);
-      transcriptState.errorsByRun.clear();
-      transcriptState.catchingUpRunIds.clear();
+      errors.clear();
+      catchingUp.clear();
       render(page());
       expect(container.textContent).not.toContain("Some task history is still loading.");
       expect(container.textContent).not.toContain("Some task history could not be loaded.");

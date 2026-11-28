@@ -3569,6 +3569,52 @@ describe("remote provider pack manifest", () => {
     }
   });
 
+  it("admits a pack that declares only pi_rpc and refuses other harnesses' leftovers in it (Smarty seam)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-pi-only-pack-"));
+    try {
+      const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+      await mkdir(join(root, "dist/cli"), { recursive: true }); await mkdir(join(root, "node_modules/node/bin"), { recursive: true });
+      await writeFile(join(root, "dist/cli/pi-app-server-proxy.cjs"), "proxy\n");
+      await writeFile(join(root, "node_modules/node/bin/node"), "node\n"); await writeFile(join(root, "pnpm-lock.yaml"), "lock\n");
+      await mkdir(join(root, "pi-runtime"), { recursive: true }); await writeFile(join(root, "pi-runtime/cli.js"), "pi\n");
+      await mkdir(join(root, "pi-resources"), { recursive: true }); await writeFile(join(root, "pi-resources/resources.json"), "{}\n");
+      const payload: Record<string, unknown> = {
+        compatibility: { pi_rpc: (PROVIDER_PACK_COMPATIBILITY as Record<string, unknown>).pi_rpc },
+        pins: { nodeMinimum: "24.11.0" }, target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "1".repeat(40),
+        distDigest: sha256DirectoryTree(join(root, "dist")),
+        artifacts: { nodeCommand: { path: "node_modules/node/bin/node", sha256: digest("node\n") }, productionLock: { path: "pnpm-lock.yaml", sha256: digest("lock\n") } },
+        pi_rpc: { version: "1.7.0", runtime: { path: "pi-runtime", sha256: sha256DirectoryTree(join(root, "pi-runtime")) },
+          resources: { path: "pi-resources", sha256: sha256DirectoryTree(join(root, "pi-resources")) } },
+      };
+      const write = () => writeFile(join(root, "provider-pack.json"), JSON.stringify({ schema: "paperclip-runner/remote-provider-pack/v1",
+        digest: `sha256:${createHash("sha256").update(canonical(payload)).digest("hex")}`, payload }));
+      await write();
+      expect(readRemoteProviderPackManifest(root).payload.pins).toEqual({ nodeMinimum: "24.11.0" });
+      await expect(verifyRemoteProviderPackManifest(root)).resolves.toEqual(readRemoteProviderPackManifest(root));
+      for (const [field, value, message] of [
+        ["pins", { nodeMinimum: "24.11.0", opencode: "1.18.34" }, "pins or source revision"],
+        ["bridgeDigest", digest("bridge"), "pins or source revision"],
+        ["pi_rpc", undefined, "pins or source revision"],
+        ["artifacts", { ...(payload.artifacts as object), opencodeProxy: { path: "dist/cli/opencode-app-server-proxy.cjs", sha256: digest("x") } }, "carries no OpenCode proxy"],
+      ] as const) {
+        const set = (next: unknown) => { if (next === undefined) delete payload[field]; else payload[field] = next; };
+        const previous = payload[field]; set(value); await write();
+        expect(() => readRemoteProviderPackManifest(root), field).toThrow(message);
+        set(previous); await write();
+      }
+      // The Pi closure that runs is checked like the other harnesses' assets: a changed runtime or resources tree is refused.
+      for (const tree of ["pi-runtime/cli.js", "pi-resources/resources.json"]) {
+        const original = await readFile(join(root, tree), "utf8"); await writeFile(join(root, tree), "substitute\n");
+        expect(() => readRemoteProviderPackManifest(root), tree).toThrow(tree.startsWith("pi-runtime") ? "Pi runtime digest mismatch" : "Pi resources digest mismatch");
+        await expect(verifyRemoteProviderPackManifest(root)).rejects.toThrow("digest mismatch");
+        await writeFile(join(root, tree), original);
+      }
+      // A full-compatibility pack keeps every other harness's artifact requirement.
+      payload.compatibility = PROVIDER_PACK_COMPATIBILITY; await write();
+      expect(() => readRemoteProviderPackManifest(root)).toThrow("pins or source revision");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("keeps a cached warm Pi owner on its admitted pack when the server pack changes", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-provider-pack-"));
     await mkdir(join(root, "dist", "cli"), { recursive: true });
@@ -3687,7 +3733,9 @@ describe("remote provider pack manifest", () => {
       });
       const execute = vi.fn(async (command: { command: string; args?: string[]; timeoutMs?: number }) => {
         expect(command.timeoutMs).toBeGreaterThan(0);
-        expect(command.timeoutMs).toBeLessThanOrEqual(30_000);
+        // Smarty seam: only the stale-pack delete gets 120 s (a 3 GB tree on a busy sandbox); every other command stays <= 30 s.
+        if (command.args?.[1]?.startsWith("rm -rf -- ")) expect(command.timeoutMs).toBe(120_000);
+        else expect(command.timeoutMs).toBeLessThanOrEqual(30_000);
         const verification = command.args?.[0] === "-e";
         const packRoot = command.args?.[2];
         const valid = mode === "staged" || mode === "preinstalled" && packRoot === "/opt/paperclip-runner/provider-pack"
@@ -3993,6 +4041,19 @@ describe("provider pack read diagnostics", () => {
 });
 
 describe("native harness persistence profiles", () => {
+  it("leaves a Pi session's re-creatable tool stores out of its save, never its conversation", () => {
+    const execution = { provider: { kind: "pi_rpc" }, session: {
+      driverKind: "pi_rpc", normalizedSessionId: "session", protocolVersion: 1,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 28_800_000 },
+    } } as unknown as NativeExecutionInputV1;
+    const [runner] = resolveNativeHarnessPersistenceProfile(execution).directories;
+    const home = `pi-sessions/${createHash("sha256").update("session").digest("hex")}/pi-home`;
+    expect(runner).toEqual({ name: "runner", location: "runner", excludeEntries: [
+      `${home}/data/pnpm`, `${home}/.rustup`, `${home}/.cargo`, `${home}/cache`, `${home}/node-compile-cache`, `${home}/.npm/_cacache`] });
+    for (const kept of [`${home}/agent/sessions/2026-11-27.jsonl`, `${home}/agent/models.json`, "pi-sessions/x/session.jsonl", `${home}/data/pi`, `${home}/.npm/_logs/2026-11-27-debug-0.log`])
+      expect(runner!.excludeEntries.some(excluded => kept === excluded || kept.startsWith(`${excluded}/`))).toBe(false);
+  });
+
   it("does not back up the external Codex home in preconfigured mode", () => {
     const execution = { homeMode: "preconfigured", provider: { kind: "codex" }, session: {
       driverKind: "codex_app_server", normalizedSessionId: "session", protocolVersion: 1,
@@ -8321,6 +8382,20 @@ type LeaseCoordinator = {
   leaseExpiresAt: Date | null;
   resultId: string | null;
 };
+
+/** A backup-stamp write (Smarty seam, Astra T1): `coalesce(metadata, '{}') || $json` on the row's current metadata.
+ * Returns whether it is that merge and the JSON it merges, which must be the stamp alone (the row's other keys stay). */
+function stampMerge(metadata: unknown): { merges: boolean; set: unknown } {
+  const chunks = (metadata as { queryChunks?: unknown[] } | null)?.queryChunks ?? [];
+  const text = chunks.map(chunk => {
+    const value = chunk && typeof chunk === "object" ? (chunk as { value?: unknown }).value : undefined;
+    return Array.isArray(value) ? value.join("") : "";
+  }).join("");
+  const json = chunks.map(chunk => typeof chunk === "string" ? chunk
+    : chunk && typeof chunk === "object" && typeof (chunk as { value?: unknown }).value === "string" ? (chunk as { value: string }).value : null)
+    .find(value => typeof value === "string" && value.startsWith("{"));
+  return { merges: /coalesce\(/.test(text) && /\|\|/.test(text), set: json ? JSON.parse(json) : undefined };
+}
 
 function leaseDb(
   boundExecution: NativeExecutionInput = execution,
@@ -24706,6 +24781,105 @@ describe("runnerd provider runtime wiring", () => {
     expect(runnerEnvironment).toMatchObject(paths);
   });
 
+  // Keep reason: real-driver guard for stamp merges and the concurrent-successor fence; no copied stamp SQL.
+  it.each([false, true])("real Postgres backup stamp preserves metadata and fences a successor (race=%s)", async race => {
+    const pg = await startRecoveryPostgres("native-stamp-guard-");
+    const { createDb, companies, agents, executionWorkspaces } = await import("@paperclipai/db");
+    const realDb = createDb(pg.connectionString);
+    const cleanup = await import("../environment-cleanup-notifications.js");
+    const tips = await import("./native-backup-tip-lease.js");
+    const writeCleanup = cleanup.writeEnvironmentCleanup, selectTip = tips.nativeBackupTipLease;
+    const logs: string[] = [];
+    try {
+      const [company] = await realDb.insert(companies).values({ name: "Native stamp guard" }).returning();
+      const [agent] = await realDb.insert(agents).values({ companyId: company.id, name: "Stamp owner" }).returning();
+      const normalizedSessionId = randomUUID();
+      const [run] = await realDb.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+        status: "succeeded", nativeSessionId: normalizedSessionId }).returning();
+      const [workspace] = await realDb.insert(executionWorkspaces).values({ companyId: company.id,
+        mode: "shared", strategyType: "project", name: "Stamp workspace" }).returning();
+      const providerLeaseId = randomUUID(), successor = { runId: randomUUID() };
+      const lease = { companyId: company.id, heartbeatRunId: run.id, executionWorkspaceId: workspace.id, providerLeaseId };
+      const [launch] = await realDb.insert(environmentLeases).values({ ...lease,
+        metadata: { retainedLaunch: { yes: true }, reusableLeaseSuccessor: successor } }).returning();
+      const [tip] = await realDb.insert(environmentLeases).values({ ...lease, metadata: { retainedTip: { yes: true } } }).returning();
+      const current: NativeExecutionInputV1 = { ...execution, binding: { ...execution.binding,
+        companyId: company.id, agentId: agent.id, runId: run.id, issueId: randomUUID(), executionWorkspaceId: workspace.id },
+        session: { ...execution.session, normalizedSessionId, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } } };
+      // Only unrelated controller bookkeeping is simulated: all lease reads, writes, and cleanup transactions use Postgres.
+      const db = leaseDb(current), select = db.select.bind(db);
+      db.select = ((fields?: Parameters<Db["select"]>[0]) => ({ from: (table: unknown) =>
+        (table === environmentLeases || table === heartbeatRunEvents ? (fields ? realDb.select(fields) : realDb.select())
+          : (fields ? select(fields) : select())).from(table as never) })) as unknown as Db["select"];
+      vi.spyOn(cleanup, "writeEnvironmentCleanup").mockImplementation((_db, write, scope) => writeCleanup(realDb, write, scope));
+      vi.spyOn(harnessStorage, "durableNativeHarnessStorage").mockReturnValue(null);
+      vi.spyOn(runnerCheckpoint, "nativeRunnerCheckpointRegistration").mockReturnValue(async () => undefined);
+      vi.spyOn(tips, "nativeBackupTipLease").mockImplementation(async (database, input) => {
+        const selected = await selectTip(database, input);
+        if (race && selected) await realDb.update(environmentLeases)
+          .set({ metadata: { ...selected.metadata, reusableLeaseSuccessor: successor } }).where(eq(environmentLeases.id, selected.id));
+        return selected;
+      });
+      const remoteCwd = join(isolatedStateDirectory, "stamp-remote"), runnerInstanceId = "stamp-guard-runner";
+      const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
+        if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner",
+          binaryContractVersion: 2, durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"] }) };
+        if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stderr: "", stdout: "codex-cli 0.170.0" };
+        if (command.command === "sh" && /base64|tar |\.paperclip-checkpoint-/.test(command.args?.[1] ?? "")) {
+          try { return { exitCode: 0, timedOut: false, stderr: "", stdout: execFileSync("sh", command.args!, { encoding: "utf8" }) }; }
+          catch { return { exitCode: 1, timedOut: false, stderr: "", stdout: "" }; }
+        }
+        return { exitCode: 0, timedOut: false, stderr: "", stdout: "" };
+      });
+      const artifact = join(isolatedStateDirectory, "stamp-runnerd"); await writeFile(artifact, "fixture bootstrap artifact");
+      await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true,
+        runnerRemoteBinaryPath: artifact, runnerRemoteCodexPath: artifact, onLog: async (_stream, message) => { logs.push(message); },
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment", leaseId: launch.id,
+          providerKey: "daytona", reusableLeaseConfigured: true, sandboxLeaseAcquisition: { outcome: "created", providerLeaseId },
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute: remoteExecute, syncIn: vi.fn(),
+            syncOut: async (operations: Parameters<typeof copySyncedFiles>[0]) => {
+              for (const operation of operations) for (const file of operation.files) await cp(file.sourcePath, file.targetPath, { recursive: true });
+            } },
+          getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+            secretHeaders: [], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }) } as never });
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+        controlPlaneRegistration: NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]> };
+      const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions", createHash("sha256").update(normalizedSessionId).digest("hex"));
+      for (const directory of resolveNativeHarnessPersistenceProfile(current).directories)
+        await mkdir(join(remoteSession, directory.location === "runner" ? "runner" : "filesystem", directory.location === "runner" ? "" : directory.name), { recursive: true });
+      await writeFile(join(remoteSession, "runner/runner-state.json"), JSON.stringify(durableRunnerState({ runId: run.id,
+        normalizedSessionId, runnerInstanceId, environmentLeaseId: launch.id, turnId: "turn", itemId: "item" }, "suspended")));
+      await writeFile(join(remoteSession, "runner/codex-provider-state.json"), JSON.stringify({ schema: "paperclip.runner.codex-provider-state.v1",
+        lifecycle: "prepared", threadId: "stamp-thread", providerSessionId: null, activeProviderTurnId: null,
+        config: { provider: "codex", driver: "codex_app_server" } }));
+      const controller = new DurablePrpControlPlane({ stateDirectory: join(options.stateDirectory!, "control-plane"),
+        identity: options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+        expectedRunnerVersion: "stamp-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      const registration = await options.controlPlaneRegistration(controller);
+      try { await registration.checkpoint!("settled"); }
+      finally { await registration.release(); await controller.stop(); }
+      const [savedLaunch] = await realDb.select().from(environmentLeases).where(eq(environmentLeases.id, launch.id));
+      const [savedTip] = await realDb.select().from(environmentLeases).where(eq(environmentLeases.id, tip.id));
+      expect(savedLaunch.metadata).toMatchObject({ retainedLaunch: { yes: true }, reusableLeaseSuccessor: successor,
+        nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId } });
+      expect(savedTip.metadata).toMatchObject({ retainedTip: { yes: true } });
+      if (race) {
+        expect(savedTip.metadata).toHaveProperty("reusableLeaseSuccessor", successor);
+        expect(savedTip.metadata).not.toHaveProperty("nativeHarnessBackup");
+        expect(logs.join("")).toContain("not stamped");
+      } else {
+        expect(savedTip.metadata).toHaveProperty("nativeHarnessBackup", savedLaunch.metadata!.nativeHarnessBackup);
+        expect(logs.join("")).toContain("backup stamp copied");
+      }
+      // Successful row assertions above and no caught tip error prove the production raw '?' predicate executed.
+      expect(logs.join("")).not.toContain("backup stamp was not copied");
+    } finally {
+      vi.restoreAllMocks(); await realDb.$client.end({ timeout: 2 }); await pg.cleanup();
+    }
+  }, 120_000);
+
   it("keeps the provider backup fence while its accepted result is saving the workspace", async () => {
     const current = { ...execution, binding: { ...execution.binding, runId: randomUUID(), issueId: randomUUID(),
       executionWorkspaceId: randomUUID() }, session: { ...execution.session, normalizedSessionId: randomUUID() } };
@@ -24907,12 +25081,13 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
-      expect(updates.filter(update => update.table === environmentLeases)).toEqual([expect.objectContaining({
-        values: expect.objectContaining({ metadata: { nativeHarnessBackup: expect.objectContaining({
-          normalizedSessionId: current.session.normalizedSessionId, runnerInstanceId,
-          sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created",
-        }) } }),
-      })]);
+      const leaseWrites = updates.filter(update => update.table === environmentLeases);
+      expect(leaseWrites).toHaveLength(1);
+      // The stamp merges into the row's current metadata and writes nothing else.
+      expect(stampMerge(leaseWrites[0]!.values.metadata)).toEqual({ merges: true, set: { nativeHarnessBackup: expect.objectContaining({
+        normalizedSessionId: current.session.normalizedSessionId, runnerInstanceId,
+        sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created",
+      }) } });
     } else {
       await expect(options.prepareExternalRunnerState()).rejects.toThrow("backup_without_reusable_lease");
       expect(syncIn).not.toHaveBeenCalled();
@@ -25068,16 +25243,15 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
-      expect(updates.filter(update => update.table === environmentLeases)).toEqual([
-        // The idle source is claimed first: its reuse scope moves into a superseded
-        // receipt, so it is never resumed with the older state again.
-        ...(idleWarm ? [expect.objectContaining({ values: expect.objectContaining({
-          metadata: expect.not.objectContaining({ reusableSandboxLease: expect.anything() }) }) })] : []),
-        expect.objectContaining({
-          values: expect.objectContaining({ metadata: { nativeHarnessBackup: expect.objectContaining({
-            normalizedSessionId: current.session.normalizedSessionId, sourceProviderLeaseId: "prior-sandbox",
-            authorizedProviderLeaseId: "sandbox-created" }) } }),
-        })]);
+      const leaseWrites = updates.filter(update => update.table === environmentLeases);
+      expect(leaseWrites).toHaveLength(idleWarm ? 2 : 1);
+      // The idle source is claimed first: its reuse scope moves into a superseded
+      // receipt, so it is never resumed with the older state again.
+      if (idleWarm) expect(leaseWrites[0]!.values.metadata).toEqual(expect.not.objectContaining({ reusableSandboxLease: expect.anything() }));
+      // The stamp merges into the row's current metadata and writes nothing else.
+      expect(stampMerge(leaseWrites.at(-1)!.values.metadata)).toEqual({ merges: true, set: { nativeHarnessBackup: expect.objectContaining({
+        normalizedSessionId: current.session.normalizedSessionId, sourceProviderLeaseId: "prior-sandbox",
+        authorizedProviderLeaseId: "sandbox-created" }) } });
       if (idleWarm) expect(updates.filter(update => update.table === environmentLeases)[0]!.values.metadata).toEqual(
         expect.objectContaining({ reusableSandboxLeaseSuperseded: expect.objectContaining({
           supersededByRunId: current.binding.runId, supersededByProviderLeaseId: "sandbox-created",
@@ -25599,8 +25773,8 @@ describe("runnerd provider runtime wiring", () => {
       expect(syncIn).toHaveBeenCalled();
       // Failed inspection must not erase the durable provenance of files that
       // were already copied. The next invocation must still use the END fence.
-      expect(cleanupUpdates.find(update => update.table === environmentLeases)?.values.metadata)
-        .toHaveProperty("nativeHarnessBackup");
+      expect(stampMerge(cleanupUpdates.find(update => update.table === environmentLeases)?.values.metadata))
+        .toEqual({ merges: true, set: { nativeHarnessBackup: expect.anything() } });
     }
   });
 
