@@ -483,21 +483,6 @@ export interface PluginManagedSkillResolution {
   } | null;
 }
 
-/** Context only: no task records, projections, or privileged data callbacks. */
-export interface PluginChatComposerAccessoryContext {
-  companyId: string;
-  conversationIssueId: string;
-  agentId: string;
-  theme: "light" | "dark";
-  /** Standard slot/bridge aliases for the conversation task. */
-  entityId: string;
-  entityType: "issue";
-}
-
-export interface PluginChatComposerAccessoryProps {
-  context: PluginChatComposerAccessoryContext;
-}
-
 /**
  * Declares a UI extension slot the plugin fills with a React component.
  *

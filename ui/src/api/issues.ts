@@ -10,7 +10,6 @@ import type {
   AskUserQuestionsAnswer,
   Approval,
   CompactIssue,
-  ConversationTaskHandoffPage,
   InboxMineSnapshot,
   CreateIssueTreeHold,
   DocumentRevision,
@@ -292,15 +291,6 @@ function issueListSearchParams(filters?: IssueListFilters) {
 }
 
 export const issuesApi = {
-  listChatHandoffs: (id: string, filters: { view?: "tray"; cursor?: string | null; limit?: number } = {}, options?: RequestOptions) => {
-    const params = new URLSearchParams({ limit: String(filters.limit ?? 100) });
-    if (filters.view) params.set("view", filters.view);
-    if (filters.cursor) params.set("cursor", filters.cursor);
-    const path = `/issues/${id}/chat-handoffs?${params}`;
-    // Do not coalesce with an older viewer/session's URL-identical request.
-    detachInflightGet(path);
-    return api.get<ConversationTaskHandoffPage>(path, { ...options, cache: "no-store" });
-  },
   inboxMine: (companyId: string, options?: RequestOptions) => {
     const path = `/companies/${companyId}/inbox/mine`;
     detachInflightGet(path);

@@ -452,7 +452,6 @@ vi.mock("../components/TaskChatThread", () => ({
     comments?: Array<{ metadata?: { recovery?: DispositionRecoverySnapshot } | null }>;
     workProducts?: IssueWorkProduct[];
     threadHeader?: ReactNode;
-    composerAccessory?: ReactNode;
     onStopRun?: (runId: string) => Promise<void>;
     stopRunLabel?: string;
     onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
@@ -472,7 +471,6 @@ vi.mock("../components/TaskChatThread", () => ({
     return (
       <div data-testid="task-chat-thread">
         {props.threadHeader}
-        {props.composerAccessory}
         Task chat thread
         {props.comments?.map((comment, index) => comment.metadata?.recovery ? <DispositionRecoveryNotice key={index} snapshot={comment.metadata.recovery} /> : null)}
         {props.workProducts?.map((workProduct) => (
@@ -548,13 +546,6 @@ vi.mock("../components/IssueProperties", () => ({
     mockIssuePropertiesRender(props);
     return <div>Properties</div>;
   },
-}));
-
-vi.mock("../components/chat-composer/ChatComposerAccessoryHost", () => ({
-  ChatComposerAccessoryHost: ({ children }: { children: ReactNode }) => <div data-testid="accessory-host">{children}</div>,
-}));
-vi.mock("../components/coordinator/CoordinatorChatTaskTray", () => ({
-  CoordinatorChatTaskTray: ({ onOpenConversationTasks }: { onOpenConversationTasks: () => void }) => <button onClick={onOpenConversationTasks}>Open conversation tasks</button>,
 }));
 
 vi.mock("../components/task-side-panel", () => ({
@@ -3618,41 +3609,6 @@ describe("IssueDetail", () => {
     await waitForAssertion(() => {
       expect(mockRequestPanelMaximize).toHaveBeenCalledTimes(2);
     });
-  });
-
-  it.each([false, true])("opens a closed conversation Tasks panel from the composer tray (mobile=%s)", async isMobile => {
-    coordinatorPreference.enabled = true;
-    mockSidebarState.isMobile = isMobile;
-    mockPanelState.panelVisible = false;
-    const chat = createIssue({ conversationAgentId: "agent-1", conversationUserId: "user-1", conversationSessionGeneration: 7 });
-    mockIssuesApi.get.mockResolvedValue(chat);
-    mockAgentsApi.list.mockResolvedValue([createAgent()]);
-    await act(async () => renderIssueView());
-    await waitForAssertion(() => expect(container.textContent).toContain("Open conversation tasks"));
-    expect(document.querySelector('[data-testid="mobile-task-side-panel"]')).toBeNull();
-    const open = () => Array.from(container.querySelectorAll("button")).find(button => button.textContent === "Open conversation tasks")!;
-    await act(() => open().click());
-    const panelProps = () => (isMobile ? mockTaskSidePanelRender.mock.calls.at(-1)?.[0]
-      : mockOpenPanel.mock.calls.at(-1)?.[0]?.props.children?.props) as {
-        conversationTasksOpenRequestId?: number;
-        onConversationTasksOpened: (id: number) => void;
-      };
-    await waitForAssertion(() => expect(panelProps()?.conversationTasksOpenRequestId).toBe(1));
-    if (isMobile) expect(document.querySelector('[data-testid="mobile-task-side-panel"]')).not.toBeNull();
-    else expect(mockSetPanelVisible).toHaveBeenCalledWith(true);
-    await act(() => panelProps().onConversationTasksOpened(1));
-    await waitForAssertion(() => expect(panelProps().conversationTasksOpenRequestId).toBeUndefined());
-    await act(() => open().click());
-    await waitForAssertion(() => expect(panelProps().conversationTasksOpenRequestId).toBe(2));
-    expect(mockLocation.hash).toBe("");
-  });
-
-  it.each([{ coordinator: false, chat: true }, { coordinator: true, chat: false }])("does not mount the tray outside Coordinator chats ($coordinator/$chat)", async ({ coordinator, chat }) => {
-    coordinatorPreference.enabled = coordinator;
-    mockIssuesApi.get.mockResolvedValue(createIssue({ conversationAgentId: chat ? "agent-1" : null }));
-    await act(async () => renderIssueView());
-    await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());
-    expect(container.querySelector('[data-testid="accessory-host"]')).toBeNull();
   });
 
   it("opens Artifacts for existing output without discarding a document deep link", async () => {

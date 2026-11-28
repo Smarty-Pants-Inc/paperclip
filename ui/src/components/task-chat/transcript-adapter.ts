@@ -190,6 +190,7 @@ export function isNestableLiveChild(
     item.kind === "usage" ||
     item.kind === "activity_phase" ||
     item.kind === "plan_document" ||
+    item.kind === "task_handoff" ||
     item.kind === "protocol"
   );
 }
@@ -657,6 +658,8 @@ function providerActivityItem(
     outputTruncated,
     transcriptIndex: index,
     startedAt: entry.ts,
+    startedAtMs: Date.parse(entry.ts),
+    updatedAtMs: Date.parse(entry.ts),
     ...(entry.family === "tool_execution"
       ? {
           activityId: stringValue(entry.payload.executionId),
@@ -741,6 +744,7 @@ function mergeProviderActivityItem(
     ...incoming,
     id: previous.id,
     startedAt: previous.startedAt ?? incoming.startedAt,
+    startedAtMs: previous.startedAtMs ?? incoming.startedAtMs,
     summary: meaningfulProviderToolSummary(incoming.summary)
       ? incoming.summary
       : previous.summary,
@@ -914,6 +918,7 @@ export function transcriptToTaskChatItems(
             // Each visible burst needs its own stable key, not the shared ID.
             id: `${runId}:think:${entry.itemId ?? "anonymous"}:${entry.eventSeq ?? i}`,
             kind: "thinking",
+            atMs: Date.parse(entry.ts),
             lines: entry.text ? entry.text.split("\n") : [],
             streaming: running && entry.lifecycle !== "completed",
             // Settled history folds its thinking behind the header (v7);
@@ -1007,6 +1012,7 @@ export function transcriptToTaskChatItems(
           const tool: TaskChatToolItem = {
             id: `${runId}:tool:${toolCallId}`,
             kind: "tool",
+            startedAtMs: Date.parse(entry.ts),
             name: toolDisplayName(entry.name),
             rawName: entry.name ?? undefined,
             target: summarizeToolInput(entry.input),
@@ -1029,6 +1035,7 @@ export function transcriptToTaskChatItems(
         if (idx != null) {
           const existing = items[idx];
           if (existing.kind === "tool") {
+            existing.finishedAtMs = Date.parse(entry.ts);
             existing.status = entry.delta
               ? "in_progress"
               : entry.isError
@@ -1629,6 +1636,7 @@ export function paperclipRunnerActivityItems(
       case "turn":
       case "brief":
       case "plan_document":
+      case "task_handoff":
         return false;
     }
   });
@@ -1662,6 +1670,7 @@ export function paperclipRunnerTimelineItems(
         ? item.lines.some(line => line.trim()) || !activityIds.has(item.id)
         : activityIds.has(item.id)) ||
       item.kind === "plan_document" ||
+      item.kind === "task_handoff" ||
       (item.kind === "protocol" && item.surface === "runtime_request"),
   );
 }
@@ -2283,7 +2292,7 @@ export function buildTurnTimelineRows(
     ) {
       current = null;
       rows.push(item);
-    } else if (item.kind === "plan_document") {
+    } else if (item.kind === "plan_document" || item.kind === "task_handoff") {
       current = null;
       rows.push(item);
     } else if (item.kind === "marker" && item.variant === "context_compacted") {

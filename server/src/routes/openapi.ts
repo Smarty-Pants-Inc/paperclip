@@ -8760,11 +8760,10 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List tasks created from your conversation",
   description:
-    "Requires a board user who owns the conversation and has current issue read access. Returns a ConversationTaskHandoffPage (items and nextCursor) for the current conversation session, ordered by handoff createdAt descending then task ID descending, omitting tasks the user can no longer read. Accepts cursor, limit and optional view=tray; the default page size is 40 (maximum 100). The default view retains finished tasks; tray excludes canonical done and cancelled tasks before cursor and limit. Both views include displayStatus (Issue.displayStatus or null), externalConversationState (active, waiting or null), blockerAttention (IssueBlockerAttention or null, with unreadable blocker identifiers redacted), unblockDescriptor (Issue.unblockDescriptor or null), interruption (Issue.interruption or null), blockedInboxAttention (currently null; reserved for the shared blocked-inbox projection), assigneeAgentId and assigneeUserId (string or null), and updatedAt (ISO task last-change time). These fields are optional in the shared type for older-server compatibility; current responses always send the keys, including unblockDescriptor: null when absent. No actionRequired field is added. Unknown view values return 400. This read does not create tasks or wake agents.",
+    "Requires a board user who owns the conversation and has current issue read access. Returns a ConversationTaskHandoffPage for the current conversation session, newest first, omitting tasks the user can no longer read. Accepts only cursor and limit; the default page size is 40. This read does not create tasks or wake agents.",
   request: {
     params: z.object({ id: z.string() }),
     query: z.object({
-      view: z.literal("tray").optional().describe("Open tasks only; excludes canonical done and cancelled before cursor and limit. Omit for the full handoff history."),
       cursor: z.string().max(1000).optional(),
       limit: z.coerce.number().int().min(1).max(100).optional(),
     }).strict(),

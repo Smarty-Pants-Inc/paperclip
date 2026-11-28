@@ -131,8 +131,6 @@ export interface TaskSidePanelProps {
   /** A new durable output asks the host to reveal this tab once. */
   artifactsOpenRequestId?: number;
   onArtifactsOpened?: (requestId: number) => void;
-  conversationTasksOpenRequestId?: number;
-  onConversationTasksOpened?: (requestId: number) => void;
   onRequestClose?: () => void;
   streamlinedTabs?: boolean;
   showSubtasksTab?: boolean;
@@ -293,8 +291,6 @@ function TaskSidePanelForScope({
   onArtifactVisibilityChange,
   artifactsOpenRequestId,
   onArtifactsOpened,
-  conversationTasksOpenRequestId,
-  onConversationTasksOpened,
   onRequestClose,
   streamlinedTabs = false,
   showSubtasksTab = false,
@@ -540,18 +536,6 @@ function TaskSidePanelForScope({
     viewer.query,
     viewer.state,
   ]);
-
-  const handledConversationTasksRequest = useRef<number | undefined>(undefined);
-  useEffect(() => {
-    if (conversationTasksOpenRequestId === undefined || !conversationAgentId
-      || handledConversationTasksRequest.current === conversationTasksOpenRequestId) return;
-    handledConversationTasksRequest.current = conversationTasksOpenRequestId;
-    userInteractedRef.current = true;
-    setLauncherOpen(false);
-    controller.openTab(taskPanelAgentTasksTab());
-    if (viewer.state || viewer.browse) viewer.close();
-    onConversationTasksOpened?.(conversationTasksOpenRequestId);
-  }, [conversationTasksOpenRequestId, conversationAgentId, controller.openTab, onConversationTasksOpened, viewer.state, viewer.browse, viewer.close]);
 
   useEffect(() => {
     if (artifactsOpenRequestId === undefined || handledArtifactsRequestRef.current === artifactsOpenRequestId) return;

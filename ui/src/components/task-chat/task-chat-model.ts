@@ -199,6 +199,7 @@ export interface TaskChatThinkingItem {
   kind: "thinking";
   lines: string[];
   streaming?: boolean;
+  atMs?: number;
   /** When true, render collapsed ("Worked for N") with an expand affordance. */
   collapsed?: boolean;
   /** Human-readable elapsed label for the collapsed header. */
@@ -224,6 +225,9 @@ export interface TaskChatToolItem {
   id: string;
   kind: "tool";
   name: string;
+  /** Call window retained for task cards created inside script tools. */
+  startedAtMs?: number;
+  finishedAtMs?: number;
   /** Raw ACP tool name pre-collapse ("mcp__server__tool") for taxonomy lookup. */
   rawName?: string;
   /** The app tool a wrapper call runs (`paperclip_call_assigned_tool`'s `name`), for its progress. */
@@ -610,6 +614,7 @@ export type TaskChatTurnChildItem =
   | TaskChatUsageItem
   | TaskChatActivityPhaseItem
   | TaskChatPlanDocumentItem
+  | Extract<TaskChatItem, { kind: "task_handoff" }>
   | TaskChatProtocolItem;
 
 /**

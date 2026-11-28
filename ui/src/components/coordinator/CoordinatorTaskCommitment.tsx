@@ -126,7 +126,7 @@ export function CoordinatorCreatedTaskLink({ task, createdAt }: {
   task: Pick<ConversationTaskHandoff, "issueId" | "identifier" | "title"> & { status?: ConversationTaskHandoff["status"] }
     & Partial<Omit<TaskStatusPresentationInput, "id" | "status">>;
 }) {
-  return <Link to={`/issues/${task.identifier ?? task.issueId}`} className="coordinator-created-task">
+  return <Link to={`/issues/${task.identifier ?? task.issueId}`} className="coordinator-created-task coordinator-created-task-compact">
     {task.status ? <StatusIcon {...taskStatusIconProps({ ...task, id: task.issueId, status: task.status })} size="lg" /> : <FileCheck2 className="size-5 shrink-0 text-muted-foreground" aria-label="Task created" />}
     <span className="min-w-0 flex-1">
       <span className="block truncate text-sm font-medium">{task.title}</span>

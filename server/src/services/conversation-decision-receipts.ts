@@ -1,16 +1,12 @@
-import { and, desc, eq, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { chatCompletionDeliveries, chatTaskHandoffs, issueComments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import type { AttentionItem, ConversationTaskHandoff, ConversationTaskHandoffPage, DecisionHistoryPage, DecisionHistoryQuery } from "@paperclipai/shared";
 import { issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 import { attentionService } from "./attention.js";
+import { issueStatusProjectionFields } from "./issue-display-status.js";
 import { decisionHistoryService, pageDecisionHistory } from "./decision-history.js";
 import { badRequest, notFound } from "../errors.js";
 import { z } from "zod";
-import { issueDisplayStatusSql } from "./issue-display-status.js";
-import { externalConversationStateSql } from "./slack-conversation-state.js";
-import { listIssueStatusBlockerAttention } from "./issue-status-presentation.js";
-import { listIssueSummaries } from "./issue-summaries.js";
-import { taskInterruptionPresentations } from "./task-interruption-presentation.js";
 
 const handoffCursorIdSchema = z.uuid();
 
@@ -64,7 +60,7 @@ export function conversationDecisionReceiptsService(db: Db) {
       return attentionService(db).taskQuestions(companyId, [...taskIds], options);
     },
     async listCreatedTasks(companyId: string, conversationId: string, options: {
-      actor: AuthorizationActor; userId: string; cursor?: string; limit?: number; view?: "tray";
+      actor: AuthorizationActor; userId: string; cursor?: string; limit?: number;
     }): Promise<ConversationTaskHandoffPage> {
       const conversation = await source(companyId, conversationId, options);
       const limit = Math.max(1, Math.min(options.limit ?? 40, 100));
@@ -79,10 +75,7 @@ export function conversationDecisionReceiptsService(db: Db) {
       }
       const readable = await issueReadSqlCondition(db, options.actor);
       const rows = await db.select({ issueId: issues.id, identifier: issues.identifier, title: issues.title,
-        status: issues.status, createdAt: chatTaskHandoffs.createdAt, sourceRunId: issues.originRunId,
-        displayStatus: issueDisplayStatusSql(), externalConversationState: externalConversationStateSql(),
-        unblockDescriptor: issues.unblockDescriptor, assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId,
-        updatedAt: issues.updatedAt, projectId: issues.projectId,
+        status: issues.status, ...issueStatusProjectionFields(), createdAt: chatTaskHandoffs.createdAt, sourceRunId: issues.originRunId,
         createdAtCursor: sql<string>`${chatTaskHandoffs.createdAt}::text`,
         suggestionInteractionId: sql<string | null>`(select ${issueThreadInteractions.id} from ${issueThreadInteractions}
           where ${issueThreadInteractions.companyId} = ${companyId} and ${issueThreadInteractions.issueId} = ${conversationId}
@@ -98,31 +91,12 @@ export function conversationDecisionReceiptsService(db: Db) {
         .where(and(eq(chatTaskHandoffs.companyId, companyId), eq(chatTaskHandoffs.conversationId, conversationId),
           eq(chatTaskHandoffs.agentId, conversation.conversationAgentId!),
           eq(chatTaskHandoffs.sessionGeneration, conversation.conversationSessionGeneration), readable,
-          options.view === "tray" ? notInArray(issues.status, ["done", "cancelled"]) : undefined,
           cursor ? sql`(${chatTaskHandoffs.createdAt}, ${issues.id}) < (${cursor.at}::timestamptz, ${cursor.id}::uuid)` : undefined))
         .orderBy(desc(chatTaskHandoffs.createdAt), desc(issues.id)).limit(limit + 1);
       const page = rows.slice(0, limit);
       const last = page.at(-1);
-      // Enrich only the bounded, readable page with the same projections used
-      // by task lists/summaries. No per-task reads; the lookahead is not enriched.
-      const projectionRows = page.map(row => ({ ...row, id: row.issueId, companyId }));
-      const [blockerAttention, interruptions] = await Promise.all([
-        listIssueStatusBlockerAttention(db, companyId, projectionRows, async ids => new Set(
-          (await listIssueSummaries(db, companyId, ids, readable)).map(row => row.id),
-        )),
-        taskInterruptionPresentations(db, companyId, projectionRows),
-      ]);
       return {
-        items: page.map(({ createdAtCursor: _cursor, projectId: _projectId, ...row }) => ({
-          ...row, id: `chat_handoff:${row.issueId}`, status: row.status as ConversationTaskHandoff["status"],
-          displayStatus: row.displayStatus ?? undefined, externalConversationState: row.externalConversationState ?? null,
-          blockerAttention: blockerAttention.get(row.issueId), unblockDescriptor: row.unblockDescriptor ?? null,
-          interruption: interruptions.get(row.issueId) ?? null,
-          // The blocked-inbox graph projection is private to issues.ts. Do not
-          // duplicate its classification here or invoke a full issue list per row.
-          blockedInboxAttention: null,
-          updatedAt: row.updatedAt.toISOString(), createdAt: row.createdAt.toISOString(),
-        })),
+        items: page.map(({ createdAtCursor: _cursor, ...row }) => ({ ...row, id: `chat_handoff:${row.issueId}`, status: row.status as ConversationTaskHandoff["status"], createdAt: row.createdAt.toISOString() })),
         nextCursor: rows.length > limit && last
           ? Buffer.from(JSON.stringify({ at: last.createdAtCursor, id: last.issueId })).toString("base64url") : null,
       };

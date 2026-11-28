@@ -17893,7 +17893,6 @@ export function issueRoutes(
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     if (!issue.conversationAgentId || issue.conversationUserId !== req.actor.userId) throw notFound("Conversation not found");
     const query = z.object({
-      view: z.literal("tray").optional(),
       cursor: z.string().max(1000).optional(),
       limit: z.coerce.number().int().min(1).max(100).optional(),
     }).strict().safeParse(req.query);
