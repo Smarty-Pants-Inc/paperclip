@@ -84,7 +84,7 @@ fn write_descriptor(path: &Path, endpoint: &Endpoint) -> Result<(), DurableRunne
     let (temporary, mut file) = create_private_temporary_file(path)?;
     let result = file
         .write_all(&bytes)
-        .and_then(|()| fs::rename(&temporary, path));
+        .and_then(|()| crate::atomic_replace::rename_replace_retrying_exdev(&temporary, path));
     let _ = fs::remove_file(temporary);
     result.map_err(failure)
 }

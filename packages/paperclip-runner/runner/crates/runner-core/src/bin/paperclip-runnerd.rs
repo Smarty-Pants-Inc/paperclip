@@ -84,7 +84,10 @@ fn persist_runner_diagnostic(directory: &Path, message: &str) -> io::Result<()> 
             file.write_all(contents.as_bytes())?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, &destination)
+            paperclip_runner_core::atomic_replace::rename_replace_retrying_exdev(
+                &temporary,
+                &destination,
+            )
         })();
         if write_result.is_err() {
             let _ = fs::remove_file(&temporary);
